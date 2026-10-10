@@ -1,0 +1,482 @@
+import math
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import numpy as np
+
+from orbit_app.domain import Observation, OrbitSolution
+from orbit_app.main_window import (
+    CONSTELLATION_LABELS, CONSTELLATION_LINES, SkyPanel,
+    datetime_from_jd, format_dec_sexagesimal, format_ra_sexagesimal,
+    observation_residual_score, parse_output_epoch,
+    perihelion_jd_from_solution, project_ecliptic_camera,
+    SKY_TRACK_HORIZONS, sky_track_sample_count, solar_orbit_clip_radius,
+)
+from orbit_app.mpc import MpcClient, parse_mpc80
+from orbit_app.mpc_orbit import (
+    cartesian_to_elements, mpc_display_name, mpc_identifier_choices, parse_mpc_orbit,
+)
+from orbit_app.observatories import (
+    equatorial_to_horizontal, observation_altaz_series, observatory_details,
+    station_offsets_gcrs,
+)
+from orbit_app.orbit_engine import (
+    MU_SUN, NBodyIntegrator, StateVector, marsden_water_ice_law,
+    nongravitational_acceleration,
+)
+from orbit_app.orbit_evolution import evolution_span
+from orbit_app.planetary import PLANETS
+from orbit_app.orbit_fit import (
+    _observation_offsets_gcrs, _observation_sigma_arcsec,
+    _truncate_rows_to_recent_years, fit_selection_count, parse_observation_time,
+)
+from orbit_app.photometry import estimate_absolute_magnitude, power_law_magnitude
+from orbit_app.preview_orbit import apparent_geometry, demo_solution, heliocentric_xyz, orbital_curve_xyz, solve_kepler
+
+
+class PhotometryTests(unittest.TestCase):
+    def test_unit_distances_equal_absolute_magnitude(self):
+        result = power_law_magnitude(12.3, np.array([1.0]), np.array([1.0]), 4.0)
+        self.assertAlmostEqual(float(result[0]), 12.3)
+
+    def test_comet_exponent_convention(self):
+        # n=4 corresponds to K1=10: doubling r adds 10 log10(2) mag.
+        result = power_law_magnitude(10.0, np.array([1.0]), np.array([2.0]), 4.0)
+        self.assertAlmostEqual(float(result[0]), 10.0 + 10.0 * math.log10(2.0))
+
+    def test_apparent_measurements_are_reduced_before_becoming_comet_m(self):
+        delta = np.array([8.0, 8.2, 8.5])
+        radius = np.array([8.7, 8.8, 8.9])
+        apparent = power_law_magnitude(6.25, delta, radius, 4.0)
+        self.assertAlmostEqual(
+            estimate_absolute_magnitude(apparent, delta, radius, 4.0), 6.25
+        )
+
+
+class SkyTrackTests(unittest.TestCase):
+    def test_equatorial_projection_uses_absolute_dec_and_wraps_ra(self):
+        x, y, _ = SkyPanel._project_equatorial(
+            np.array([359.0, 1.0, 10.0]), np.array([-5.0, 12.0, 25.0]), 0.0, 10.0
+        )
+        np.testing.assert_allclose(x, [-1.0, 1.0, 10.0])
+        np.testing.assert_allclose(y, [-5.0, 12.0, 25.0])
+
+    def test_constellation_strokes_keep_connections_across_ra_zero(self):
+        adjacent_pairs = {
+            tuple(np.round(np.asarray(pair).ravel(), 3))
+            for line in CONSTELLATION_LINES
+            for pair in zip(line[:-1], line[1:])
+        }
+        # Pegasus: Markab -> Alpheratz, and Algenib -> Scheat.
+        self.assertIn((345.944, 28.083, 2.097, 29.09), adjacent_pairs)
+        self.assertIn((3.309, 15.184, 346.19, 15.205), adjacent_pairs)
+        # Pisces also crosses the zero-hour meridian.
+        self.assertIn((12.171, 7.585, 359.828, 6.863), adjacent_pairs)
+
+    def test_constellation_abbreviations_are_available(self):
+        labels = {item[0] for item in CONSTELLATION_LABELS}
+        self.assertTrue({"Sgr", "Leo", "Sct", "Peg", "Psc"} <= labels)
+
+    def test_fast_horizontal_projection_matches_astropy_altaz(self):
+        instant = datetime(2026, 10, 10, 21, 0, tzinfo=timezone.utc)
+        ra = np.array([0.0, 120.0, 275.0])
+        dec = np.array([20.0, -12.0, 45.0])
+        fast = equatorial_to_horizontal("557", instant, ra, dec)
+        reference = observation_altaz_series("557", [instant] * 3, ra, dec)
+        self.assertIsNotNone(fast)
+        self.assertIsNotNone(reference)
+        np.testing.assert_allclose(fast[0], reference[0], atol=.01)
+        np.testing.assert_allclose(fast[1], reference[1], atol=.01)
+
+    def test_long_horizons_are_available_but_bounded(self):
+        self.assertIn(("± 600 dní", 600), SKY_TRACK_HORIZONS)
+        self.assertIn(("± 2,5 roku", 913), SKY_TRACK_HORIZONS)
+        self.assertEqual(SKY_TRACK_HORIZONS[-1], ("± 10 let", 3652))
+
+    def test_sampling_stays_fine_for_short_tracks_and_capped_for_long_ones(self):
+        self.assertEqual(sky_track_sample_count(30), 241)
+        self.assertEqual(sky_track_sample_count(300), 1501)
+        self.assertEqual(sky_track_sample_count(600), 2401)
+        self.assertEqual(sky_track_sample_count(3652), 2401)
+
+
+class ObservationResidualTests(unittest.TestCase):
+    def test_score_matches_row_colour_rule(self):
+        observation = Observation(
+            residual_ra_arcsec=-1.25, residual_dec_arcsec=2.4,
+        )
+        self.assertEqual(observation_residual_score(observation), 2.4)
+
+    def test_score_requires_both_coordinate_residuals(self):
+        observation = Observation(residual_ra_arcsec=3.0)
+        self.assertIsNone(observation_residual_score(observation))
+
+    def test_output_epoch_accepts_nineteenth_century_and_year_only(self):
+        self.assertEqual(parse_output_epoch("1900"), datetime(1900, 1, 1))
+        self.assertEqual(
+            parse_output_epoch("1800-06-15 12:30"), datetime(1800, 6, 15, 12, 30)
+        )
+
+
+class MpcParsingTests(unittest.TestCase):
+    def test_ec0001_reference_file_has_24_observations(self):
+        path = Path(__file__).with_name("data") / "ec0001.obs"
+        observations = parse_mpc80(path.read_text(encoding="utf-8"))
+        self.assertEqual(len(observations), 24)
+        self.assertEqual(observations[0].station, "273")
+        self.assertIn("observer_position_gcrs_au", observations[0].raw)
+
+    def test_ades_row_mapping(self):
+        body = [{"ADES_DF": [{
+            "provID": "2026 AB", "obsTime": "2026-01-01T00:00:00Z",
+            "ra": "12.5", "dec": "-2.25", "mag": "20.1", "band": "G", "stn": "F51"
+        }]}]
+        rows = MpcClient._extract_rows(body)
+        observation = MpcClient._to_observation(rows[0], "fallback")
+        self.assertEqual(observation.designation, "2026 AB")
+        self.assertEqual(observation.station, "F51")
+        self.assertAlmostEqual(observation.dec_deg or 0.0, -2.25)
+
+    def test_ades_dict_response_mapping(self):
+        body = {"ADES_DF": [{"provID": "2026 AB", "ra": "1", "dec": "2"}]}
+        self.assertEqual(len(MpcClient._extract_rows(body)), 1)
+
+    def test_ades_spacecraft_position_is_preserved(self):
+        row = {
+            "trkSub": "ec0001", "obsTime": "2026-09-16T13:34:48Z",
+            "ra": "272.9875", "dec": "64.3758", "stn": "273",
+            "sys": "ICRF_AU", "ctr": "399",
+            "pos1": "0.00768793", "pos2": "-0.00332991", "pos3": "-0.00312377",
+            "vel1": "0.000071", "vel2": "0.000274", "vel3": "0.000052",
+        }
+        observation = MpcClient._to_observation(row, "ec0001")
+        self.assertEqual(
+            observation.raw["observer_position_gcrs_au"],
+            (0.00768793, -0.00332991, -0.00312377),
+        )
+        self.assertEqual(
+            observation.raw["observer_velocity_gcrs_au_per_day"],
+            (0.000071, 0.000274, 0.000052),
+        )
+
+    def test_ades_uncertainties_are_used_as_arcsecond_sigmas(self):
+        observation = MpcClient._to_observation({
+            "trkSub": "SWAN26Q", "obsTime": "2026-08-24T00:00:00Z",
+            "ra": "1", "dec": "2", "stn": "C49",
+            "rmsra": "120", "rmsdec": "150",
+        }, "SWAN26Q")
+        self.assertEqual(_observation_sigma_arcsec(observation), (120.0, 150.0))
+
+    def test_ades_wgs84_roving_observer_is_not_treated_as_geocentre(self):
+        observation = MpcClient._to_observation({
+            "trkSub": "SWAN26Q", "obstime": "2026-09-03T03:05:26.1Z",
+            "ra": "175.8953", "dec": "20.63973", "stn": "247",
+            "sys": "WGS84", "pos1": "247.16759", "pos2": "37.63058",
+            "pos3": "3190",
+        }, "SWAN26Q")
+        instant = parse_observation_time(observation.time)
+        offsets = _observation_offsets_gcrs([
+            (observation, instant, observation.ra_deg or 0.0, observation.dec_deg or 0.0)
+        ])
+        self.assertGreater(float(np.linalg.norm(offsets[0])), 4.0e-5)
+        self.assertLess(float(np.linalg.norm(offsets[0])), 4.4e-5)
+
+    def test_mpc80_mapping_preserves_station(self):
+        line = list(" " * 80)
+        line[0:12] = f"{'K24Y01C':<12}"
+        line[15:32] = f"{'2024 12 25.50000':<17}"
+        line[32:44] = f"{'12 34 56.70':<12}"
+        line[44:56] = f"{'+12 34 56.7':<12}"
+        line[65:70] = f"{18.4:5.1f}"
+        line[70] = "G"
+        line[77:80] = "M22"
+        observation = parse_mpc80("".join(line))[0]
+        self.assertEqual(observation.station, "M22")
+        self.assertEqual(observation.time[:10], "2024-12-25")
+        self.assertAlmostEqual(observation.ra_deg or 0.0, 188.73625)
+        self.assertAlmostEqual(observation.dec_deg or 0.0, 12.5824167, places=6)
+
+    def test_mpc80_spacecraft_pair_is_one_observation_with_offset(self):
+        first = "     C46K1R1*0S2026 09 23.00099916 09 31.734+50 42 00.90               LNEOCPC53"
+        second = "     C46K1R1 0s2026 09 23.0009991 +  505.3577 - 3075.1589 + 6130.6117   NEOCPC53"
+        observations = parse_mpc80(first + "\n" + second)
+        self.assertEqual(len(observations), 1)
+        offset = observations[0].raw["observer_position_gcrs_au"]
+        self.assertAlmostEqual(offset[0] * 149_597_870.7, 505.3577, places=4)
+        self.assertAlmostEqual(offset[1] * 149_597_870.7, -3075.1589, places=4)
+        self.assertAlmostEqual(offset[2] * 149_597_870.7, 6130.6117, places=4)
+
+    def test_spacecraft_offset_overrides_unknown_station(self):
+        instant = datetime(2026, 9, 23, tzinfo=timezone.utc)
+        observation = parse_mpc80(
+            "     C46K1R1 0S2026 09 23.00099916 09 31.734+50 42 00.90               LNEOCPC53\n"
+            "     C46K1R1 0s2026 09 23.0009991 +  505.3577 - 3075.1589 + 6130.6117   NEOCPC53"
+        )[0]
+        offsets = _observation_offsets_gcrs([(observation, instant, 0.0, 0.0)])
+        self.assertGreater(float(np.linalg.norm(offsets[0])), 4e-5)
+
+    def test_observatory_offset_is_topocentric(self):
+        instant = datetime(2026, 8, 3, tzinfo=timezone.utc)
+        offsets = station_offsets_gcrs(["500", "M22"], [instant, instant])
+        self.assertTrue(np.allclose(offsets[0], 0.0))
+        self.assertGreater(float(np.linalg.norm(offsets[1])), 4e-5)
+
+    def test_station_807_is_in_observatory_catalog(self):
+        details = observatory_details("807")
+        self.assertIsNotNone(details)
+        self.assertIn("Cerro Tololo", str(details["name"]))
+
+    def test_cartesian_orbit_mapping(self):
+        speed = math.sqrt(MU_SUN)
+        body = [{"mpc_orb": [{
+            "CAR": {
+                "coefficient_names": ["x", "y", "z", "vx", "vy", "vz"],
+                "coefficient_values": [1, 0, 0, 0, speed, 0],
+            },
+            "epoch_data": {"epoch": 51544.5},
+            "magnitude_data": {"H": 12.4, "G": 0.21},
+        }]}]
+        solution = parse_mpc_orbit(body, "Test")
+        self.assertAlmostEqual(solution.epoch_jd, 2451545.0)
+        self.assertAlmostEqual(solution.semi_major_axis_au, 1.0)
+        self.assertAlmostEqual(solution.absolute_magnitude, 12.4)
+
+    def test_mpc_display_name_for_named_asteroid(self):
+        result = mpc_display_name({
+            "iau_designation": "(9841)", "permid": "9841",
+            "name": "Mašek", "unpacked_primary_provisional_designation": "1988 UT",
+        }, "9841")
+        self.assertEqual(result, "(9841) Mašek")
+
+    def test_mpc_display_name_for_named_comet(self):
+        result = mpc_display_name({
+            "name": "Hale-Bopp",
+            "unpacked_primary_provisional_designation": "C/1995 O1",
+        }, "C/1995 O1")
+        self.assertEqual(result, "C/1995 O1 (Hale-Bopp)")
+
+    def test_ambiguous_masek_identifier_offers_comet_and_asteroid(self):
+        choices = mpc_identifier_choices({
+            "found": 2,
+            "disambiguation_list": [
+                {"group": "Comets", "name": "Masek", "permid": None,
+                 "unpacked_primary_provisional_designation": "C/2024 Y1"},
+                {"group": "Minor Planets", "name": "Mašek", "permid": "9841",
+                 "unpacked_primary_provisional_designation": "1988 UT"},
+            ],
+        }, "Masek")
+        self.assertEqual(choices, [
+            ("(9841) Mašek — planetka", "9841"),
+            ("C/2024 Y1 (Masek) — kometa", "C/2024 Y1"),
+        ])
+
+    def test_ambiguous_name_choices_follow_discovery_order(self):
+        choices = mpc_identifier_choices({
+            "found": 5,
+            "disambiguation_list": [
+                {"group": "Comets", "name": "Leonard",
+                 "unpacked_primary_provisional_designation": "C/2023 A1"},
+                {"group": "Comets", "name": "Leonard",
+                 "unpacked_primary_provisional_designation": "P/2018 VN2"},
+                {"group": "Minor Planets", "name": "Leonard", "permid": "53435",
+                 "unpacked_primary_provisional_designation": "1999 ED78"},
+                {"group": "Comets", "name": "Leonard",
+                 "unpacked_primary_provisional_designation": "P/2017 Y3"},
+                {"group": "Comets", "name": "Leonard",
+                 "unpacked_primary_provisional_designation": "C/2020 F1"},
+            ],
+        }, "Leonard")
+        self.assertEqual([query for _, query in choices], [
+            "53435", "P/2017 Y3", "P/2018 VN2", "C/2020 F1", "C/2023 A1",
+        ])
+
+    def test_cartesian_covariance_mapping(self):
+        covariance = {
+            f"cov{row}{column}": (1e-12 if row == column else 0.0)
+            for row in range(6) for column in range(row, 6)
+        }
+        body = [{"mpc_orb": [{
+            "CAR": {
+                "coefficient_names": ["x", "y", "z", "vx", "vy", "vz"],
+                "coefficient_values": [1, 0, 0, 0, math.sqrt(MU_SUN), 0],
+                "covariance": covariance,
+            },
+            "epoch_data": {"epoch": 51544.5},
+        }]}]
+        solution = parse_mpc_orbit(body, "Test")
+        self.assertIsNotNone(solution.state_covariance)
+        self.assertAlmostEqual(solution.state_covariance[2][2], 1e-12)
+
+
+class PreviewGeometryTests(unittest.TestCase):
+    def test_julian_date_conversion_does_not_use_windows_timestamp_range(self):
+        self.assertEqual(datetime_from_jd(2451545.0), datetime(2000, 1, 1, 12, tzinfo=timezone.utc))
+        self.assertIsNone(datetime_from_jd(-1e20))
+
+    def test_mean_anomaly_near_360_uses_upcoming_perihelion(self):
+        solution = OrbitSolution(
+            designation="ec0001", epoch_jd=2461317.5,
+            semi_major_axis_au=3914.52883, eccentricity=0.9977681,
+            inclination_deg=85.20095, node_deg=304.03877,
+            arg_peri_deg=101.83306, mean_anomaly_deg=359.99866038,
+        )
+        # Screenshot elements are rounded, so agreement within 0.01 day is the
+        # meaningful regression check here.
+        self.assertAlmostEqual(perihelion_jd_from_solution(solution), 2461650.38517, delta=0.01)
+
+    def test_sexagesimal_ephemeris_coordinates(self):
+        self.assertEqual(format_ra_sexagesimal(188.73625), "12 34 56.70")
+        self.assertEqual(format_dec_sexagesimal(-12.5824167), "−12 34 56.7")
+
+    def test_sun_centred_camera_axes_are_orthonormal(self):
+        points = np.eye(3)
+        x, y, depth = project_ecliptic_camera(points, 0.0, 0.0)
+        self.assertTrue(np.allclose(x, [0.0, 1.0, 0.0]))
+        self.assertTrue(np.allclose(y, [0.0, 0.0, 1.0]))
+        self.assertTrue(np.allclose(depth, [1.0, 0.0, 0.0]))
+
+    def test_camera_azimuth_rotates_only_about_ecliptic_z(self):
+        points = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+        x, y, depth = project_ecliptic_camera(points, 90.0, 0.0)
+        self.assertTrue(np.allclose(x, [-1.0, 0.0], atol=1e-12))
+        self.assertTrue(np.allclose(y, [0.0, 1.0], atol=1e-12))
+        self.assertTrue(np.allclose(depth, [0.0, 0.0], atol=1e-12))
+
+    def test_preview_geometry_is_finite(self):
+        result = apparent_geometry(demo_solution(), np.array([2460950.5, 2460951.5]))
+        for values in result.values():
+            self.assertTrue(np.all(np.isfinite(values)))
+        self.assertTrue(np.all((result["ra"] >= 0) & (result["ra"] < 360)))
+
+    def test_osculating_curve_has_no_wrap_chords(self):
+        curve, valid = orbital_curve_xyz(demo_solution(), 30.0)
+        steps = np.linalg.norm(np.diff(curve[valid], axis=0), axis=1)
+        self.assertLess(float(np.max(steps)), 0.02)
+
+    def test_closed_orbit_is_not_preclipped_by_solar_viewport(self):
+        solution = OrbitSolution(
+            designation="9841", epoch_jd=2461118.5,
+            semi_major_axis_au=2.18882215, eccentricity=.1600963,
+            inclination_deg=2.19873, node_deg=138.52648,
+            arg_peri_deg=264.66660, mean_anomaly_deg=185.59746671,
+        )
+        self.assertIsNone(solar_orbit_clip_radius(solution, 1.9))
+        curve, valid = orbital_curve_xyz(solution, max_radius_au=None)
+        self.assertTrue(np.all(valid))
+        self.assertTrue(np.allclose(curve[0], curve[-1], atol=1e-12))
+
+    def test_hyperbolic_state_and_propagation(self):
+        position = np.array([1.0, 0.0, 0.0])
+        velocity = np.array([0.0, math.sqrt(2.5 * MU_SUN), 0.0])
+        elements = cartesian_to_elements(position, velocity)
+        self.assertLess(elements[0], 0.0)
+        self.assertGreater(elements[1], 1.0)
+        from orbit_app.domain import OrbitSolution
+        solution = OrbitSolution("Hyperbola", 2451545.0, *elements)
+        states = heliocentric_xyz(solution, np.array([2451535.0, 2451545.0, 2451555.0]))
+        self.assertTrue(np.all(np.isfinite(states)))
+        self.assertTrue(np.allclose(states[1], position, atol=1e-10))
+
+    def test_near_parabolic_kepler_solution_is_continuous(self):
+        mean = np.linspace(-.05, .05, 2001)
+        eccentric = solve_kepler(mean, .999999)
+        residual = eccentric - .999999 * np.sin(eccentric) - mean
+        self.assertLess(float(np.max(np.abs(residual))), 2e-14)
+        self.assertTrue(np.all(np.diff(eccentric) >= 0.0))
+
+
+class OrbitFitSelectionTests(unittest.TestCase):
+    def test_fit_selection_count_respects_window_and_manual_exclusion(self):
+        from orbit_app.domain import Observation
+        observations = [
+            Observation(time="2022-01-01T00:00:00Z", ra_deg=1.0, dec_deg=2.0),
+            Observation(time="2024-06-01T00:00:00Z", ra_deg=1.0, dec_deg=2.0),
+            Observation(time="2025-01-01T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
+                        excluded_from_fit=True),
+            Observation(time="2025-02-01T00:00:00Z", ra_deg=1.0, dec_deg=2.0),
+        ]
+        self.assertEqual(fit_selection_count(observations, None), 3)
+        self.assertEqual(fit_selection_count(observations, 2.0), 2)
+
+    def test_ades_time_with_hundredths_is_accepted(self):
+        instant = parse_observation_time("2024-12-29T00:58:51.17Z")
+        self.assertEqual(instant.microsecond, 170000)
+
+    def test_two_year_window_is_relative_to_newest_observation(self):
+        newest = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        rows = [
+            (object(), newest - timedelta(days=900), 0.0, 0.0),
+            (object(), newest - timedelta(days=700), 0.0, 0.0),
+            (object(), newest, 0.0, 0.0),
+        ]
+        selected = _truncate_rows_to_recent_years(rows, 2.0)
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(selected[-1][1], newest)
+
+
+class _NoPlanets:
+    def position(self, body: str, jd: float) -> np.ndarray:
+        raise AssertionError("Sun-only test must not request a planet.")
+
+
+class NativeIntegratorTests(unittest.TestCase):
+    def test_evolution_year_range_is_asymmetric(self):
+        solution = OrbitSolution(
+            "Test", 2451545.0, 2.0, .2, 0.0, 0.0, 0.0, 0.0,
+            position_au=(1.6, 0.0, 0.0), velocity_au_per_day=(0.0, .01, 0.0),
+        )
+        start, stop = evolution_span(solution, "years", 150, 200)
+        self.assertAlmostEqual(solution.epoch_jd - start, 150 * 365.25)
+        self.assertAlmostEqual(stop - solution.epoch_jd, 200 * 365.25)
+
+    def test_return_range_rejects_open_orbit(self):
+        solution = OrbitSolution("Open", 2451545.0, -10.0, 1.1, 0.0, 0.0, 0.0, 0.0)
+        with self.assertRaisesRegex(ValueError, "uzavřenou eliptickou"):
+            evolution_span(solution, "returns", 1, 1)
+
+    def test_marsden_law_is_normalized_at_one_au(self):
+        self.assertAlmostEqual(marsden_water_ice_law(1.0), 1.0, places=5)
+
+    def test_nongravitational_axes_follow_rtn_frame(self):
+        acceleration = nongravitational_acceleration(
+            np.array([1.0, 0.0, 0.0]), np.array([0.0, .01, 0.0]),
+            {"A1": 1e-8, "A2": 2e-8, "A3": -3e-8},
+        )
+        np.testing.assert_allclose(acceleration, [1e-8, 2e-8, -3e-8], rtol=2e-5)
+
+    def test_zero_length_propagation_returns_initial_state(self):
+        state = StateVector(2451545.0, np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.01, 0.0]))
+        engine = NBodyIntegrator(PLANETS)
+        result = engine.propagate(state, np.array([2451545.0, 2451545.0]))
+        self.assertEqual(result.shape, (2, 6))
+        self.assertTrue(np.allclose(result[0], state.packed()))
+        self.assertTrue(np.allclose(result[1], state.packed()))
+
+    def test_one_year_circular_solar_orbit(self):
+        initial = StateVector(
+            epoch_jd=2451545.0,
+            position_au=np.array([1.0, 0.0, 0.0]),
+            velocity_au_per_day=np.array([0.0, math.sqrt(MU_SUN), 0.0]),
+        )
+        engine = NBodyIntegrator(_NoPlanets(), perturbers=())
+        states = engine.propagate(initial, np.array([2451545.0, 2451545.0 + 365.2568983]))
+        self.assertLess(float(np.linalg.norm(states[-1, :3] - initial.position_au)), 2e-6)
+        self.assertLess(float(np.linalg.norm(states[-1, 3:] - initial.velocity_au_per_day)), 4e-8)
+
+    def test_propagates_on_both_sides_of_epoch(self):
+        initial = StateVector(
+            epoch_jd=2451545.0,
+            position_au=np.array([1.0, 0.0, 0.0]),
+            velocity_au_per_day=np.array([0.0, math.sqrt(MU_SUN), 0.0]),
+        )
+        engine = NBodyIntegrator(_NoPlanets(), perturbers=())
+        states = engine.propagate(initial, np.array([2451544.0, 2451545.0, 2451546.0]))
+        self.assertEqual(states.shape, (3, 6))
+        self.assertTrue(np.all(np.isfinite(states)))
+        self.assertTrue(np.allclose(states[1], initial.packed()))
+
+
+if __name__ == "__main__":
+    unittest.main()
+

@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+dist/
+build/
+*.spec
+orbit-data/
+orbit-crash.log
+artifacts/
+_horizon_check.png
+
