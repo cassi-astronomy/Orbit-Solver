@@ -71,7 +71,10 @@ from .observatories import (
     equatorial_to_horizontal, observation_altaz_series, observation_geometry,
     observatory_details, station_offsets_gcrs,
 )
-from .orbit_fit import fit_orbit, fit_selection_count, parse_observation_time
+from .orbit_fit import (
+    fit_orbit, fit_selection_count, initial_orbit_from_observations,
+    parse_observation_time,
+)
 from .orbit_engine import NBodyIntegrator, StateVector
 from .orbit_evolution import (
     EvolutionResult, PLANET_LABELS, calculate_orbit_evolution,
@@ -552,6 +555,34 @@ class OrbitFitWorker(QObject):
                 except Exception:
                     pass
             self.success.emit(result)
+        except Exception as exc:
+            self.error.emit(str(exc))
+        finally:
+            self.finished.emit()
+
+
+class PreliminaryOrbitWorker(QObject):
+    success = Signal(object)
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(
+        self, observations: list[Observation], method: str,
+        perihelion_distance_au: float | None,
+    ) -> None:
+        super().__init__()
+        self.observations = observations
+        self.method = method
+        self.perihelion_distance_au = perihelion_distance_au
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            solution = initial_orbit_from_observations(
+                self.observations, self.method, self.perihelion_distance_au,
+                minimum_observations=3,
+            )
+            self.success.emit((solution, self.method, self.perihelion_distance_au))
         except Exception as exc:
             self.error.emit(str(exc))
         finally:
@@ -2547,6 +2578,15 @@ class EphemerisPanel(QWidget):
         self.solution = solution
         self.generate()
 
+    def use_short_arc_preset(self) -> None:
+        """Use the dense follow-up cadence appropriate for a discovery arc."""
+        self.start.setDateTime(datetime.now(timezone.utc).replace(tzinfo=None))
+        index = self.step.findData(10)
+        if index >= 0:
+            self.step.setCurrentIndex(index)
+        # 48 hours at ten-minute spacing, including the starting row.
+        self.count.setValue(289)
+
     @staticmethod
     def _coordinates_for_solution(
         solution: OrbitSolution, jd: np.ndarray, observer_offsets: np.ndarray | None,
@@ -3098,6 +3138,107 @@ class OrbitConstraintsDialog(QDialog):
         return self.is_comet and self.original_future.isChecked()
 
 
+class PreliminaryOrbitDialog(QDialog):
+    """Settings for a deliberately provisional short-arc orbit."""
+
+    def __init__(self, observation_count: int, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Předběžná dráha z krátkého oblouku")
+        self.setMinimumWidth(560)
+        self.method = QComboBox()
+        self.method.addItem("Systematické hledání vzdálenosti (doporučeno)", "systematic")
+        self.method.addItem("Väisälä — předpoklad průchodu perihelem", "vaisala")
+        self.perihelion = QDoubleSpinBox()
+        self.perihelion.setRange(0.01, 100.0)
+        self.perihelion.setDecimals(4)
+        self.perihelion.setSingleStep(0.1)
+        self.perihelion.setValue(1.0)
+        self.perihelion.setSuffix(" AU")
+        self.perihelion.setEnabled(False)
+        self.method.currentIndexChanged.connect(
+            lambda _: self.perihelion.setEnabled(self.method.currentData() == "vaisala")
+        )
+        description = QLabel(
+            f"Načteno {observation_count} měření. Systematická metoda prohledá vzdálenost "
+            "a radiální rychlost. Väisälova varianta vytvoří jednu hypotézu pro zadané q."
+        )
+        description.setWordWrap(True)
+        warning = QLabel(
+            "Výsledek z krátkého oblouku není jednoznačně určená dráha. Použijte jej "
+            "jako počáteční odhad a počítejte s rychle rostoucí nejistotou efemeridy."
+        )
+        warning.setWordWrap(True)
+        warning.setStyleSheet("color: #ffcf70;")
+        form = QFormLayout()
+        form.addRow("Metoda:", self.method)
+        form.addRow("Perihelová vzdálenost q:", self.perihelion)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Vypočítat předběžnou dráhu")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addWidget(description)
+        layout.addLayout(form)
+        layout.addWidget(warning)
+        layout.addWidget(buttons)
+
+    def selected_method(self) -> str:
+        return str(self.method.currentData())
+
+    def selected_perihelion_distance(self) -> float | None:
+        return self.perihelion.value() if self.selected_method() == "vaisala" else None
+
+
+class PreliminaryOrbitResultDialog(QDialog):
+    USE = 1
+    REFINE = 2
+
+    def __init__(
+        self, solution: OrbitSolution, method: str, assumed_q: float | None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Předběžná dráha — výsledek")
+        self.setMinimumWidth(600)
+        method_text = (
+            "systematické hledání vzdálenosti a radiální rychlosti"
+            if method == "systematic" else f"Väisälova hypotéza, zadané q = {assumed_q:.4f} AU"
+        )
+        actual_q = solution.semi_major_axis_au * (1.0 - solution.eccentricity)
+        report = QPlainTextEdit()
+        report.setReadOnly(True)
+        report.setMinimumHeight(220)
+        report.setPlainText(
+            "PŘEDBĚŽNÉ ŘEŠENÍ — DRÁHA NENÍ JEDNOZNAČNĚ URČENA\n\n"
+            f"Metoda: {method_text}\n"
+            f"Epocha: JD {solution.epoch_jd:.6f}\n"
+            f"a = {solution.semi_major_axis_au:.8g} AU\n"
+            f"e = {solution.eccentricity:.8f}\n"
+            f"q = {actual_q:.8f} AU\n"
+            f"i = {solution.inclination_deg:.6f}°\n"
+            f"Ω = {solution.node_deg:.6f}°\n"
+            f"ω = {solution.arg_peri_deg:.6f}°\n"
+            f"M = {solution.mean_anomaly_deg:.6f}°\n\n"
+            "Volba „Použít a zpřesnit“ spustí běžnou diferenciální korekci ze všech "
+            "vybraných měření. Efemerida bude přednastavena po 10 minutách na 48 hodin."
+        )
+        use = QPushButton("Použít předběžnou dráhu")
+        refine = QPushButton("Použít a zpřesnit")
+        refine.setObjectName("solveOrbit")
+        close = QPushButton("Zavřít")
+        use.clicked.connect(lambda: self.done(self.USE))
+        refine.clicked.connect(lambda: self.done(self.REFINE))
+        close.clicked.connect(self.reject)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        actions.addWidget(use)
+        actions.addWidget(refine)
+        actions.addWidget(close)
+        layout = QVBoxLayout(self)
+        layout.addWidget(report)
+        layout.addLayout(actions)
+
+
 def metric_card(title: str, value: str) -> tuple[QFrame, QLabel]:
     frame = QFrame(); frame.setObjectName("card")
     layout = QVBoxLayout(frame)
@@ -3137,6 +3278,8 @@ class MainWindow(QMainWindow):
         self._fit_after_observations_load = False
         self.fit_thread: QThread | None = None
         self.fit_worker: OrbitFitWorker | None = None
+        self.preliminary_thread: QThread | None = None
+        self.preliminary_worker: PreliminaryOrbitWorker | None = None
         self._dirty_solution_tabs: set[int] = set()
         self._build_ui()
 
@@ -3176,6 +3319,14 @@ class MainWindow(QMainWindow):
         self.fit_button.setObjectName("solveOrbit")
         self.fit_button.setVisible(False)
         self.fit_button.clicked.connect(self.calculate_own_orbit)
+        self.preliminary_button = QPushButton("Předběžná dráha z krátkého oblouku…")
+        self.preliminary_button.setToolTip(
+            "Prohledá možné vzdálenosti a radiální rychlosti, případně vytvoří "
+            "Väisälovu hypotézu se zadanou perihelovou vzdáleností."
+        )
+        self.preliminary_button.setEnabled(False)
+        self.preliminary_button.setVisible(False)
+        self.preliminary_button.clicked.connect(self.calculate_preliminary_orbit)
         self.constraints_button = QPushButton("Vlastní nastavení…")
         self.constraints_button.setEnabled(False)
         self.constraints_button.clicked.connect(self.configure_constraints)
@@ -3204,6 +3355,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.paste_observations_button)
         layout.addSpacing(7)
         layout.addWidget(self.fit_button)
+        layout.addWidget(self.preliminary_button)
         layout.addWidget(self.constraints_button); layout.addWidget(QLabel("Rozsah astrometrie:"))
         layout.addWidget(self.fit_interval); layout.addWidget(hint)
         layout.addStretch()
@@ -3320,6 +3472,8 @@ class MainWindow(QMainWindow):
             self.photometry_panel.set_observations([])
             self.fit_button.setText("▶  Spočítat vlastní dráhu")
             self.fit_button.setVisible(False)
+            self.preliminary_button.setVisible(False)
+            self.preliminary_button.setEnabled(False)
             self.obs_metric.setText("0")
             self.arc_metric.setText("—")
             self.rms_metric.setText("—")
@@ -3402,10 +3556,12 @@ class MainWindow(QMainWindow):
         self.object_title.setText(self.current_display_name or designation)
         self.solve.setEnabled(True)
         self.fit_button.setVisible(True)
+        self.preliminary_button.setVisible(True)
         # Astrometry is sufficient to offer the action.  If its required
         # initial Cartesian state has not been loaded yet, calculate_own_orbit
         # obtains that state from MPC before starting the native fit.
         self.fit_button.setEnabled(bool(rows))
+        self.preliminary_button.setEnabled(fit_selection_count(rows, None) >= 3)
         self._update_fit_button_label()
         self.constraints_button.setEnabled(self.has_orbit)
         times = sorted(row.time for row in rows if row.time)
@@ -3453,6 +3609,8 @@ class MainWindow(QMainWindow):
         self.solve.setEnabled(True)
         self.fit_button.setVisible(bool(self.current_observations))
         self.fit_button.setEnabled(bool(self.current_observations))
+        self.preliminary_button.setVisible(bool(self.current_observations))
+        self.preliminary_button.setEnabled(fit_selection_count(self.current_observations, None) >= 3)
         self.constraints_button.setEnabled(True)
         for index in range(1, self.tabs.count()):
             self.tabs.setTabEnabled(index, True)
@@ -3697,6 +3855,10 @@ class MainWindow(QMainWindow):
         selected = fit_selection_count(
             self.current_observations, self.fit_interval.currentData()
         ) if total else 0
+        if hasattr(self, "preliminary_button") and self.preliminary_thread is None:
+            self.preliminary_button.setEnabled(fit_selection_count(
+                self.current_observations, None,
+            ) >= 3)
         if not total:
             self.fit_button.setText("▶  Spočítat vlastní dráhu")
         elif selected == total:
@@ -3773,6 +3935,84 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Aktivní vlastní nastavení: {summary}", 10000)
         else:
             self.statusBar().showMessage("Všech šest elementů je ve vlastním fitu volných.", 6000)
+
+    def calculate_preliminary_orbit(self) -> None:
+        if fit_selection_count(self.current_observations, None) < 3:
+            QMessageBox.information(
+                self, "Předběžná dráha",
+                "Pro předběžný výpočet jsou potřeba alespoň tři platná měření.",
+            )
+            return
+        dialog = PreliminaryOrbitDialog(len(self.current_observations), self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        method = dialog.selected_method()
+        perihelion_distance = dialog.selected_perihelion_distance()
+        self.preliminary_button.setEnabled(False)
+        self.fit_button.setEnabled(False)
+        method_text = "systematicky" if method == "systematic" else "Väisälovou metodou"
+        self.statusBar().showMessage(
+            f"Hledám předběžnou dráhu {method_text}; výpočet běží na pozadí…"
+        )
+        thread = QThread(self)
+        worker = PreliminaryOrbitWorker(
+            self.current_observations, method, perihelion_distance,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.success.connect(self._preliminary_orbit_loaded)
+        worker.error.connect(self._preliminary_orbit_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._preliminary_finished)
+        self.preliminary_thread = thread
+        self.preliminary_worker = worker
+        thread.start()
+
+    def _preliminary_orbit_loaded(self, result: object) -> None:
+        solution, method, assumed_q = result
+        solution = replace(
+            solution,
+            designation=self.current_designation or solution.designation,
+            display_name=self.current_display_name or solution.designation,
+        )
+        dialog = PreliminaryOrbitResultDialog(solution, method, assumed_q, self)
+        choice = dialog.exec()
+        if choice not in (PreliminaryOrbitResultDialog.USE, PreliminaryOrbitResultDialog.REFINE):
+            self.statusBar().showMessage("Předběžné řešení nebylo použito.", 6000)
+            return
+        self.has_orbit = True
+        self.ephemeris_panel.use_short_arc_preset()
+        self._apply_solution(solution)
+        self.object_title.setText(self.current_display_name or solution.designation)
+        method_label = "systematický odhad" if method == "systematic" else "Väisälova hypotéza"
+        self.object_label.setText(
+            f"Předběžná dráha z krátkého oblouku • {method_label} • není jednoznačná"
+        )
+        self.constraints_button.setEnabled(True)
+        for index in range(1, self.tabs.count()):
+            self.tabs.setTabEnabled(index, True)
+        if choice == PreliminaryOrbitResultDialog.REFINE:
+            self._start_own_orbit_fit(solution)
+        else:
+            self.tabs.setCurrentIndex(1)
+            self.statusBar().showMessage(
+                "Použita předběžná dráha. Efemerida je nastavena po 10 minutách na 48 hodin; "
+                "výsledek může mít velkou a rychle rostoucí nejistotu.", 15000,
+            )
+
+    def _preliminary_orbit_failed(self, message: str) -> None:
+        QMessageBox.warning(self, "Předběžná dráha", message)
+        self.statusBar().showMessage("Výpočet předběžné dráhy selhal.", 7000)
+
+    def _preliminary_finished(self) -> None:
+        self.preliminary_thread = None
+        self.preliminary_worker = None
+        available = fit_selection_count(self.current_observations, None) >= 3
+        self.preliminary_button.setEnabled(available and self.fit_thread is None)
+        if self.fit_thread is None:
+            self.fit_button.setEnabled(bool(self.current_observations))
 
     def calculate_own_orbit(self) -> None:
         if not self.current_observations:
@@ -3860,6 +4100,9 @@ class MainWindow(QMainWindow):
         self.fit_thread = None
         self.fit_worker = None
         self.fit_button.setEnabled(True)
+        self.preliminary_button.setEnabled(
+            fit_selection_count(self.current_observations, None) >= 3
+        )
         self.solve.setEnabled(True)
         self.fit_interval.setEnabled(True)
 

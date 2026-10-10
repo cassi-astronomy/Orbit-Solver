@@ -125,8 +125,21 @@ class NBodyIntegrator:
         epochs = np.asarray(epochs_jd, dtype=float)
         if epochs.ndim != 1 or epochs.size == 0:
             raise ValueError("Je potřeba alespoň jeden výstupní čas.")
-        if np.any(np.diff(epochs) < 0):
-            raise ValueError("Výstupní časy musejí být seřazené vzestupně.")
+        if not np.all(np.isfinite(epochs)):
+            raise ValueError("Výstupní časy musejí být konečná čísla.")
+        # solve_ivp requires strictly monotonic t_eval.  Astrometric rows may
+        # share one epoch and light-time correction can swap two otherwise
+        # adjacent epochs by a tiny amount.  Integrate sorted unique epochs and
+        # restore the caller's original order, including duplicates.
+        order = np.argsort(epochs, kind="stable")
+        sorted_epochs = epochs[order]
+        unique_epochs, inverse = np.unique(sorted_epochs, return_inverse=True)
+        if unique_epochs.size != epochs.size or not np.array_equal(order, np.arange(epochs.size)):
+            unique_states = self.propagate(initial, unique_epochs)
+            sorted_states = unique_states[inverse]
+            output = np.empty((epochs.size, 6), dtype=float)
+            output[order] = sorted_states
+            return output
 
         def derivative(offset_days: float, state: np.ndarray) -> np.ndarray:
             position = state[:3]

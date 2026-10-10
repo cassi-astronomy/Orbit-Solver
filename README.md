@@ -138,6 +138,10 @@ QT_QPA_PLATFORM=xcb python3 run.py
    odhad, protože katalogová dráha ještě nemusí existovat.
 4. Podle potřeby omezte časový rozsah, vyřaďte chybná měření a zvolte
    **Spočítat vlastní dráhu**.
+   Pokud je oblouk příliš krátký nebo běžný počáteční odhad selže, použijte
+   **Předběžná dráha z krátkého oblouku**. Doporučené systematické hledání
+   prohledává vzdálenost a radiální rychlost; alternativní Väisälova metoda
+   vytvoří hypotézu pro ručně zadanou perihelovou vzdálenost `q`.
 5. Výsledek prohlížejte v záložkách **Elementy**, **Efemerida**,
    **Vývoj dráhy**, **Sluneční soustava**, **Pohled ze Země** a
    **Světelná křivka**.
@@ -159,6 +163,10 @@ aplikací nutné porovnat s MPC, JPL Horizons nebo jiným nezávislým softwarem
   předpoklad; skutečná negravitační aktivita komety se může mezi návraty měnit.
 - Poziční nejistoty jsou formálně propagovány z kovariance fitovaného stavu;
   nezahrnují všechny možné systematické chyby měření ani modelu.
+- Jediná předběžná dráha z velmi krátkého oblouku není jednoznačné řešení.
+  Slouží jako počáteční odhad pro diferenciální korekci; efemerida se v tomto
+  režimu přednastaví po 10 minutách na následujících 48 hodin a její skutečná
+  nejistota může rychle růst.
 - Fotometrická předpověď je modelová. U komet se skutečná aktivita a jasnost
   mohou od vypočtené křivky výrazně lišit.
 - Velmi dlouhé integrace a velké soubory pozorování mohou trvat desítky sekund

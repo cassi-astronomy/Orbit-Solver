@@ -12,7 +12,7 @@ from .observatories import (
     dynamical_jd, earth_heliocentric_ecliptic, geodetic_offsets_gcrs,
     station_offsets_gcrs,
 )
-from .orbit_engine import NBodyIntegrator, StateVector
+from .orbit_engine import MU_SUN, NBodyIntegrator, StateVector
 from .planetary import PLANETS
 
 C_AU_PER_DAY = 173.1446326846693
@@ -218,7 +218,11 @@ def _observation_sigmas(rows: list[tuple[Observation, datetime, float, float]]) 
     ], dtype=float)
 
 
-def initial_orbit_from_observations(observations: list[Observation]) -> OrbitSolution:
+def initial_orbit_from_observations(
+    observations: list[Observation], method: str = "systematic",
+    perihelion_distance_au: float | None = None,
+    minimum_observations: int = 6,
+) -> OrbitSolution:
     """Estimate a heliocentric state from angles and times without an MPC orbit.
 
     The observed line-of-sight motion supplies the transverse velocity.  A
@@ -226,7 +230,19 @@ def initial_orbit_from_observations(observations: list[Observation]) -> OrbitSol
     against a representative subset with the same N-body model used by the
     final six-parameter differential correction.  This is an initial-orbit
     estimate, not the final solution.
+
+    ``method="systematic"`` searches topocentric range and range rate.  The
+    optional ``method="vaisala"`` instead constrains the state to be close to
+    perihelion at a user-supplied perihelion distance.  That second result is a
+    Väisälä hypothesis intended only as a seed for the full differential fit.
     """
+    if method not in {"systematic", "vaisala"}:
+        raise ValueError(f"Neznámá metoda předběžné dráhy: {method}")
+    if method == "vaisala" and (
+        perihelion_distance_au is None or not np.isfinite(perihelion_distance_au)
+        or perihelion_distance_au <= 0.0
+    ):
+        raise OrbitFitError("Pro Väisälovu dráhu zadejte kladnou perihelovou vzdálenost q.")
     parsed: list[tuple[Observation, datetime, float, float]] = []
     for observation in observations:
         if (
@@ -242,8 +258,11 @@ def initial_orbit_from_observations(observations: list[Observation]) -> OrbitSol
         except (TypeError, ValueError):
             continue
     parsed.sort(key=lambda item: item[1])
-    if len(parsed) < 6:
-        raise OrbitFitError("Pro počáteční určení dráhy je potřeba alespoň šest měření.")
+    if len(parsed) < minimum_observations:
+        raise OrbitFitError(
+            f"Pro toto počáteční určení dráhy je potřeba alespoň "
+            f"{minimum_observations} platných měření."
+        )
 
     all_epochs = dynamical_jd([item[1] for item in parsed])
     arc_days = float(all_epochs[-1] - all_epochs[0])
@@ -379,17 +398,74 @@ def initial_orbit_from_observations(observations: list[Observation]) -> OrbitSol
             return np.full(sample_count * 2, 1e9)
 
     seeds: list[tuple[float, np.ndarray]] = []
-    for distance in np.geomspace(0.03, 60.0, 14):
-        for radial_velocity in (-0.04, 0.0, 0.04):
-            parameters = np.array([np.log(distance), radial_velocity])
-            residual = angular_residual(parameters)
-            seeds.append((float(np.median(np.abs(residual))), parameters))
+    if method == "systematic":
+        for distance in np.geomspace(0.03, 60.0, 14):
+            for radial_velocity in (-0.04, 0.0, 0.04):
+                parameters = np.array([np.log(distance), radial_velocity])
+                residual = angular_residual(parameters)
+                seeds.append((float(np.median(np.abs(residual))), parameters))
+    else:
+        # Intersect the observed ray with a heliocentric sphere r=q.  At
+        # perihelion the heliocentric radial velocity is zero; solving that
+        # scalar condition supplies the corresponding topocentric range rate.
+        q = float(perihelion_distance_au)
+        projection = float(np.dot(observer_position, line_of_sight))
+        discriminant = projection * projection - (
+            float(np.dot(observer_position, observer_position)) - q * q
+        )
+        distances = []
+        if discriminant >= 0.0:
+            root = float(np.sqrt(discriminant))
+            distances = [value for value in (-projection - root, -projection + root) if value > 0.005]
+        if not distances:
+            minimum_q = float(np.linalg.norm(
+                observer_position - projection * line_of_sight
+            ))
+            raise OrbitFitError(
+                "Zadané q neprotíná pozorovaný směr. "
+                f"Pro tuto geometrii musí být q alespoň {minimum_q:.3f} AU."
+            )
+        for distance in distances:
+            position = observer_position + distance * line_of_sight
+            base_velocity = observer_velocity + distance * angular_velocity
+            denominator = float(np.dot(position, line_of_sight))
+            radial_velocity = (
+                -float(np.dot(position, base_velocity)) / denominator
+                if abs(denominator) > 1e-10 else 0.0
+            )
+            radial_velocity = float(np.clip(radial_velocity, -0.12, 0.12))
+            for distance_scale in (0.995, 1.0, 1.005):
+                parameters = np.array([np.log(distance * distance_scale), radial_velocity])
+                residual = angular_residual(parameters)
+                seeds.append((float(np.median(np.abs(residual))), parameters))
     seeds.sort(key=lambda item: item[0])
+
+    def search_residual(parameters: np.ndarray) -> np.ndarray:
+        astrometry = angular_residual(parameters)
+        vector = state_for(parameters)
+        position = vector[:3]
+        velocity = vector[3:]
+        radius = float(np.linalg.norm(position))
+        if method != "vaisala":
+            # The admissible region for ordinary Solar-system discoveries is
+            # bound or only mildly hyperbolic.  Without this guard a three-point
+            # tracklet can be matched by absurd, very-near states with enormous
+            # heliocentric excess velocity.
+            specific_energy = float(np.dot(velocity, velocity) / 2.0 - MU_SUN / radius)
+            return np.append(astrometry, max(0.0, specific_energy - 5e-6) / 1e-6)
+        heliocentric_radial_velocity = float(np.dot(position, velocity) / max(radius, 1e-12))
+        q = float(perihelion_distance_au)
+        # Strong, but finite, constraints retain numerical stability and make
+        # explicit that this is a perihelion hypothesis rather than a free fit.
+        return np.append(astrometry, (
+            (radius - q) / max(1e-6, q * 1e-7),
+            heliocentric_radial_velocity / 1e-7,
+        ))
 
     best: tuple[float, np.ndarray] | None = None
     for _, seed in seeds[:4]:
         result = least_squares(
-            angular_residual, seed, bounds=([np.log(0.005), -0.12], [np.log(120.0), 0.12]),
+            search_residual, seed, bounds=([np.log(0.005), -0.12], [np.log(120.0), 0.12]),
             loss="soft_l1", f_scale=5.0, max_nfev=24,
         )
         score = float(np.sqrt(np.mean(np.square(angular_residual(result.x)))))

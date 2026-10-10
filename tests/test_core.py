@@ -516,6 +516,19 @@ class NativeIntegratorTests(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(states)))
         self.assertTrue(np.allclose(states[1], initial.packed()))
 
+    def test_propagation_accepts_unsorted_duplicate_epochs(self):
+        initial = StateVector(
+            epoch_jd=2451545.0,
+            position_au=np.array([1.0, 0.0, 0.0]),
+            velocity_au_per_day=np.array([0.0, math.sqrt(MU_SUN), 0.0]),
+        )
+        engine = NBodyIntegrator(_NoPlanets(), perturbers=())
+        epochs = np.array([2451546.0, 2451544.0, 2451546.0, 2451545.0])
+        states = engine.propagate(initial, epochs)
+        self.assertEqual(states.shape, (4, 6))
+        np.testing.assert_allclose(states[0], states[2])
+        np.testing.assert_allclose(states[3], initial.packed())
+
 
 if __name__ == "__main__":
     unittest.main()
