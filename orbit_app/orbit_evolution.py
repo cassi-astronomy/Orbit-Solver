@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+import re
 
 import numpy as np
 
@@ -57,6 +59,147 @@ class EvolutionResult:
     end_jd: float
     sample_step_days: float
     model_note: str
+
+
+def _format_jd_utc(jd: float) -> str:
+    try:
+        value = datetime(2000, 1, 1, 12, tzinfo=timezone.utc) + timedelta(
+            days=float(jd) - 2451545.0
+        )
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    except (OverflowError, ValueError):
+        return f"JD {jd:.8f}"
+
+
+def format_evolution_report(
+    solution: OrbitSolution, result: EvolutionResult,
+) -> str:
+    """Create a chronological, tab-separated text export of an evolution run."""
+    name = solution.display_name or solution.designation
+    lines = [
+        "ORBIT SOLVER — VÝVOJ DRÁHY",
+        f"Objekt:\t{name}",
+        f"Rozsah UTC:\t{_format_jd_utc(result.start_jd)}\t{_format_jd_utc(result.end_jd)}",
+        f"Krok vyhledávání událostí [dny]:\t{result.sample_step_days:.6f}",
+        f"Model:\t{result.model_note}",
+        "",
+        "Chronologický přehled (hodnoty elementů jsou oskulační v perihelu)",
+        "Typ\tDatum UTC\tNávrat / planeta\tq [AU]\te\ta [AU]\tP [roky]\t1/a [AU^-1]"
+        "\ti [deg]\tOmega [deg]\tomega [deg]\tVzdálenost [AU]\tHillovy poloměry"
+        "\tv rel. [km/s]\tDelta(1/a) [AU^-1]",
+    ]
+    events: list[tuple[float, int, EvolutionReturn | PlanetEncounter]] = []
+    events.extend((item.epoch_jd, 0, item) for item in result.returns)
+    events.extend((item.epoch_jd, 1, item) for item in result.encounters)
+    for _epoch, _event_type, item in sorted(events, key=lambda row: (row[0], row[1])):
+        if isinstance(item, EvolutionReturn):
+            period = "" if item.period_years is None else f"{item.period_years:.8f}"
+            lines.append(
+                "PERIHELIUM\t"
+                f"{_format_jd_utc(item.epoch_jd)}\t{item.index:+d}\t"
+                f"{item.perihelion_au:.9f}\t{item.eccentricity:.10f}\t"
+                f"{item.semi_major_axis_au:.9f}\t{period}\t{item.reciprocal_a:.10e}\t"
+                f"{item.inclination_deg:.7f}\t{item.node_deg:.7f}\t"
+                f"{item.arg_peri_deg:.7f}\t\t\t\t"
+            )
+        else:
+            delta = "" if item.delta_reciprocal_a is None else f"{item.delta_reciprocal_a:+.10e}"
+            lines.append(
+                "SETKÁNÍ\t"
+                f"{_format_jd_utc(item.epoch_jd)}\t{PLANET_LABELS.get(item.planet, item.planet)}\t"
+                "\t\t\t\t\t\t\t\t"
+                f"{item.distance_au:.9f}\t{item.hill_radii:.6f}\t"
+                f"{item.relative_velocity_kms:.5f}\t{delta}"
+            )
+    if not events:
+        lines.append("Žádné perihelové průchody ani planetární setkání nebyly nalezeny.")
+    lines.extend(("", "Vytvořeno programem Orbit Solver 1.0 — Martin Mašek"))
+    return "\n".join(lines) + "\n"
+
+
+def _packed_mpc_epoch(jd: float) -> str:
+    try:
+        value = datetime(2000, 1, 1, 12, tzinfo=timezone.utc) + timedelta(
+            days=float(jd) - 2451545.0
+        )
+    except (OverflowError, ValueError):
+        return "?????"
+    century = {18: "I", 19: "J", 20: "K", 21: "L"}.get(value.year // 100, "?")
+    digit = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    return f"{century}{value.year % 100:02d}{digit[value.month]}{digit[value.day]}"
+
+
+def _mpc_return_line(solution: OrbitSolution, item: EvolutionReturn) -> str:
+    comet = re.match(
+        r"^\s*([ACDPX])/\s*(\d{4})\s+([A-Z])(\d+)", solution.designation, re.I
+    )
+    if comet:
+        orbit_type, year_text, half_month, sequence_text = comet.groups()
+        year = int(year_text)
+        century = {18: "I", 19: "J", 20: "K", 21: "L"}.get(year // 100, "?")
+        packed = (
+            f"{orbit_type.upper()}{century}{year % 100:02d}{half_month.upper()}"
+            f"{int(sequence_text):02d}0"
+        )
+        try:
+            perihelion = datetime(2000, 1, 1, 12, tzinfo=timezone.utc) + timedelta(
+                days=item.epoch_jd - 2451545.0
+            )
+        except (OverflowError, ValueError):
+            return f"# Návrat {item.index:+d}: kalendářní datum je mimo podporovaný rozsah."
+        day_fraction = perihelion.day + (
+            perihelion.hour * 3600 + perihelion.minute * 60 + perihelion.second
+            + perihelion.microsecond / 1e6
+        ) / 86400.0
+        return (
+            f"    {packed:<8}  {perihelion.year:04d} {perihelion.month:02d} {day_fraction:07.4f}  "
+            f"{item.perihelion_au:8.6f}  {item.eccentricity:8.6f}  "
+            f"{item.arg_peri_deg:8.4f}  {item.node_deg:8.4f}  "
+            f"{item.inclination_deg:8.4f}  {perihelion:%Y%m%d}  "
+            f"{solution.absolute_magnitude:4.1f}  {solution.photometric_exponent:3.1f}      "
+            f"{solution.display_name or solution.designation}"
+        )
+    mean_motion = np.degrees(0.01720209895 / abs(item.semi_major_axis_au) ** 1.5)
+    packed_designation = solution.designation.replace(" ", "")[:7]
+    return (
+        f"{packed_designation:<7} {solution.absolute_magnitude:5.2f} {solution.slope_g:5.2f} "
+        f"{_packed_mpc_epoch(item.epoch_jd):5s} {0.0:9.5f} "
+        f"{item.arg_peri_deg:9.5f} {item.node_deg:9.5f} {item.inclination_deg:9.5f} "
+        f"{item.eccentricity:10.7f} {mean_motion:11.8f} {item.semi_major_axis_au:11.7f}"
+    )
+
+
+def format_evolution_mpc_report(
+    solution: OrbitSolution, result: EvolutionResult,
+) -> str:
+    """Return chronological MPC-style element lines plus commented encounters."""
+    name = solution.display_name or solution.designation
+    lines = [
+        f"# Orbit Solver 1.0 — vývoj dráhy: {name}",
+        f"# Rozsah UTC: {_format_jd_utc(result.start_jd)} až {_format_jd_utc(result.end_jd)}",
+        "# Elementy jsou oskulační v okamžiku příslušného perihelu.",
+        "# Řádky začínající # jsou komentáře a planetární setkání.",
+        f"# {result.model_note}",
+    ]
+    events: list[tuple[float, int, EvolutionReturn | PlanetEncounter]] = []
+    events.extend((item.epoch_jd, 0, item) for item in result.returns)
+    events.extend((item.epoch_jd, 1, item) for item in result.encounters)
+    for _epoch, _kind, item in sorted(events, key=lambda row: (row[0], row[1])):
+        if isinstance(item, EvolutionReturn):
+            lines.append(f"# Návrat {item.index:+d} — {_format_jd_utc(item.epoch_jd)} UTC")
+            lines.append(_mpc_return_line(solution, item))
+        else:
+            delta = (
+                "neuvedeno" if item.delta_reciprocal_a is None
+                else f"{item.delta_reciprocal_a:+.6e} AU^-1"
+            )
+            lines.append(
+                f"# SETKÁNÍ {_format_jd_utc(item.epoch_jd)} UTC — "
+                f"{PLANET_LABELS.get(item.planet, item.planet)}; "
+                f"d={item.distance_au:.6f} AU = {item.hill_radii:.3f} Hillova poloměru; "
+                f"v_rel={item.relative_velocity_kms:.2f} km/s; Delta(1/a)={delta}"
+            )
+    return "\n".join(lines) + "\n"
 
 
 def _parabolic_vertex_time(times: np.ndarray, values: np.ndarray, index: int) -> float:

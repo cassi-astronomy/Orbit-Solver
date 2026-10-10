@@ -58,7 +58,9 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
 - tabulka oskulačních elementů v jednotlivých perihelových průchodech;
 - hledání přiblížení k planetám, vzdálenost v AU a Hillových poloměrech,
   relativní rychlost a orientační změna `1/a`;
-- graf vývoje perihelové vzdálenosti;
+- přepínatelný graf vývoje `q`, `a`, `e`, periody, `1/a`, sklonu, uzlu nebo
+  argumentu perihelu;
+- chronologický export jako čitelný tabulkový TXT nebo MPC 1-line elements;
 - zobrazení minulých a budoucích oskulačních drah různými barvami ve Sluneční
   soustavě.
 

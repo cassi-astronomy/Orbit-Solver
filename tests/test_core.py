@@ -25,7 +25,10 @@ from orbit_app.orbit_engine import (
     MU_SUN, NBodyIntegrator, StateVector, marsden_water_ice_law,
     nongravitational_acceleration,
 )
-from orbit_app.orbit_evolution import evolution_span
+from orbit_app.orbit_evolution import (
+    EvolutionResult, EvolutionReturn, PlanetEncounter, evolution_span,
+    format_evolution_mpc_report, format_evolution_report,
+)
 from orbit_app.planetary import PLANETS
 from orbit_app.orbit_fit import (
     _observation_offsets_gcrs, _observation_sigma_arcsec,
@@ -421,6 +424,43 @@ class _NoPlanets:
 
 
 class NativeIntegratorTests(unittest.TestCase):
+    @staticmethod
+    def _evolution_export_fixture():
+        solution = OrbitSolution(
+            "C/2024 Y1", 2460676.5, 60.0, .986, 64.7, 112.5, 238.1, 0.0,
+            absolute_magnitude=17.6, photometric_exponent=4.0,
+            display_name="C/2024 Y1 (Mašek)",
+        )
+        returns = (
+            EvolutionReturn(-1, 2460600.0, (0, 0, 0, 0, 0, 0), 60.0, .986,
+                            64.7, 112.5, 238.1, .84, 464.8, 1 / 60),
+            EvolutionReturn(0, 2461600.0, (0, 0, 0, 0, 0, 0), 61.0, .987,
+                            64.8, 112.6, 238.2, .793, 476.4, 1 / 61),
+        )
+        encounters = (
+            PlanetEncounter(2461000.0, "jupiter", .2, .563, 12.5, 2e-4),
+        )
+        result = EvolutionResult(
+            returns, encounters, 2460500.0, 2461700.0, 2.0, "Testovací model",
+        )
+        return solution, result
+
+    def test_readable_evolution_export_is_chronological(self):
+        solution, result = self._evolution_export_fixture()
+        report = format_evolution_report(solution, result)
+        self.assertLess(report.index("PERIHELIUM"), report.index("SETKÁNÍ"))
+        self.assertLess(report.index("SETKÁNÍ"), report.rindex("PERIHELIUM"))
+        self.assertIn("Jupiter", report)
+        self.assertIn("Martin Mašek", report)
+
+    def test_mpc_evolution_export_contains_elements_and_commented_encounter(self):
+        solution, result = self._evolution_export_fixture()
+        report = format_evolution_mpc_report(solution, result)
+        self.assertIn("CK24Y010", report)
+        self.assertIn("# SETKÁNÍ", report)
+        element_lines = [line for line in report.splitlines() if "CK24Y010" in line]
+        self.assertEqual(len(element_lines), 2)
+
     def test_evolution_year_range_is_asymmetric(self):
         solution = OrbitSolution(
             "Test", 2451545.0, 2.0, .2, 0.0, 0.0, 0.0, 0.0,

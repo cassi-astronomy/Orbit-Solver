@@ -75,7 +75,7 @@ from .orbit_fit import fit_orbit, fit_selection_count, parse_observation_time
 from .orbit_engine import NBodyIntegrator, StateVector
 from .orbit_evolution import (
     EvolutionResult, PLANET_LABELS, calculate_orbit_evolution,
-    return_solution,
+    format_evolution_mpc_report, format_evolution_report, return_solution,
 )
 from .planetary import PLANETS
 from .photometry import estimate_absolute_magnitude, hg_phase_correction, power_law_magnitude
@@ -776,6 +776,17 @@ class PlotCanvas(FigureCanvasQTAgg):
 class OrbitEvolutionPanel(QWidget):
     """Kinoshita-style overview of osculating elements across returns."""
 
+    GRAPH_METRICS = {
+        "q": ("perihelion_au", "perihelová vzdálenost q [AU]", "perihelové vzdálenosti"),
+        "a": ("semi_major_axis_au", "velká poloosa a [AU]", "velké poloosy"),
+        "e": ("eccentricity", "excentricita e", "excentricity"),
+        "period": ("period_years", "oběžná doba P [roky]", "oběžné doby"),
+        "reciprocal_a": ("reciprocal_a", "1/a [AU⁻¹]", "reciproké velké poloosy"),
+        "inclination": ("inclination_deg", "sklon i [°]", "sklonu dráhy"),
+        "node": ("node_deg", "délka výstupného uzlu Ω [°]", "délky výstupného uzlu"),
+        "arg_peri": ("arg_peri_deg", "argument perihelu ω [°]", "argumentu perihelu"),
+    }
+
     show_return = Signal(object, object)
     evolution_ready = Signal(object, object)
 
@@ -792,9 +803,9 @@ class OrbitEvolutionPanel(QWidget):
         self.mode.addItem("Podle počtu návratů", "returns")
         self.mode.addItem("Podle počtu let", "years")
         self.past_label = QLabel("Předchozí návraty:")
-        self.past = QSpinBox(); self.past.setRange(0, 500); self.past.setValue(4)
+        self.past = QSpinBox(); self.past.setRange(0, 500); self.past.setValue(5)
         self.future_label = QLabel("Budoucí návraty:")
-        self.future = QSpinBox(); self.future.setRange(0, 500); self.future.setValue(3)
+        self.future = QSpinBox(); self.future.setRange(0, 500); self.future.setValue(5)
         self.calculate = QPushButton("Spustit integraci")
         self.calculate.setObjectName("primary")
         self.calculate.clicked.connect(self.start)
@@ -810,6 +821,35 @@ class OrbitEvolutionPanel(QWidget):
         )
         self.note.setObjectName("muted"); self.note.setWordWrap(True)
         layout.addWidget(self.note)
+        self.source_note = QLabel()
+        self.source_note.setStyleSheet("color: #bcd4ed; font-weight: 600;")
+        self.source_note.setWordWrap(True)
+        layout.addWidget(self.source_note)
+
+        output_controls = QHBoxLayout()
+        self.graph_metric = QComboBox()
+        self.graph_metric.addItem("Graf: perihelová vzdálenost q", "q")
+        self.graph_metric.addItem("Graf: velká poloosa a", "a")
+        self.graph_metric.addItem("Graf: excentricita e", "e")
+        self.graph_metric.addItem("Graf: oběžná doba P", "period")
+        self.graph_metric.addItem("Graf: reciproká poloosa 1/a", "reciprocal_a")
+        self.graph_metric.addItem("Graf: sklon i", "inclination")
+        self.graph_metric.addItem("Graf: výstupný uzel Ω", "node")
+        self.graph_metric.addItem("Graf: argument perihelu ω", "arg_peri")
+        self.graph_metric.currentIndexChanged.connect(self._draw_result)
+        self.report_format = QComboBox()
+        self.report_format.addItem("TXT: čitelný přehled", "readable")
+        self.report_format.addItem("TXT: MPC 1-line", "mpc")
+        self.copy_report = QPushButton("Kopírovat TXT")
+        self.save_report = QPushButton("Uložit TXT…")
+        self.copy_report.setEnabled(False); self.save_report.setEnabled(False)
+        self.copy_report.clicked.connect(self._copy_report)
+        self.save_report.clicked.connect(self._save_report)
+        output_controls.addWidget(self.graph_metric)
+        output_controls.addStretch()
+        output_controls.addWidget(self.report_format)
+        output_controls.addWidget(self.copy_report); output_controls.addWidget(self.save_report)
+        layout.addLayout(output_controls)
 
         splitter = QSplitter(Qt.Vertical)
         self.canvas = PlotCanvas(); self.canvas.setMinimumHeight(280)
@@ -839,20 +879,35 @@ class OrbitEvolutionPanel(QWidget):
         splitter.addWidget(tables); splitter.setSizes([370, 300])
         layout.addWidget(splitter, 1)
         self._mode_changed()
+        self._update_source_note()
+
+    def _update_source_note(self) -> None:
+        if self.solution.position_au is None or self.solution.velocity_au_per_day is None:
+            text = "Zdroj integrace: žádný použitelný kartézský stav ještě není načten."
+        elif self.solution.fit_observation_count is not None:
+            text = (
+                "Zdroj integrace: vlastní fit z "
+                f"{self.solution.fit_observation_count} použitých pozorování."
+            )
+        else:
+            text = "Zdroj integrace: výchozí kartézská dráha MPC."
+        self.source_note.setText(text)
 
     def _mode_changed(self, *_args) -> None:
         years = self.mode.currentData() == "years"
         self.past_label.setText("Roky do minulosti:" if years else "Předchozí návraty:")
         self.future_label.setText("Roky do budoucnosti:" if years else "Budoucí návraty:")
-        if years and self.past.value() < 10 and self.future.value() < 10:
-            self.past.setValue(150); self.future.setValue(200)
+        if years and self.past.value() <= 50 and self.future.value() <= 50:
+            self.past.setValue(200); self.future.setValue(200)
         elif not years and (self.past.value() > 50 or self.future.value() > 50):
-            self.past.setValue(4); self.future.setValue(3)
+            self.past.setValue(5); self.future.setValue(5)
 
     def set_solution(self, solution: OrbitSolution) -> None:
         self.solution = solution
+        self._update_source_note()
         self.result = None
         self.returns.setRowCount(0); self.encounters.setRowCount(0)
+        self.copy_report.setEnabled(False); self.save_report.setEnabled(False)
         self.canvas.axes.clear(); self.canvas.style_axes(); self.canvas.draw_idle()
         self.calculate.setEnabled(solution.position_au is not None)
         self.note.setText(
@@ -904,6 +959,7 @@ class OrbitEvolutionPanel(QWidget):
 
     def _completed(self, result: EvolutionResult) -> None:
         self.result = result
+        self.copy_report.setEnabled(True); self.save_report.setEnabled(True)
         self.evolution_ready.emit(self.solution, result)
         self.note.setText(
             f"{result.model_note}  Krok vyhledávání událostí: {result.sample_step_days:.2f} dne. "
@@ -944,17 +1000,63 @@ class OrbitEvolutionPanel(QWidget):
             ax.text(.5, .5, "V zadaném rozsahu nebylo nalezeno perihelium.",
                     ha="center", va="center", transform=ax.transAxes, color="#afc2d8")
             self.canvas.draw_idle(); return
-        x = np.array([item.index for item in self.result.returns])
-        q = np.array([item.perihelion_au for item in self.result.returns])
+        metric_key = str(self.graph_metric.currentData() or "q")
+        attribute, y_label, title_label = self.GRAPH_METRICS[metric_key]
+        x = np.array([item.index for item in self.result.returns], dtype=float)
+        values = np.array([
+            np.nan if getattr(item, attribute) is None else float(getattr(item, attribute))
+            for item in self.result.returns
+        ])
+        finite = np.isfinite(values)
         colours = ["#5ca9ff" if value < 0 else "#ffad5c" if value > 0 else "#55e3e9" for value in x]
-        ax.plot(x, q, color="#657d99", lw=1.0, alpha=.7)
-        ax.scatter(x, q, c=colours, s=42, zorder=3)
+        ax.plot(x[finite], values[finite], color="#657d99", lw=1.0, alpha=.7)
+        ax.scatter(x[finite], values[finite], c=np.asarray(colours)[finite], s=42, zorder=3)
         ax.axvline(0, color="#55e3e9", lw=.8, alpha=.45)
         ax.set_xlabel("návrat (0 = nejbližší epoše dráhy)")
-        ax.set_ylabel("perihelová vzdálenost q [AU]")
-        ax.set_title(f"{self.solution.display_name or self.solution.designation} — vývoj perihelové vzdálenosti")
+        ax.set_ylabel(y_label)
+        ax.set_title(
+            f"{self.solution.display_name or self.solution.designation} — vývoj {title_label}"
+        )
         ax.grid(color="#273750", alpha=.55, lw=.6)
         self.canvas.draw_idle()
+
+    def _report_text(self) -> str:
+        if self.result is None:
+            return ""
+        if self.report_format.currentData() == "mpc":
+            return format_evolution_mpc_report(self.solution, self.result)
+        return format_evolution_report(self.solution, self.result)
+
+    def _copy_report(self) -> None:
+        report = self._report_text()
+        if not report:
+            return
+        QApplication.clipboard().setText(report)
+        self.note.setText(
+            f"Chronologický TXT výstup byl zkopírován do schránky.  {self.result.model_note}"
+        )
+
+    def _save_report(self) -> None:
+        report = self._report_text()
+        if not report:
+            return
+        safe_name = re.sub(
+            r"[^A-Za-z0-9._-]+", "_",
+            self.solution.display_name or self.solution.designation,
+        ).strip("_") or "orbit"
+        suffix = "mpc-elements" if self.report_format.currentData() == "mpc" else "vyvoj-drahy"
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "Uložit vývoj dráhy", f"{safe_name}-{suffix}.txt",
+            "Textové soubory (*.txt);;Všechny soubory (*)",
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(report, encoding="utf-8-sig")
+        except OSError as exc:
+            QMessageBox.warning(self, "Vývoj dráhy", f"Soubor se nepodařilo uložit:\n{exc}")
+            return
+        self.note.setText(f"Chronologický výstup byl uložen do {path}")
 
     def _open_return(self, row: int, _column: int) -> None:
         if not self.result or not (0 <= row < len(self.result.returns)):
@@ -3061,7 +3163,7 @@ class MainWindow(QMainWindow):
         self.load_button.setObjectName("primary"); self.load_button.clicked.connect(self.load_object)
         self.solve = QPushButton("Znovu načíst výchozí dráhu MPC"); self.solve.setEnabled(False)
         self.solve.clicked.connect(self.load_orbit)
-        self.mpc_observations_button = QPushButton("Stáhnout pozorování automaticky")
+        self.mpc_observations_button = QPushButton("Stáhnout astrometrii z MPC")
         self.mpc_observations_button.setToolTip(
             "Program sám vyzkouší běžný archiv MPC i aktuální NEOCP/PCCP."
         )
