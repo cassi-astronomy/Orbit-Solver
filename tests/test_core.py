@@ -182,6 +182,10 @@ class ObservationResidualTests(unittest.TestCase):
         self.assertRegex(line, r"^\s*2P\s+20\d{2} \d{2} \d{2}\.\d{4}")
         self.assertIn(" 0.338", line)
 
+    def test_defunct_d_comet_designation_is_recognized(self):
+        self.assertTrue(is_comet_designation("D/1993 F2"))
+        self.assertTrue(is_comet_designation("D/1993 F2-A"))
+
     def test_asteroid_keeps_mpcorb_epoch_and_mean_anomaly(self):
         solution = OrbitSolution(
             "9841", 2461118.5, 2.18882215, .1600963, 21.9873,
@@ -204,6 +208,12 @@ class MpcParsingTests(unittest.TestCase):
         self.assertEqual(MpcNetworkClient._sl9_spk_id("D/1993 F2-J"), 1000189)
         self.assertEqual(MpcNetworkClient._sl9_spk_id("D/1993 F2-W"), 1000201)
 
+    def test_horizons_url_percent_encodes_required_quotes(self):
+        encoded = bytes(MpcNetworkClient._horizons_url((
+            ("COMMAND", "'DES=1000187;'"),
+        )).toEncoded())
+        self.assertIn(b"COMMAND=%27DES%3D1000187%3B%27", encoded)
+
     def test_sl9_horizons_parser_uses_requested_ecliptic_ephemeris_block(self):
         result = """
 Target body name: Shoemaker-Levy 9-A
@@ -223,6 +233,12 @@ $$EOE
         self.assertEqual(solution.display_name, "Shoemaker-Levy 9-A")
         np.testing.assert_allclose(solution.position_au, [5.0, .1, -.02])
         np.testing.assert_allclose(solution.velocity_au_per_day, [-.0001, .007, .0001])
+
+        parent = MpcNetworkClient._parse_sl9_horizons_vector(
+            result, "D/1993 F2", 2449480.5, representative_parent=True,
+        )
+        self.assertEqual(parent.display_name, "D/1993 F2 (Shoemaker–Levy 9)")
+        self.assertIn("fragmentu G", parent.data_source)
 
     def test_ec0001_reference_file_has_24_observations(self):
         path = Path(__file__).with_name("data") / "ec0001.obs"
@@ -526,6 +542,13 @@ class PreviewGeometryTests(unittest.TestCase):
 
 
 class OrbitFitSelectionTests(unittest.TestCase):
+    def test_interpolated_ephemeris_includes_the_moon(self):
+        start = 2451545.0
+        cached = _InterpolatedPlanetEphemeris(PLANETS, start, start + 1.0)
+        moon = cached.position("moon", start + .5)
+        self.assertEqual(moon.shape, (3,))
+        self.assertTrue(np.all(np.isfinite(moon)))
+
     def test_interstellar_solution_is_never_replaced_by_parabolic_trial(self):
         interstellar = OrbitSolution("3I", 2461200.5, -0.26, 6.1, 175, 322, 128, 10)
         interstellar.fit_normalized_rms = 1.0

@@ -8,6 +8,7 @@ import hashlib
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlencode
 
 import numpy as np
 
@@ -16,7 +17,7 @@ os.environ.setdefault("QT_API", "pyside6")
 
 from PySide6.QtCore import (
     QAbstractTableModel, QByteArray, QItemSelectionModel, QModelIndex, QObject,
-    QThread, Qt, QTimer, QUrl, QUrlQuery, Signal, Slot,
+    QThread, Qt, QTimer, QUrl, Signal, Slot,
 )
 from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
@@ -549,6 +550,14 @@ class MpcNetworkClient(QObject):
                 if re.fullmatch(r"D/1993\s+F2-[A-HJ-NP-W]", designation, re.I):
                     self._request_sl9_horizons_metadata(designation)
                     return
+                if re.fullmatch(r"D/1993\s+F2", designation, re.I):
+                    # MPC has astrometry for the disrupted comet but no single
+                    # cartesian orbit.  Fragment G supplies a nearby historical
+                    # state from which the aggregate astrometry can be refitted.
+                    self._request_sl9_horizons_metadata(
+                        designation, self._sl9_spk_id("D/1993 F2-G"),
+                    )
+                    return
                 self.orbit_error.emit(str(exc))
                 return
             self.orbit_success.emit(solution)
@@ -561,16 +570,14 @@ class MpcNetworkClient(QObject):
         letters = "ABCDEFGHJKLMNPQRSTUVW"
         return 1000181 + letters.index(letter)
 
-    def _request_sl9_horizons_metadata(self, designation: str) -> None:
-        spk_id = self._sl9_spk_id(designation)
-        url = QUrl("https://ssd.jpl.nasa.gov/api/horizons.api")
-        query = QUrlQuery()
-        for key, value in (
+    def _request_sl9_horizons_metadata(
+        self, designation: str, spk_id: int | None = None,
+    ) -> None:
+        spk_id = self._sl9_spk_id(designation) if spk_id is None else spk_id
+        url = self._horizons_url((
             ("format", "json"), ("COMMAND", f"'DES={spk_id};'"),
             ("OBJ_DATA", "'YES'"), ("MAKE_EPHEM", "'NO'"),
-        ):
-            query.addQueryItem(key, value)
-        url.setQuery(query)
+        ))
         request = QNetworkRequest(url)
         request.setRawHeader(b"User-Agent", b"OrbitSolver/1.0")
         request.setTransferTimeout(30_000)
@@ -602,8 +609,6 @@ class MpcNetworkClient(QObject):
     def _request_sl9_horizons_vector(
         self, designation: str, spk_id: int, epoch_jd: float,
     ) -> None:
-        url = QUrl("https://ssd.jpl.nasa.gov/api/horizons.api")
-        query = QUrlQuery()
         parameters = (
             ("format", "json"), ("COMMAND", f"'DES={spk_id};'"),
             ("OBJ_DATA", "'YES'"), ("MAKE_EPHEM", "'YES'"),
@@ -612,15 +617,22 @@ class MpcNetworkClient(QObject):
             ("OUT_UNITS", "'AU-D'"), ("REF_PLANE", "'ECLIPTIC'"),
             ("VEC_TABLE", "'2'"), ("VEC_CORR", "'NONE'"),
         )
-        for key, value in parameters:
-            query.addQueryItem(key, value)
-        url.setQuery(query)
+        url = self._horizons_url(parameters)
         request = QNetworkRequest(url)
         request.setRawHeader(b"User-Agent", b"OrbitSolver/1.0")
         request.setTransferTimeout(30_000)
         reply = self.manager.get(request); self._active.add(reply)
         reply.finished.connect(
             lambda: self._sl9_vector_finished(reply, designation, epoch_jd)
+        )
+
+    @staticmethod
+    def _horizons_url(parameters: tuple[tuple[str, str], ...]) -> QUrl:
+        # Horizons requires literal quotes around several values. QUrlQuery
+        # leaves apostrophes unescaped, which this API rejects as a bad URL.
+        encoded = urlencode(parameters).encode("ascii")
+        return QUrl.fromEncoded(
+            b"https://ssd.jpl.nasa.gov/api/horizons.api?" + encoded
         )
 
     def _sl9_vector_finished(
@@ -633,9 +645,12 @@ class MpcNetworkClient(QObject):
                 return
             body = json.loads(bytes(reply.readAll()).decode("utf-8"))
             result = str(body.get("result") or "")
-            self.orbit_success.emit(
-                self._parse_sl9_horizons_vector(result, designation, epoch_jd)
+            representative_parent = bool(
+                re.fullmatch(r"D/1993\s+F2", designation, re.I)
             )
+            self.orbit_success.emit(self._parse_sl9_horizons_vector(
+                result, designation, epoch_jd, representative_parent,
+            ))
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError, OrbitParseError) as exc:
             self.orbit_error.emit(f"JPL Horizons stav SL9 nelze načíst: {exc}")
         finally:
@@ -644,6 +659,7 @@ class MpcNetworkClient(QObject):
     @staticmethod
     def _parse_sl9_horizons_vector(
         result: str, designation: str, epoch_jd: float,
+        representative_parent: bool = False,
     ) -> OrbitSolution:
         # OBJ_DATA contains another cartesian state in the ICRF frame.  Only
         # the requested AU/day ecliptic vector between the ephemeris sentinels
@@ -664,14 +680,21 @@ class MpcNetworkClient(QObject):
         state = np.array([float(value) for value in (*position.groups(), *velocity.groups())])
         a, e, inc, node, arg_peri, mean = cartesian_to_elements(state[:3], state[3:])
         name_match = re.search(r"Target body name:\s*([^\r\n{]+)", result)
-        display = name_match.group(1).strip() if name_match else designation
+        display = (
+            "D/1993 F2 (Shoemaker–Levy 9)"
+            if representative_parent else
+            name_match.group(1).strip() if name_match else designation
+        )
         return OrbitSolution(
             designation=designation, display_name=display, epoch_jd=epoch_jd,
             semi_major_axis_au=a, eccentricity=e, inclination_deg=inc,
             node_deg=node, arg_peri_deg=arg_peri, mean_anomaly_deg=mean,
             photometric_exponent=4.0, phase_correction=False,
             position_au=tuple(state[:3]), velocity_au_per_day=tuple(state[3:]),
-            data_source="JPL Horizons",
+            data_source=(
+                "JPL Horizons (reprezentativní počáteční stav fragmentu G)"
+                if representative_parent else "JPL Horizons"
+            ),
         )
 
     def _identifier_finished(self, reply: QNetworkReply, designation: str) -> None:
@@ -3721,7 +3744,8 @@ class OrbitConstraintsDialog(QDialog):
     def __init__(
         self, solution: OrbitSolution, constraints: dict[str, float],
         nongravitational: dict[str, float] | None = None,
-        compute_original_future: bool = False, parent=None,
+        compute_original_future: bool = False,
+        allow_element_constraints: bool = True, parent=None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Vlastní nastavení fitu")
@@ -3744,6 +3768,8 @@ class OrbitConstraintsDialog(QDialog):
                 editor.setRange(-360.0, 360.0)
             editor.setValue(constraints.get(name, values[name]))
             enabled.setChecked(name in constraints)
+            enabled.setEnabled(allow_element_constraints)
+            editor.setEnabled(allow_element_constraints)
             row = QWidget(); row_layout = QHBoxLayout(row); row_layout.setContentsMargins(0, 0, 0, 0)
             row_layout.addWidget(enabled); row_layout.addWidget(editor, 1)
             form.addRow(label, row)
@@ -3808,9 +3834,15 @@ class OrbitConstraintsDialog(QDialog):
             dynamics_note.setObjectName("muted")
             form.addRow(dynamics_note)
         note = QLabel(
-            "Fixace elementů je vynucena během diferenciální korekce. Pro parabolickou "
-            "hypotézu lze nastavit e = 1. A1–A3 se fitují jako volné parametry a mají "
-            "smysl především pro dostatečně dlouhý oblouk komety."
+            (
+                "Fixace elementů je vynucena během diferenciální korekce. Pro parabolickou "
+                "hypotézu lze nastavit e = 1. "
+                if allow_element_constraints else
+                "MPC neposkytlo počáteční dráhu, proto bude nejprve určena z astrometrie; "
+                "fixace elementů se zpřístupní po prvním úspěšném fitu. "
+            )
+            + "A1–A3 se fitují jako volné parametry a mají smysl především pro "
+              "dostatečně dlouhý oblouk komety."
         )
         note.setWordWrap(True); note.setObjectName("muted")
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -4019,7 +4051,10 @@ class MainWindow(QMainWindow):
             "Načte katalogovou dráhu; u NEOCP/PCCP stáhne astrometrii a spočítá vlastní dráhu."
         )
         self.load_button.setObjectName("primary"); self.load_button.clicked.connect(self.load_object)
-        self.solve = QPushButton("Znovu načíst výchozí dráhu MPC"); self.solve.setEnabled(False)
+        self.solve = QPushButton("Znovu načíst výchozí dráhu"); self.solve.setEnabled(False)
+        self.solve.setToolTip(
+            "Načte stav z MPC; u historických fragmentů Shoemaker–Levy 9 použije JPL Horizons."
+        )
         self.solve.clicked.connect(self.load_orbit)
         self.mpc_observations_button = QPushButton("Stáhnout astrometrii z MPC")
         self.mpc_observations_button.setToolTip(
@@ -4201,6 +4236,7 @@ class MainWindow(QMainWindow):
             self.arc_metric.setText("—")
             self.rms_metric.setText("—")
             self.nongravitational_fit = {}
+            self.fit_constraints = {}
             self.compute_original_future = False
         self.current_designation = designation
         self.current_display_name = display_name or designation
@@ -4267,7 +4303,10 @@ class MainWindow(QMainWindow):
         self.observation_detail.setText(
             "Kliknutím na pozorování zobrazíte observatoř a geometrii v okamžiku měření."
         )
-        orbit_note = "výchozí dráha MPC" if self.has_orbit else "dráha dosud nenačtena"
+        orbit_note = (
+            f"výchozí dráha {self.solution.data_source}"
+            if self.has_orbit else "dráha dosud nenačtena"
+        )
         self.object_label.setText(f"{len(rows)} pozorování • {orbit_note}")
         self.obs_metric.setText(str(len(rows)))
         self.current_designation = designation
@@ -4286,7 +4325,7 @@ class MainWindow(QMainWindow):
         self.fit_button.setEnabled(bool(rows))
         self.preliminary_button.setEnabled(fit_selection_count(rows, None) >= 3)
         self._update_fit_button_label()
-        self.constraints_button.setEnabled(self.has_orbit)
+        self.constraints_button.setEnabled(bool(rows))
         times = sorted(row.time for row in rows if row.time)
         self.arc_metric.setText(f"{times[0][:10]} → {times[-1][:10]}" if times else "—")
         source_note = (
@@ -4346,7 +4385,8 @@ class MainWindow(QMainWindow):
         )
         if continue_with_fit:
             self.statusBar().showMessage(
-                "Výchozí dráha MPC načtena; spouštím vlastní fit z astrometrie…"
+                f"Výchozí dráha {solution.data_source} načtena; "
+                "spouštím vlastní fit z astrometrie…"
             )
             self.calculate_own_orbit()
         else:
@@ -4657,9 +4697,18 @@ class MainWindow(QMainWindow):
         )
 
     def configure_constraints(self) -> None:
+        settings_solution = self.solution
+        if not self.has_orbit:
+            settings_solution = replace(
+                self.solution,
+                designation=self.current_designation or self.solution.designation,
+                display_name=self.current_display_name or self.current_designation,
+                nongravitational_parameters=None,
+                dynamical_1a=None,
+            )
         dialog = OrbitConstraintsDialog(
-            self.solution, self.fit_constraints, self.nongravitational_fit,
-            self.compute_original_future, self,
+            settings_solution, self.fit_constraints, self.nongravitational_fit,
+            self.compute_original_future, self.has_orbit, self,
         )
         if dialog.exec() != QDialog.Accepted:
             return

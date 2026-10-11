@@ -76,6 +76,8 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
 - fragmenty komety Shoemaker–Levy 9 lze načíst jejich úplným označením, například
   `D/1993 F2-A`; pokud MPC neposkytne kartézský stav, program automaticky použije
   historický heliocentrický ekliptikální vektor příslušného fragmentu z JPL Horizons.
+  Pro obecné označení `D/1993 F2` slouží jako reprezentativní počáteční odhad
+  stav fragmentu G; rozpadlá kometa už nemá jedinou společnou dráhu všech fragmentů.
 
 ## Požadavky
 

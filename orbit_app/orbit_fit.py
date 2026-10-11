@@ -18,7 +18,7 @@ from .planetary import PLANETS
 
 C_AU_PER_DAY = 173.1446326846693
 _PLANET_NAMES = (
-    "mercury", "venus", "earth", "mars",
+    "mercury", "venus", "earth", "moon", "mars",
     "jupiter", "saturn", "uranus", "neptune",
 )
 
