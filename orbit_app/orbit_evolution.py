@@ -363,7 +363,7 @@ def calculate_orbit_evolution(
         sample_step_days=sample_step,
         model_note=(
             "Orientační výpočet: planetární perturbace a A1/A2/A3 jsou zahrnuty, "
-            "polohy planet zatím používají analytický model; nejde ještě o DE440."
+            f"polohy planet používají model {PLANETS.model_name}."
         ),
     )
 

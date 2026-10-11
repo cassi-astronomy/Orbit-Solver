@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import numpy as np
 
 J2000_JD = 2451545.0
@@ -63,6 +66,124 @@ class AnalyticPlanetEphemeris:
             sin_w * sin_i * x_prime + cos_w * sin_i * y_prime,
         ])
 
+AU_KM = 149_597_870.7
+DE440_FILENAME = "de440.bsp"
+DE440_URL = (
+    "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/planets/de440.bsp"
+)
+DE440_MD5 = "c9d581bfd84209dbeee8b1583939b148"
+DE440_COVERAGE = (2287184.5, 2688976.5)  # 1549-12-31 through 2650-01-25
 
-PLANETS = AnalyticPlanetEphemeris()
+
+def ephemeris_data_directory() -> Path:
+    override = os.environ.get("ORBIT_SOLVER_DATA_DIR")
+    if override:
+        return Path(override).expanduser()
+    return Path(__file__).resolve().parent.parent / "orbit-data"
+
+
+def de440_path() -> Path:
+    return ephemeris_data_directory() / DE440_FILENAME
+
+
+def _equatorial_to_ecliptic(vector: np.ndarray) -> np.ndarray:
+    value = np.asarray(vector, dtype=float)
+    epsilon = np.radians(23.4392911)
+    return np.array((
+        value[0],
+        value[1] * np.cos(epsilon) + value[2] * np.sin(epsilon),
+        -value[1] * np.sin(epsilon) + value[2] * np.cos(epsilon),
+    ))
+
+
+class JplSpkPlanetEphemeris:
+    """Heliocentric J2000-ecliptic positions read from a JPL SPK kernel."""
+
+    _BARYCENTER_IDS = {
+        "mercury": 1, "venus": 2, "earth": 3, "mars": 4,
+        "jupiter": 5, "saturn": 6, "uranus": 7, "neptune": 8,
+    }
+
+    def __init__(self, path: Path) -> None:
+        try:
+            from jplephem.spk import SPK
+        except ImportError as exc:
+            raise RuntimeError(
+                "Pro JPL DE440 chybí knihovna jplephem; nainstalujte requirements.txt."
+            ) from exc
+        self.path = Path(path)
+        self.kernel = SPK.open(str(self.path))
+
+    def _ssb_position(self, center: int, target: int, jd: float) -> np.ndarray:
+        return np.asarray(self.kernel[center, target].compute(float(jd)), dtype=float)
+
+    def position(self, body: str, jd: float) -> np.ndarray:
+        if not (DE440_COVERAGE[0] <= float(jd) <= DE440_COVERAGE[1]):
+            raise ValueError(
+                "Požadovaná epocha leží mimo rozsah JPL DE440 "
+                "(1549-12-31 až 2650-01-25)."
+            )
+        name = body.lower()
+        if name not in self._BARYCENTER_IDS:
+            raise KeyError(f"Těleso {body!r} není v poskytovateli DE440 podporováno.")
+        target = self._BARYCENTER_IDS[name]
+        barycentric = self._ssb_position(0, target, jd)
+        if name == "mercury":
+            barycentric += self._ssb_position(1, 199, jd)
+        elif name == "venus":
+            barycentric += self._ssb_position(2, 299, jd)
+        elif name == "earth":
+            barycentric += self._ssb_position(3, 399, jd)
+        sun = self._ssb_position(0, 10, jd)
+        return _equatorial_to_ecliptic((barycentric - sun) / AU_KM)
+
+    def close(self) -> None:
+        self.kernel.close()
+
+
+class PlanetEphemerisProvider:
+    """Stable application-wide provider with optional DE440 activation."""
+
+    def __init__(self) -> None:
+        self.analytic = AnalyticPlanetEphemeris()
+        self.jpl: JplSpkPlanetEphemeris | None = None
+        self.load_error: str | None = None
+        self.reload()
+
+    def unload(self) -> None:
+        if self.jpl is not None:
+            self.jpl.close()
+            self.jpl = None
+
+    def reload(self) -> bool:
+        self.unload()
+        self.load_error = None
+        path = de440_path()
+        if not path.is_file():
+            return False
+        try:
+            self.jpl = JplSpkPlanetEphemeris(path)
+            return True
+        except Exception as exc:
+            self.load_error = str(exc)
+            return False
+
+    def position(self, body: str, jd: float) -> np.ndarray:
+        provider = self.jpl or self.analytic
+        return provider.position(body, jd)
+
+    @property
+    def model_name(self) -> str:
+        return "JPL DE440" if self.jpl is not None else "analytický model"
+
+    def status_text(self) -> str:
+        if self.jpl is not None:
+            size_mb = de440_path().stat().st_size / (1024 * 1024)
+            return f"JPL DE440 je aktivní ({size_mb:.0f} MB; 1549–2650)."
+        if self.load_error:
+            return f"Soubor DE440 nelze použít: {self.load_error}"
+        return "JPL DE440 chybí; používá se méně přesný analytický model planet."
+
+
+PLANETS = PlanetEphemerisProvider()
 

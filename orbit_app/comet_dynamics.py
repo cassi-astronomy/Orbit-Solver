@@ -166,7 +166,7 @@ def analyze_original_future_orbit(
         "original_interpretation": _interpret(original, reciprocal_sigma, True),
         "future_interpretation": _interpret(future, reciprocal_sigma, False),
         "model": (
-            "orientační N-body model planet; 1σ je lineární formální chyba ze stavové "
+            f"N-body model planet ({PLANETS.model_name}); 1σ je lineární formální chyba ze stavové "
             "kovariance; nejde o publikovanou hodnotu MPC/JPL"
         ),
     }

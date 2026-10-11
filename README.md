@@ -154,9 +154,11 @@ uživatelské rozhraní zůstalo ovladatelné.
 Orbit Solver je pracovní a vizualizační nástroj. Výsledky je u důležitých
 aplikací nutné porovnat s MPC, JPL Horizons nebo jiným nezávislým softwarem.
 
-- Současný N-body model zahrnuje perturbace osmi planet, ale jejich polohy zatím
-  získává z analytických středních elementů. Dlouhodobé integrace proto nejsou
-  ekvivalentem JPL DE440/DE441 a program je označuje jako orientační.
+- N-body model zahrnuje perturbace osmi planet. Bez volitelného kernelu používá
+  jejich analytické střední elementy; v **Vlastním nastavení** lze jedním
+  kliknutím stáhnout a aktivovat JPL DE440 (přibližně 114 MB, 1549–2650).
+  Výpočty mimo pokrytí aktivního kernelu program odmítne místo tichého přechodu
+  na méně přesný model.
 - Samostatný Měsíc, Pluto, relativistické členy a perturbace hmotných planetek
   zatím nejsou v dynamickém modelu zahrnuty.
 - Konstantní A1/A2/A3 při integraci komety přes mnoho návratů jsou modelový
@@ -208,6 +210,9 @@ Orbit-Solver/
 
 - Orbitální a astrometrická data se načítají z rozhraní
   [Minor Planet Center](https://www.minorplanetcenter.net/).
+- Volitelná planetární efemerida DE440 se stahuje přímo z oficiálního
+  [archivu NASA/NAIF](https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/planets/).
+  Program před aktivací ověří její zveřejněný kontrolní součet.
 - Hvězdný katalog a obrazce souhvězdí pocházejí z projektu
   [d3-celestial](https://github.com/ofrohn/d3-celestial) a jsou distribuovány
   pod licencí BSD-3-Clause. Její text je uložen v
@@ -222,10 +227,8 @@ Planet Center; katalog hvězd a obrazce souhvězdí pocházejí z d3-celestial.
 
 ## Vývoj a plánované kroky
 
-Nejvýznamnější plánovanou změnou je planetární efemerida JPL DE440 pro přesnější
-integrace v rozsahu přibližně 1550–2650. Následovat může samostatný Měsíc,
-relativistické členy, hmotné planetky, ukládání projektů a distribuční balíčky
-pro Windows a Linux.
+Následovat může samostatný Měsíc, relativistické členy, hmotné planetky,
+ukládání projektů a distribuční balíčky pro Windows a Linux.
 
 Příspěvky a hlášení reprodukovatelných chyb jsou vítány prostřednictvím
 [GitHub Issues](https://github.com/cassi-astronomy/Orbit-Solver/issues). K hlášení

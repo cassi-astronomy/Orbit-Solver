@@ -7,9 +7,9 @@ import numpy as np
 
 from orbit_app.domain import Observation, OrbitSolution
 from orbit_app.main_window import (
-    CONSTELLATION_LABELS, CONSTELLATION_LINES, SkyPanel,
+    CONSTELLATION_LABELS, CONSTELLATION_LINES, ElementsPanel, SkyPanel,
     datetime_from_jd, format_dec_sexagesimal, format_ra_sexagesimal,
-    observation_residual_score, parse_output_epoch,
+    is_comet_designation, observation_residual_score, parse_output_epoch,
     perihelion_jd_from_solution, project_ecliptic_camera,
     SKY_TRACK_HORIZONS, sky_track_sample_count, solar_orbit_clip_radius,
 )
@@ -120,6 +120,41 @@ class ObservationResidualTests(unittest.TestCase):
         self.assertEqual(
             parse_output_epoch("1800-06-15 12:30"), datetime(1800, 6, 15, 12, 30)
         )
+
+    def test_numbered_periodic_comet_uses_comet_mpc_elements(self):
+        solution = OrbitSolution(
+            "2P", 2462500.5, 2.2178179, .8472983, 11.34795,
+            334.01955, 187.28396, 286.52227,
+            absolute_magnitude=14.36, photometric_exponent=4.0,
+        )
+
+        class ReportFixture:
+            display_solution = solution
+            _packed_epoch = staticmethod(ElementsPanel._packed_epoch)
+
+            @staticmethod
+            def _perihelion_jd():
+                return perihelion_jd_from_solution(solution)
+
+        line = ElementsPanel._mpc_line(ReportFixture())
+        self.assertTrue(is_comet_designation("2P"))
+        self.assertRegex(line, r"^\s*2P\s+20\d{2} \d{2} \d{2}\.\d{4}")
+        self.assertIn(" 0.338", line)
+
+    def test_asteroid_keeps_mpcorb_epoch_and_mean_anomaly(self):
+        solution = OrbitSolution(
+            "9841", 2461118.5, 2.18882215, .1600963, 21.9873,
+            138.52648, 264.66660, 185.59746671,
+            absolute_magnitude=15.0, slope_g=.15,
+        )
+
+        class ReportFixture:
+            display_solution = solution
+            _packed_epoch = staticmethod(ElementsPanel._packed_epoch)
+
+        line = ElementsPanel._mpc_line(ReportFixture())
+        self.assertFalse(is_comet_designation("9841"))
+        self.assertRegex(line, r"^9841\s+15\.00\s+0\.15\s+K263J\s+185\.59747")
 
 
 class MpcParsingTests(unittest.TestCase):

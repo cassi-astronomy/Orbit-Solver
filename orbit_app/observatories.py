@@ -16,6 +16,8 @@ from astropy.utils import iers
 from astropy.utils.exceptions import AstropyWarning
 import astropy.units as u
 
+from .planetary import PLANETS
+
 
 # MPC parallax constants are expressed in units of the Earth's equatorial radius.
 EARTH_EQUATORIAL_RADIUS_M = 6_378_137.0
@@ -226,8 +228,11 @@ def dynamical_jd(times: list[datetime]) -> np.ndarray:
 
 
 def earth_heliocentric_ecliptic(jd_tdb: np.ndarray) -> np.ndarray:
-    """High-precision built-in Earth ephemeris in heliocentric J2000 ecliptic axes."""
-    times = Time(np.asarray(jd_tdb), format="jd", scale="tdb")
+    """Earth position from active DE440, or Astropy's offline fallback."""
+    epochs = np.atleast_1d(np.asarray(jd_tdb, dtype=float))
+    if PLANETS.jpl is not None:
+        return np.vstack([PLANETS.position("earth", float(jd)) for jd in epochs])
+    times = Time(epochs, format="jd", scale="tdb")
     with solar_system_ephemeris.set("builtin"):
         earth = get_body_barycentric("earth", times).xyz.to_value(u.au).T
         sun = get_body_barycentric("sun", times).xyz.to_value(u.au).T

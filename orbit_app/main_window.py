@@ -4,6 +4,7 @@ import sys
 import os
 import json
 import re
+import hashlib
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -40,6 +41,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QPlainTextEdit,
+    QProgressBar,
     QSlider,
     QSizePolicy,
     QSpinBox,
@@ -80,7 +82,7 @@ from .orbit_evolution import (
     EvolutionResult, PLANET_LABELS, calculate_orbit_evolution,
     format_evolution_mpc_report, format_evolution_report, return_solution,
 )
-from .planetary import PLANETS
+from .planetary import DE440_MD5, DE440_URL, PLANETS, de440_path
 from .photometry import estimate_absolute_magnitude, hg_phase_correction, power_law_magnitude
 from .preview_orbit import apparent_geometry, datetime_to_jd, demo_solution, heliocentric_xyz, orbital_curve_xyz
 
@@ -242,7 +244,7 @@ def observation_residual_score(observation: Observation) -> float | None:
 
 
 def is_comet_designation(value: str) -> bool:
-    return bool(re.match(r"^\s*(?:[ACDPX]/|\d+P/)", value or "", re.I))
+    return bool(re.match(r"^\s*(?:[ACDPX]/|\d+[PD](?:/|\b))", value or "", re.I))
 
 
 def parse_output_epoch(value: str) -> datetime:
@@ -2790,7 +2792,7 @@ class ElementsPanel(QWidget):
         epoch_controls.addStretch()
         self.epoch_note = QLabel(
             "Převod používá N-body integraci s planetami a případnými A1–A3. "
-            "Do doplnění JPL DE je vzdálená epocha pouze orientační."
+            f"Aktivní planetární efemerida: {PLANETS.model_name}."
         )
         self.epoch_note.setObjectName("muted"); self.epoch_note.setWordWrap(True)
         layout = QVBoxLayout(self)
@@ -2810,16 +2812,20 @@ class ElementsPanel(QWidget):
     def _mpc_line(self) -> str:
         s = self.display_solution
         comet_match = re.match(r"^\s*([ACDPX])/\s*(\d{4})\s+([A-Z])(\d+)", s.designation, re.I)
-        if comet_match:
-            orbit_type, year_text, half_month, sequence_text = comet_match.groups()
-            year = int(year_text)
-            century = {18: "I", 19: "J", 20: "K", 21: "L"}.get(year // 100, "?")
-            # MPC comet packing appends the fragment code (zero for the main
-            # component): C/2024 Y1 -> CK24Y010.
-            packed = (
-                f"{orbit_type.upper()}{century}{year % 100:02d}{half_month.upper()}"
-                f"{int(sequence_text):02d}0"
-            )
+        numbered_comet = re.match(r"^\s*(\d+)([PD])(?:/|\b)", s.designation, re.I)
+        if comet_match or numbered_comet:
+            periodic_number = int(numbered_comet.group(1)) if numbered_comet else 0
+            packed_provisional = ""
+            if comet_match:
+                orbit_type, year_text, half_month, sequence_text = comet_match.groups()
+                year = int(year_text)
+                century = {18: "I", 19: "J", 20: "K", 21: "L"}.get(year // 100, "?")
+                packed_provisional = (
+                    f"{century}{year % 100:02d}{half_month.upper()}"
+                    f"{int(sequence_text):02d}0"
+                )
+            else:
+                orbit_type = numbered_comet.group(2).upper()
             perihelion = self._perihelion_jd()
             peri_time = datetime_from_jd(perihelion)
             epoch = datetime_from_jd(s.epoch_jd)
@@ -2832,11 +2838,15 @@ class ElementsPanel(QWidget):
                 peri_time.hour * 3600 + peri_time.minute * 60 + peri_time.second + peri_time.microsecond / 1e6
             ) / 86400.0
             perihelion_distance = s.semi_major_axis_au * (1.0 - s.eccentricity)
+            slope_parameter = 2.5 * s.photometric_exponent
+            number_field = f"{periodic_number:4d}" if numbered_comet else "    "
+            prefix = f"{number_field}{orbit_type.upper()}{packed_provisional:<7}"
             return (
-                f"    {packed:<8}  {peri_time.year:04d} {peri_time.month:02d} {day_fraction:07.4f}  "
-                f"{perihelion_distance:8.6f}  {s.eccentricity:8.6f}  {s.arg_peri_deg:8.4f}  "
-                f"{s.node_deg:8.4f}  {s.inclination_deg:8.4f}  {epoch:%Y%m%d}  "
-                f"{s.absolute_magnitude:4.1f}  {4.0:3.1f}      {s.designation}"
+                f"{prefix}  {peri_time.year:04d} {peri_time.month:02d} {day_fraction:07.4f} "
+                f"{perihelion_distance:9.6f}  {s.eccentricity:8.6f}  "
+                f"{s.arg_peri_deg:8.4f}  {s.node_deg:8.4f}  {s.inclination_deg:8.4f}  "
+                f"{epoch:%Y%m%d}  {s.absolute_magnitude:4.1f} {slope_parameter:4.1f}  "
+                f"{s.designation}"
             )
         mean_motion = np.degrees(0.01720209895 / abs(s.semi_major_axis_au) ** 1.5)
         packed_designation = s.designation.replace(" ", "")[:7]
@@ -2892,6 +2902,7 @@ class ElementsPanel(QWidget):
             f"Orbital elements: {s.designation}",
             perihelion_line,
             epoch_line,
+            f"Planetary ephemeris: {PLANETS.model_name}",
             f"M    {s.mean_anomaly_deg:12.8f}{self._uncertainty('mean_anomaly', 8)}",
             f"n    {mean_motion:12.9f}{self._uncertainty('mean_motion_deg_day', 9)} deg/day",
             f"a    {s.semi_major_axis_au:12.9f}{self._uncertainty('a', 9)} AU",
@@ -2971,7 +2982,7 @@ class ElementsPanel(QWidget):
             self.output_epoch.setText(epoch_time.strftime("%Y-%m-%d %H:%M"))
         self.epoch_note.setText(
             "Zobrazena je epocha vlastního fitu. Převod používá N-body integraci; "
-            "do doplnění JPL DE je vzdálená epocha pouze orientační."
+            f"aktivní planetární efemerida: {PLANETS.model_name}."
         )
         self.redraw()
 
@@ -3018,8 +3029,8 @@ class ElementsPanel(QWidget):
         target_time = self._epoch_target_time or datetime.now()
         self.epoch_note.setText(
             f"Elementy převedeny N-body integrací na {target_time:%Y-%m-%d %H:%M}. "
-            "Formální nejistoty nebyly do nové epochy propagovány; planetární "
-            "efemerida je zatím analytická, proto je vzdálený výsledek orientační."
+            "Formální nejistoty nebyly do nové epochy propagovány. "
+            f"Planetární efemerida: {PLANETS.model_name}."
         )
         self.redraw()
 
@@ -3034,6 +3045,139 @@ class ElementsPanel(QWidget):
     def set_solution(self, solution: OrbitSolution) -> None:
         self.solution = solution
         self._reset_output_epoch()
+
+
+class De440DownloadDialog(QDialog):
+    """Download and verify the official NAIF DE440 kernel."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Stažení JPL DE440")
+        self.setMinimumWidth(560)
+        self.destination = de440_path()
+        self.partial = self.destination.with_suffix(".bsp.part")
+        self.reply: QNetworkReply | None = None
+        self.output = None
+        self.cancelled = False
+        self.status = QLabel(
+            "Stahuji oficiální kernel JPL DE440 z NASA/NAIF…\n"
+            f"Cíl: {self.destination}"
+        )
+        self.status.setWordWrap(True)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.cancel_button = QPushButton("Zrušit")
+        self.cancel_button.clicked.connect(self._cancel_download)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.status)
+        layout.addWidget(self.progress)
+        layout.addWidget(self.cancel_button, 0, Qt.AlignRight)
+        self.manager = QNetworkAccessManager(self)
+        QTimer.singleShot(0, self._start_download)
+
+    def _start_download(self) -> None:
+        try:
+            self.destination.parent.mkdir(parents=True, exist_ok=True)
+            self.output = self.partial.open("wb")
+        except OSError as exc:
+            QMessageBox.warning(self, "JPL DE440", f"Nelze vytvořit soubor:\n{exc}")
+            self.reject()
+            return
+        request = QNetworkRequest(QUrl(DE440_URL))
+        request.setHeader(QNetworkRequest.UserAgentHeader, "Orbit-Solver/1.0")
+        self.reply = self.manager.get(request)
+        self.reply.readyRead.connect(self._write_available_data)
+        self.reply.downloadProgress.connect(self._update_progress)
+        self.reply.finished.connect(self._download_finished)
+        self.reply.finished.connect(self.reply.deleteLater)
+
+    def _write_available_data(self) -> None:
+        if self.reply is not None and self.output is not None:
+            self.output.write(bytes(self.reply.readAll()))
+
+    def _update_progress(self, received: int, total: int) -> None:
+        if total > 0:
+            self.progress.setRange(0, 1000)
+            self.progress.setValue(int(received * 1000 / total))
+            self.status.setText(
+                f"Stahuji JPL DE440: {received / 1048576:.1f} z "
+                f"{total / 1048576:.1f} MB\nCíl: {self.destination}"
+            )
+        else:
+            self.progress.setRange(0, 0)
+
+    def _cancel_download(self) -> None:
+        self.cancelled = True
+        self.cancel_button.setEnabled(False)
+        if self.reply is not None:
+            self.reply.abort()
+        else:
+            self.reject()
+
+    def _cleanup_partial(self) -> None:
+        if self.output is not None:
+            self.output.close()
+            self.output = None
+        try:
+            if self.partial.exists():
+                self.partial.unlink()
+        except OSError:
+            pass
+
+    def _download_finished(self) -> None:
+        self._write_available_data()
+        if self.output is not None:
+            self.output.close()
+            self.output = None
+        if self.cancelled:
+            self._cleanup_partial()
+            self.reject()
+            return
+        if self.reply is None or self.reply.error() != QNetworkReply.NoError:
+            message = self.reply.errorString() if self.reply is not None else "neznámá chyba"
+            self._cleanup_partial()
+            QMessageBox.warning(self, "JPL DE440", f"Stažení selhalo:\n{message}")
+            self.reject()
+            return
+        self.status.setText("Ověřuji kontrolní součet staženého souboru…")
+        QApplication.processEvents()
+        digest = hashlib.md5()
+        try:
+            with self.partial.open("rb") as source:
+                for block in iter(lambda: source.read(4 * 1024 * 1024), b""):
+                    digest.update(block)
+            if digest.hexdigest().lower() != DE440_MD5:
+                raise ValueError(
+                    "Kontrolní součet nesouhlasí. Soubor může být neúplný nebo poškozený."
+                )
+            # On Windows an mmap-backed SPK cannot be replaced while open.
+            PLANETS.unload()
+            self.partial.replace(self.destination)
+            if not PLANETS.reload():
+                raise ValueError(PLANETS.load_error or "Kernel se nepodařilo otevřít.")
+        except (OSError, ValueError) as exc:
+            self._cleanup_partial()
+            PLANETS.reload()
+            QMessageBox.warning(self, "JPL DE440", str(exc))
+            self.reject()
+            return
+        self.progress.setRange(0, 1000)
+        self.progress.setValue(1000)
+        self.status.setText(
+            "JPL DE440 byla ověřena a aktivována. Nové výpočty budou používat "
+            "planetární efemeridu DE440 v rozsahu 1549–2650."
+        )
+        self.cancel_button.setText("Zavřít")
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.clicked.disconnect()
+        self.cancel_button.clicked.connect(self.accept)
+
+    def reject(self) -> None:
+        if self.reply is not None and not self.reply.isFinished():
+            self.cancelled = True
+            self.reply.abort()
+            return
+        super().reject()
 
 
 class OrbitConstraintsDialog(QDialog):
@@ -3073,6 +3217,22 @@ class OrbitConstraintsDialog(QDialog):
             row_layout.addWidget(enabled); row_layout.addWidget(editor, 1)
             form.addRow(label, row)
             self.controls[name] = (enabled, editor)
+        ephemeris_heading = QLabel("Planetární efemerida")
+        ephemeris_heading.setStyleSheet("font-weight: 650; margin-top: 10px;")
+        form.addRow(ephemeris_heading)
+        self.ephemeris_status = QLabel(PLANETS.status_text())
+        self.ephemeris_status.setWordWrap(True)
+        self.ephemeris_status.setObjectName("muted")
+        form.addRow(self.ephemeris_status)
+        self.download_de440 = QPushButton(
+            "Přeinstalovat JPL DE440…" if PLANETS.jpl is not None
+            else "Stáhnout JPL DE440 (cca 114 MB)…"
+        )
+        self.download_de440.setToolTip(
+            "Oficiální planetární kernel NASA/NAIF; pokrytí 1549-12-31 až 2650-01-25."
+        )
+        self.download_de440.clicked.connect(self._download_de440)
+        form.addRow(self.download_de440)
         comet = is_comet_designation(solution.designation)
         self.is_comet = comet
         self.original_future = QCheckBox(
@@ -3108,8 +3268,7 @@ class OrbitConstraintsDialog(QDialog):
             form.addRow(self.original_future)
             dynamics_note = QLabel(
                 "Volba je standardně vypnutá. Výpočet může trvat podstatně déle; "
-                "proběhne na pozadí. Do přidání JPL DE441 jde o orientační výsledek "
-                "současného planetárního modelu."
+                f"proběhne na pozadí. Aktivní model planet: {PLANETS.model_name}."
             )
             dynamics_note.setWordWrap(True)
             dynamics_note.setObjectName("muted")
@@ -3123,6 +3282,28 @@ class OrbitConstraintsDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject)
         layout = QVBoxLayout(self); layout.addWidget(note); layout.addLayout(form); layout.addWidget(buttons)
+
+    def _download_de440(self) -> None:
+        if PLANETS.jpl is None:
+            prompt = (
+                "Stáhnout oficiální JPL DE440 z NASA/NAIF?\n\n"
+                "Soubor má přibližně 114 MB a bude uložen do složky orbit-data. "
+                "Pokrytí efemeridy je 1549–2650."
+            )
+        else:
+            prompt = "Stáhnout a znovu ověřit JPL DE440 (přibližně 114 MB)?"
+        if QMessageBox.question(
+            self, "JPL DE440", prompt,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        ) != QMessageBox.Yes:
+            return
+        dialog = De440DownloadDialog(self)
+        dialog.exec()
+        self.ephemeris_status.setText(PLANETS.status_text())
+        self.download_de440.setText(
+            "Přeinstalovat JPL DE440…" if PLANETS.jpl is not None
+            else "Stáhnout JPL DE440 (cca 114 MB)…"
+        )
 
     def selected_constraints(self) -> dict[str, float]:
         return {name: editor.value() for name, (enabled, editor) in self.controls.items() if enabled.isChecked()}
