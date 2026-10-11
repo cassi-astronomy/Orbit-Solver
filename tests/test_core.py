@@ -69,6 +69,8 @@ class SkyTrackTests(unittest.TestCase):
         self.assertIn(("1 den/s", 1), PlaybackBar.STANDARD_SPEEDS)
         self.assertIn(("2 dny/s", 2), PlaybackBar.STANDARD_SPEEDS)
         self.assertIn(("5 dní/s", 5), PlaybackBar.STANDARD_SPEEDS)
+        self.assertIn(("250 dní/s", 250), PlaybackBar.STANDARD_SPEEDS)
+        self.assertIn(("500 dní/s", 500), PlaybackBar.STANDARD_SPEEDS)
         self.assertLess(
             PlaybackBar.STANDARD_SPEEDS.index(("2 dny/s", 2)),
             PlaybackBar.STANDARD_SPEEDS.index(("5 dní/s", 5)),

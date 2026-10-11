@@ -59,6 +59,7 @@ from PySide6.QtWidgets import (
 import matplotlib.dates as mdates
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
+from matplotlib.collections import LineCollection
 from matplotlib.figure import Figure
 from matplotlib.projections import register_projection
 from mpl_toolkits.mplot3d import Axes3D
@@ -1450,6 +1451,7 @@ class PlaybackBar(QWidget):
         ("1 den/s", 1), ("2 dny/s", 2), ("5 dní/s", 5),
         ("10 dní/s", 10), ("25 dní/s", 25),
         ("50 dní/s", 50), ("100 dní/s", 100),
+        ("250 dní/s", 250), ("500 dní/s", 500),
     )
     VISIBILITY_SPEEDS = (
         ("1 den/s", 1), ("2 dny/s", 2), ("3 dny/s", 3),
@@ -1460,8 +1462,14 @@ class PlaybackBar(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.direction = 0
+        self._fractional_seconds = 0.0
         self.timer = QTimer(self)
-        self.timer.setInterval(100)
+        # Ten frames per second made 100 days/s advance in conspicuous
+        # ten-day jumps.  A 40-fps target keeps even the fast astronomical
+        # time scales visually continuous.  If a complex plot needs longer
+        # to render, Qt coalesces timer events instead of building a backlog.
+        self.timer.setTimerType(Qt.PreciseTimer)
+        self.timer.setInterval(25)
         self.timer.timeout.connect(self._tick)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1508,16 +1516,29 @@ class PlaybackBar(QWidget):
 
     def _play(self, direction: int) -> None:
         self.direction = direction
+        self._fractional_seconds = 0.0
         self.timer.start()
 
     def _stop(self) -> None:
         self.direction = 0
         self.timer.stop()
+        self._fractional_seconds = 0.0
+        # Repaint once in full quality.  Animated panels may omit costly
+        # secondary labels while the timer is running.
+        self.time_changed.emit(self.time.dateTime().toPython())
 
     def _tick(self) -> None:
         days_per_second = float(self.speed.currentData())
-        delta_seconds = self.direction * days_per_second * 86400 * self.timer.interval() / 1000
-        self.time.setDateTime(self.time.dateTime().addSecs(int(delta_seconds)))
+        delta_seconds = (
+            self.direction * days_per_second * 86400
+            * self.timer.interval() / 1000
+        ) + self._fractional_seconds
+        whole_seconds = int(delta_seconds)
+        self._fractional_seconds = delta_seconds - whole_seconds
+        if whole_seconds:
+            self.time.setDateTime(
+                self.time.dateTime().addSecs(whole_seconds)
+            )
 
 
 class SolarSystemPanel(QWidget):
@@ -1618,6 +1639,10 @@ class SolarSystemPanel(QWidget):
         layout.addWidget(playback)
         self._camera_drag: tuple[float, float, int, int] | None = None
         self._center_track_cache: dict[tuple[str, int], np.ndarray] = {}
+        # A complete planetary orbit is effectively a static backdrop over
+        # an animation.  Recomputing thousands of DE440 positions for every
+        # frame was by far the largest source of stutter.
+        self._planet_path_cache: dict[tuple[str, str], np.ndarray] = {}
         self.canvas.mpl_connect("button_press_event", self._camera_press)
         self.canvas.mpl_connect("motion_notify_event", self._camera_motion)
         self.canvas.mpl_connect("button_release_event", self._camera_release)
@@ -1707,6 +1732,7 @@ class SolarSystemPanel(QWidget):
 
     def set_solution(self, solution: OrbitSolution) -> None:
         self.solution = solution
+        self._planet_path_cache.clear()
         self.set_time(datetime.now())
 
     def set_evolution(
@@ -1901,12 +1927,21 @@ class SolarSystemPanel(QWidget):
             if np.linalg.norm(relative_position) > curve_radius * 1.15:
                 continue
             if key != center:
-                planet_jd = np.linspace(current_jd, current_jd + years * 365.256, 360)
-                path = np.stack([PLANETS.position(key, float(epoch)) for epoch in planet_jd])
-                if center != "sun":
-                    path -= np.stack([
-                        PLANETS.position(center, float(epoch)) for epoch in planet_jd
+                cache_key = (key, center)
+                path = self._planet_path_cache.get(cache_key)
+                if path is None:
+                    planet_jd = np.linspace(
+                        current_jd, current_jd + years * 365.256, 360
+                    )
+                    path = np.stack([
+                        PLANETS.position(key, float(epoch)) for epoch in planet_jd
                     ])
+                    if center != "sun":
+                        path -= np.stack([
+                            PLANETS.position(center, float(epoch))
+                            for epoch in planet_jd
+                        ])
+                    self._planet_path_cache[cache_key] = path
                 path_x, path_y, _ = project_ecliptic_camera(path, azimuth, elevation)
                 ax.plot(path_x, path_y, color=color, alpha=.7, lw=1.15)
             px, py, _ = project_ecliptic_camera(relative_position, azimuth, elevation)
@@ -2037,6 +2072,9 @@ class SkyPanel(QWidget):
         self.free_center_ra: float | None = None
         self.free_center_dec: float | None = None
         self._map_drag: tuple[float, float, float, float] | None = None
+        self._sky_track_cache: tuple[
+            int, int, float, float, np.ndarray, dict[str, np.ndarray]
+        ] | None = None
         self.canvas = PlotCanvas()
         self.canvas.figure.set_layout_engine(None)
         self.canvas.axes.set_position([.055, .075, .935, .86])
@@ -2294,7 +2332,49 @@ class SkyPanel(QWidget):
         self.solution = solution
         self.free_center_ra = None
         self.free_center_dec = None
+        self._sky_track_cache = None
         self.rebuild(self.playback.time.dateTime().toPython())
+
+    def _sky_track_geometry(
+        self, jd0: float, horizon: int,
+    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Reuse an absolute sky track while the animation moves within it."""
+        wanted_start = jd0 - horizon
+        wanted_end = jd0 + horizon
+        solution_key = id(self.solution)
+        cache = self._sky_track_cache
+        if (
+            cache is None or cache[0] != solution_key or cache[1] != horizon
+            or wanted_start < cache[2] or wanted_end > cache[3]
+        ):
+            # A generous guard interval prevents a costly DE440 track rebuild
+            # on every frame.  The displayed part is still exactly the chosen
+            # interval around the current date.
+            margin = max(100.0, min(1000.0, float(horizon) * 2.0))
+            cache_start = wanted_start - margin
+            cache_end = wanted_end + margin
+            base_count = sky_track_sample_count(horizon)
+            base_step = 2.0 * horizon / max(base_count - 1, 1)
+            cache_count = min(
+                6001,
+                max(base_count + 2, int(np.ceil(
+                    (cache_end - cache_start) / max(base_step, 1e-6)
+                )) + 1),
+            )
+            cached_jd = np.linspace(cache_start, cache_end, cache_count)
+            cached_geometry = apparent_geometry(self.solution, cached_jd)
+            cache = (
+                solution_key, horizon, cache_start, cache_end,
+                cached_jd, cached_geometry,
+            )
+            self._sky_track_cache = cache
+        cached_jd = cache[4]
+        mask = (cached_jd >= wanted_start) & (cached_jd <= wanted_end)
+        jd = cached_jd[mask]
+        geometry = {
+            key: np.asarray(values)[mask] for key, values in cache[5].items()
+        }
+        return jd, geometry
 
     def set_time(self, time: datetime) -> None:
         self.rebuild(time)
@@ -2635,10 +2715,7 @@ class SkyPanel(QWidget):
         self.canvas.axes.set_position([.055, .075, .935, .86])
         jd0 = datetime_to_jd(time)
         horizon = int(self.horizon.currentData())
-        jd = np.linspace(
-            jd0 - horizon, jd0 + horizon, sky_track_sample_count(horizon)
-        )
-        geom = apparent_geometry(self.solution, jd)
+        jd, geom = self._sky_track_geometry(jd0, horizon)
         now = apparent_geometry(self.solution, np.array([jd0]))
         if self.lock_target.isChecked() or self.free_center_ra is None or self.free_center_dec is None:
             center_ra = float(now["ra"][0])
@@ -2688,6 +2765,7 @@ class SkyPanel(QWidget):
         sizes = np.clip(1.0 + 2.2 * np.power(np.maximum(6.2 - BRIGHT_STARS[:, 2], .1), 1.55), .8, 52)
         ax.scatter(star_x[star_visible], star_y[star_visible], s=sizes[star_visible],
                    color="#d9e7ff", alpha=.76, linewidth=0)
+        constellation_segments: list[np.ndarray] = []
         for line in CONSTELLATION_LINES:
             line_x, line_y, line_distance = projection(
                 line[:, 0], line[:, 1], center_ra, center_dec
@@ -2714,9 +2792,19 @@ class SkyPanel(QWidget):
                 np.arange(len(line_x)), np.where(discontinuity)[0] + 1
             ):
                 if len(segment) > 1:
-                    ax.plot(line_x[segment], line_y[segment], color="#526b8d",
-                            alpha=.72, lw=.65, zorder=0, clip_on=True)
-        if CONSTELLATION_LABELS:
+                    constellation_segments.append(np.column_stack((
+                        line_x[segment], line_y[segment],
+                    )))
+        if constellation_segments:
+            ax.add_collection(LineCollection(
+                constellation_segments, colors="#526b8d", alpha=.72,
+                linewidths=.65, zorder=0, clip_on=True,
+            ))
+        # Text rendering is relatively expensive and prevents a useful frame
+        # rate on large maps.  Hide only the faint constellation abbreviations
+        # while the animation is moving; the following stop redraw restores
+        # them at the final date.
+        if CONSTELLATION_LABELS and not self.playback.timer.isActive():
             label_ra = np.array([item[1] for item in CONSTELLATION_LABELS])
             label_dec = np.array([item[2] for item in CONSTELLATION_LABELS])
             label_x, label_y, label_distance = projection(
