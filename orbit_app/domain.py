@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import re
 from typing import Any
+
+
+def is_comet_designation(value: str) -> bool:
+    """Recognize provisional and permanently numbered comet designations."""
+    return bool(re.match(r"^\s*(?:[ACDPX]/|\d+[PD](?:/|\b))", value or "", re.I))
 
 
 @dataclass(slots=True)

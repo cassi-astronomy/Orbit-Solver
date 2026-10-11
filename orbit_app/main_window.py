@@ -62,7 +62,7 @@ from matplotlib.figure import Figure
 from matplotlib.projections import register_projection
 from mpl_toolkits.mplot3d import Axes3D
 
-from .domain import Observation, OrbitSolution
+from .domain import Observation, OrbitSolution, is_comet_designation
 from .comet_dynamics import analyze_original_future_orbit
 from .mpc import MpcClient, MpcError, parse_mpc80
 from .mpc_orbit import (
@@ -271,10 +271,6 @@ def observation_residual_score(observation: Observation) -> float | None:
     return max(abs(float(value)) for value in values if value is not None)
 
 
-def is_comet_designation(value: str) -> bool:
-    return bool(re.match(r"^\s*(?:[ACDPX]/|\d+[PD](?:/|\b))", value or "", re.I))
-
-
 def parse_output_epoch(value: str) -> datetime:
     text = value.strip()
     for date_format in ("%Y", "%Y-%m-%d", "%Y-%m-%d %H:%M"):
@@ -288,8 +284,8 @@ def parse_output_epoch(value: str) -> datetime:
 class ObservationModel(QAbstractTableModel):
     columns = (
         ("Čas (UTC)", "time"),
-        ("RA [°]", "ra_deg"),
-        ("Dec [°]", "dec_deg"),
+        ("RA [h m s]", "ra_deg"),
+        ("Dec [° ′ ″]", "dec_deg"),
         ("Mag / pásmo", "magnitude_band"),
         ("Stanice", "station"),
         ("Použít", "excluded_from_fit"),
@@ -336,6 +332,10 @@ class ObservationModel(QAbstractTableModel):
         if role == Qt.ToolTipRole and field in ("residual_ra_arcsec", "residual_dec_arcsec"):
             return "Barva podle většího z |O−C RA| a |O−C Dec|: zelená ≤0,5″; světle zelená ≤1″; žlutá ≤2″; červená >2″."
         if role == Qt.DisplayRole:
+            if field == "ra_deg":
+                return "—" if value is None else format_ra_sexagesimal(float(value))
+            if field == "dec_deg":
+                return "—" if value is None else format_dec_sexagesimal(float(value))
             if field == "magnitude_band":
                 if observation.magnitude is None:
                     return "—" if not observation.band else f"— {observation.band}"
@@ -345,8 +345,6 @@ class ObservationModel(QAbstractTableModel):
             if field == "used_in_fit":
                 return "ano" if value is True else ("ne" if value is False else "—")
             if isinstance(value, float):
-                if field in ("ra_deg", "dec_deg"):
-                    return f"{value:.6f}"
                 return f"{value:+.2f}" if field.startswith("residual_") else f"{value:.2f}"
             return "—" if value in (None, "") else str(value)
         if role == Qt.TextAlignmentRole and field in (
@@ -388,6 +386,45 @@ class ObservationModel(QAbstractTableModel):
             reverse=order == Qt.DescendingOrder,
         )
         self.layoutChanged.emit()
+
+
+def observations_to_tsv(observations: list[Observation]) -> str:
+    """Create a clipboard-friendly astrometry table including both residuals."""
+    lines = [
+        "Čas (UTC)\tRA (h m s)\tDec (° ′ ″)\tMag / pásmo\tStanice\t"
+        "Použít\tO−C RA [″]\tO−C Dec [″]\tVe fitu"
+    ]
+    for observation in observations:
+        magnitude = (
+            "—" if observation.magnitude is None
+            else f"{observation.magnitude:.2f}"
+        )
+        if observation.band:
+            magnitude = f"{magnitude} {observation.band}"
+        residual_ra = (
+            "—" if observation.residual_ra_arcsec is None
+            else f"{observation.residual_ra_arcsec:+.3f}"
+        )
+        residual_dec = (
+            "—" if observation.residual_dec_arcsec is None
+            else f"{observation.residual_dec_arcsec:+.3f}"
+        )
+        used = (
+            "ano" if observation.used_in_fit is True
+            else "ne" if observation.used_in_fit is False else "—"
+        )
+        lines.append("\t".join((
+            observation.time or "—",
+            "—" if observation.ra_deg is None else format_ra_sexagesimal(observation.ra_deg),
+            "—" if observation.dec_deg is None else format_dec_sexagesimal(observation.dec_deg),
+            magnitude,
+            observation.station or "—",
+            "ne" if observation.excluded_from_fit else "ano",
+            residual_ra,
+            residual_dec,
+            used,
+        )))
+    return "\n".join(lines)
 
 
 class MpcNetworkClient(QObject):
@@ -2004,9 +2041,11 @@ class SkyPanel(QWidget):
         if self.solution.phase_correction:
             magnitude += hg_phase_correction(geometry["phase"], self.solution.slope_g)
         shown_time = display_time if display_time is not None else time
+        ra_text = format_ra_sexagesimal(float(geometry["ra"][0]))
+        dec_text = format_dec_sexagesimal(float(geometry["dec"][0]))
         self.info.setText(
-            f"{shown_time:%Y-%m-%d %H:%M} {zone_label}    RA {geometry['ra'][0]:.5f}°    "
-            f"Dec {geometry['dec'][0]:+.5f}°    mag {magnitude[0]:.2f}    "
+            f"{shown_time:%Y-%m-%d %H:%M} {zone_label}    RA {ra_text}    "
+            f"Dec {dec_text}    mag {magnitude[0]:.2f}    "
             f"Δ {geometry['delta'][0]:.5f} AU    r {geometry['r'][0]:.5f} AU    "
             f"elongace {geometry['elongation'][0]:.1f}°{extra}"
         )
@@ -2449,9 +2488,18 @@ class PhotometryPanel(QWidget):
         self.kind = QComboBox(); self.kind.addItems(["Planetka", "Kometa – celková jasnost"])
         self.absolute = QDoubleSpinBox(); self.absolute.setRange(-10, 40); self.absolute.setValue(solution.absolute_magnitude)
         self.absolute.setDecimals(2); self.absolute.setPrefix("H/M = ")
-        self.exponent = QDoubleSpinBox(); self.exponent.setRange(0, 20); self.exponent.setValue(2); self.exponent.setSingleStep(.25)
+        comet = is_comet_designation(solution.designation) or is_comet_designation(solution.display_name or "")
+        if comet and solution.photometric_exponent == 2.0:
+            solution.photometric_exponent = 4.0
+        if comet:
+            solution.phase_correction = False
+        self.kind.setCurrentIndex(1 if comet else 0)
+        self.exponent = QDoubleSpinBox(); self.exponent.setRange(0, 20)
+        self.exponent.setValue(solution.photometric_exponent); self.exponent.setSingleStep(.25)
         self.exponent.setPrefix("n = ")
-        self.phase = QCheckBox("H–G fázová korekce"); self.phase.setChecked(True)
+        self.phase = QCheckBox("H–G fázová korekce")
+        self.phase.setChecked(solution.phase_correction and not comet)
+        self.phase.setEnabled(not comet)
         for widget in (self.kind, self.absolute, self.exponent, self.phase): controls.addWidget(widget)
         controls.addStretch()
         date_controls = QHBoxLayout()
@@ -2470,7 +2518,7 @@ class PhotometryPanel(QWidget):
         layout = QVBoxLayout(self); layout.addLayout(controls); layout.addLayout(date_controls)
         layout.addWidget(NavigationToolbar2QT(self.canvas, self)); layout.addWidget(self.canvas, 1)
         self.kind.currentIndexChanged.connect(self._kind_changed)
-        self.absolute.valueChanged.connect(self.redraw)
+        self.absolute.valueChanged.connect(self._absolute_changed)
         self.exponent.valueChanged.connect(self._photometry_setting_changed)
         self.phase.toggled.connect(self._photometry_setting_changed)
         self.cursor_time.dateTimeChanged.connect(lambda _: self.redraw())
@@ -2481,11 +2529,19 @@ class PhotometryPanel(QWidget):
 
     def set_solution(self, solution: OrbitSolution) -> None:
         self.solution = solution
-        if "/" in solution.designation and self.kind.currentIndex() != 1:
-            self.kind.setCurrentIndex(1)
-        else:
-            self.exponent.setValue(solution.photometric_exponent)
-        self.phase.setChecked(solution.phase_correction)
+        comet = is_comet_designation(solution.designation) or is_comet_designation(solution.display_name or "")
+        if comet and solution.photometric_exponent == 2.0:
+            solution.photometric_exponent = 4.0
+        if comet:
+            solution.phase_correction = False
+        for control in (self.kind, self.exponent, self.phase):
+            control.blockSignals(True)
+        self.kind.setCurrentIndex(1 if comet else 0)
+        self.exponent.setValue(solution.photometric_exponent)
+        self.phase.setChecked(solution.phase_correction and not comet)
+        self.phase.setEnabled(not comet)
+        for control in (self.kind, self.exponent, self.phase):
+            control.blockSignals(False)
         if not self._calibrate_absolute_from_observations():
             self.absolute.setValue(solution.absolute_magnitude)
         self.redraw()
@@ -2495,7 +2551,17 @@ class PhotometryPanel(QWidget):
         self._calibrate_absolute_from_observations()
 
     def _photometry_setting_changed(self, *_args) -> None:
-        self._calibrate_absolute_from_observations()
+        if not self._calibrate_absolute_from_observations():
+            self.solution.photometric_exponent = self.exponent.value()
+            self.solution.phase_correction = (
+                self.kind.currentIndex() == 0 and self.phase.isChecked()
+            )
+            self.photometry_changed.emit()
+        self.redraw()
+
+    def _absolute_changed(self, value: float) -> None:
+        self.solution.absolute_magnitude = float(value)
+        self.photometry_changed.emit()
         self.redraw()
 
     def _calibrate_absolute_from_observations(self) -> bool:
@@ -2530,7 +2596,11 @@ class PhotometryPanel(QWidget):
     def _kind_changed(self, index: int) -> None:
         self.exponent.setValue(2.0 if index == 0 else 4.0)
         self.phase.setEnabled(index == 0)
-        self._calibrate_absolute_from_observations()
+        self.phase.setChecked(index == 0)
+        if not self._calibrate_absolute_from_observations():
+            self.solution.photometric_exponent = self.exponent.value()
+            self.solution.phase_correction = index == 0 and self.phase.isChecked()
+            self.photometry_changed.emit()
         self.redraw()
 
     def redraw(self) -> None:
@@ -3606,6 +3676,10 @@ class MainWindow(QMainWindow):
         observation_actions = QHBoxLayout()
         exclude_selected = QPushButton("Vyřadit vybraná z fitu")
         include_selected = QPushButton("Zařadit vybraná do fitu")
+        copy_selected_observations = QPushButton("Kopírovat vybraná")
+        copy_selected_observations.setToolTip(
+            "Zkopíruje celé vybrané řádky včetně sexagesimální RA/Dec a obou reziduí O−C."
+        )
         self.exclude_outliers_button = QPushButton("Vyřadit rezidua > 2″")
         self.exclude_outliers_button.setToolTip(
             "Vybere a vyřadí všechna dosud zařazená pozorování, u nichž |O−C RA| "
@@ -3620,9 +3694,11 @@ class MainWindow(QMainWindow):
         self.worst_observation_button.setEnabled(False)
         exclude_selected.clicked.connect(lambda: self._set_selected_observations_excluded(True))
         include_selected.clicked.connect(lambda: self._set_selected_observations_excluded(False))
+        copy_selected_observations.clicked.connect(self._copy_selected_observations)
         self.exclude_outliers_button.clicked.connect(self._exclude_large_residuals)
         self.worst_observation_button.clicked.connect(self._select_worst_observation)
         observation_actions.addWidget(exclude_selected); observation_actions.addWidget(include_selected)
+        observation_actions.addWidget(copy_selected_observations)
         observation_actions.addSpacing(12)
         observation_actions.addWidget(self.exclude_outliers_button)
         observation_actions.addWidget(self.worst_observation_button)
@@ -3632,6 +3708,8 @@ class MainWindow(QMainWindow):
         self.observation_table.setAlternatingRowColors(True); self.observation_table.setSortingEnabled(True)
         self.observation_table.setSelectionBehavior(QTableView.SelectRows)
         self.observation_table.setSelectionMode(QTableView.ExtendedSelection)
+        self.observation_copy_shortcut = QShortcut(QKeySequence.Copy, self.observation_table)
+        self.observation_copy_shortcut.activated.connect(self._copy_selected_observations)
         self.observation_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         obs_layout.addWidget(self.observation_table)
         self.observation_detail = QLabel(
@@ -3980,6 +4058,10 @@ class MainWindow(QMainWindow):
     def _refresh_photometric_dependents(self) -> None:
         if not hasattr(self, "sky_panel"):
             return
+        if self.tabs.currentIndex() == 2:
+            self.ephemeris_panel.generate()
+        else:
+            self._dirty_solution_tabs.add(2)
         if self.tabs.currentIndex() == 5:
             self.sky_panel.rebuild(self.sky_panel.playback.time.dateTime().toPython())
         else:
@@ -3998,6 +4080,22 @@ class MainWindow(QMainWindow):
             self._refresh_residual_actions()
             action = "Vyřazeno" if excluded else "Zařazeno"
             self.statusBar().showMessage(f"{action} {len(rows)} vybraných pozorování.", 6000)
+
+    def _copy_selected_observations(self) -> None:
+        selection = self.observation_table.selectionModel()
+        rows = sorted({index.row() for index in selection.selectedRows()})
+        if not rows:
+            rows = sorted({index.row() for index in self.observation_table.selectedIndexes()})
+        if not rows and selection.currentIndex().isValid():
+            rows = [selection.currentIndex().row()]
+        if not rows:
+            self.statusBar().showMessage("Nejdřív vyberte alespoň jedno pozorování.", 5000)
+            return
+        observations = [self.observation_model.rows[row] for row in rows]
+        QApplication.clipboard().setText(observations_to_tsv(observations))
+        self.statusBar().showMessage(
+            f"Zkopírováno {len(observations)} pozorování včetně O−C RA a Dec.", 6000
+        )
 
     def _active_residual_rows(self) -> list[tuple[int, float]]:
         result: list[tuple[int, float]] = []

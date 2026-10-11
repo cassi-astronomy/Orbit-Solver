@@ -7,9 +7,9 @@ import numpy as np
 
 from orbit_app.domain import Observation, OrbitSolution
 from orbit_app.main_window import (
-    CONSTELLATION_LABELS, CONSTELLATION_LINES, ElementsPanel, SkyPanel,
+    CONSTELLATION_LABELS, CONSTELLATION_LINES, ElementsPanel, ObservationModel, SkyPanel,
     datetime_from_jd, equatorial_ra_ticks, format_dec_sexagesimal, format_ra_sexagesimal,
-    is_comet_designation, observation_residual_score, parse_output_epoch,
+    is_comet_designation, observation_residual_score, observations_to_tsv, parse_output_epoch,
     perihelion_jd_from_solution, project_ecliptic_camera,
     SKY_TRACK_HORIZONS, sky_track_sample_count, solar_orbit_clip_radius,
 )
@@ -113,6 +113,23 @@ class SkyTrackTests(unittest.TestCase):
 
 
 class ObservationResidualTests(unittest.TestCase):
+    def test_observation_clipboard_uses_sexagesimal_coordinates_and_residuals(self):
+        observation = Observation(
+            time="2026-10-11T01:02:03Z", ra_deg=272.9875, dec_deg=-17.125,
+            magnitude=12.3, band="G", station="557",
+            residual_ra_arcsec=-.125, residual_dec_arcsec=.375,
+            used_in_fit=True,
+        )
+        text = observations_to_tsv([observation])
+        self.assertIn("18 11 57.00", text)
+        self.assertIn("−17 07 30.0", text)
+        self.assertIn("-0.125\t+0.375", text)
+
+        model = ObservationModel()
+        model.set_rows([observation])
+        self.assertEqual(model.data(model.index(0, 1)), "18 11 57.00")
+        self.assertEqual(model.data(model.index(0, 2)), "−17 07 30.0")
+
     def test_score_matches_row_colour_rule(self):
         observation = Observation(
             residual_ra_arcsec=-1.25, residual_dec_arcsec=2.4,
@@ -287,6 +304,20 @@ class MpcParsingTests(unittest.TestCase):
         self.assertAlmostEqual(solution.epoch_jd, 2451545.0)
         self.assertAlmostEqual(solution.semi_major_axis_au, 1.0)
         self.assertAlmostEqual(solution.absolute_magnitude, 12.4)
+
+    def test_mpc_comet_defaults_to_n4_without_asteroid_phase_law(self):
+        speed = math.sqrt(MU_SUN)
+        body = [{"mpc_orb": [{
+            "CAR": {
+                "coefficient_names": ["x", "y", "z", "vx", "vy", "vz"],
+                "coefficient_values": [1, 0, 0, 0, speed, 0],
+            },
+            "epoch_data": {"epoch": 51544.5},
+            "magnitude_data": {"H": 10.5, "G": 0.15},
+        }]}]
+        solution = parse_mpc_orbit(body, "2P")
+        self.assertEqual(solution.photometric_exponent, 4.0)
+        self.assertFalse(solution.phase_correction)
 
     def test_mpc_display_name_for_named_asteroid(self):
         result = mpc_display_name({

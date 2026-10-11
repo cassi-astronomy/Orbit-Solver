@@ -4,7 +4,7 @@ import re
 
 import numpy as np
 
-from .domain import OrbitSolution
+from .domain import OrbitSolution, is_comet_designation
 from .orbit_engine import MU_SUN
 
 
@@ -183,6 +183,7 @@ def parse_mpc_orbit(body: object, designation: str) -> OrbitSolution:
     elements = cartesian_to_elements(np.array(values[:3]), np.array(values[3:]))
     magnitude = orbit.get("magnitude_data", {})
     display_name = mpc_display_name(orbit.get("designation_data"), designation)
+    comet = is_comet_designation(designation) or is_comet_designation(display_name)
     h_value = magnitude.get("H", orbit.get("H", 18.0))
     g_value = magnitude.get("G", orbit.get("G", 0.15))
     covariance_values = orbit.get("CAR", {}).get("covariance", {})
@@ -212,6 +213,8 @@ def parse_mpc_orbit(body: object, designation: str) -> OrbitSolution:
         mean_anomaly_deg=elements[5],
         absolute_magnitude=float(h_value) if h_value is not None else 18.0,
         slope_g=float(g_value) if g_value is not None else 0.15,
+        photometric_exponent=4.0 if comet else 2.0,
+        phase_correction=not comet,
         provisional=False,
         position_au=tuple(float(value) for value in values[:3]),
         velocity_au_per_day=tuple(float(value) for value in values[3:]),
