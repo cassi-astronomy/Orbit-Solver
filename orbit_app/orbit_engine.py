@@ -69,6 +69,7 @@ DEFAULT_PERTURBERS = (
     Perturber("mercury", MU_SUN * 1.660120e-7),
     Perturber("venus", MU_SUN * 2.4478396e-6),
     Perturber("earth", MU_SUN * 3.0034896e-6),
+    Perturber("moon", MU_SUN * 3.694303e-8),
     Perturber("mars", MU_SUN * 3.227151e-7),
     Perturber("jupiter", MU_SUN * 9.547919e-4),
     Perturber("saturn", MU_SUN * 2.858856e-4),

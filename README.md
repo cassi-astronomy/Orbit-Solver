@@ -34,6 +34,7 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
 
 - přehled orbitálních elementů včetně nejistot;
 - převod elementů na uživatelem zvolenou epochu;
+- přepočet oskulačních elementů vůči Slunci nebo zvolené planetě;
 - kopírovatelný textový výstup a MPC 1-line elements;
 - geocentrická nebo topocentrická efemerida pro zvolenou MPC stanici;
 - RA/Dec v desetinném i sexagesimálním formátu;
@@ -50,7 +51,8 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
 - hvězdy do 6. magnitudy, obrazce a latinské zkratky 88 souhvězdí, rovník a ekliptika;
 - volné posouvání mapy, sledování objektu a samostatné zvětšené okno;
 - světelná křivka pro planetky i komety s nastavitelným fotometrickým modelem
-  a souběžnými křivkami vzdálenosti od Země a od Slunce.
+  a souběžnými křivkami vzdálenosti od Země a od Slunce; v grafu je vyznačeno
+  také heliocentrické přísluní.
 
 ### Dlouhodobý vývoj dráhy
 
@@ -60,13 +62,17 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
   přímo rokem návratu;
 - hledání přiblížení k planetám, vzdálenost v AU a Hillových poloměrech,
   relativní rychlost a orientační změna `1/a`;
+- automatická detekce planetocentrického zachycení podle záporné relativní
+  orbitální energie uvnitř Hillovy sféry;
 - přepínatelný graf průběžného vývoje `q`, `a`, `e`, periody, `1/a`, sklonu,
   uzlu nebo argumentu perihelu na lineární časové ose; změny při setkáních se
   projeví v okamžiku setkání a setkání jsou v grafu vyznačena;
 - chronologický export jako čitelný tabulkový TXT nebo MPC 1-line elements;
 - zobrazení numericky integrované minulé a budoucí trajektorie výrazně odlišnými
   barvami ve Sluneční soustavě; animovaná poloha sleduje i změny dráhy po
-  planetárním setkání.
+  planetárním setkání;
+- volitelný lokální planetocentrický pohled pro zachycené objekty; lunární
+  perturbace jsou zahrnuty (z DE440, nebo přibližným modelem bez něj).
 
 ## Požadavky
 
@@ -172,6 +178,9 @@ aplikací nutné porovnat s MPC, JPL Horizons nebo jiným nezávislým softwarem
   zatím nejsou v dynamickém modelu zahrnuty.
 - Konstantní A1/A2/A3 při integraci komety přes mnoho návratů jsou modelový
   předpoklad; skutečná negravitační aktivita komety se může mezi návraty měnit.
+- Velmi těsné průlety u povrchu Jupiteru zatím nezahrnují jeho zploštění ani
+  Galileovy měsíce. Rekonstrukce rozpadu Shoemaker–Levy 9 proto zůstává
+  orientační, i když planetocentrický rámec a bodová gravitace Jupiteru fungují.
 - Poziční nejistoty jsou formálně propagovány z kovariance fitovaného stavu;
   nezahrnují všechny možné systematické chyby měření ani modelu.
 - Jediná předběžná dráha z velmi krátkého oblouku není jednoznačné řešení.

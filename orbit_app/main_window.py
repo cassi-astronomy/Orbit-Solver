@@ -76,9 +76,10 @@ from .orbit_fit import (
     fit_orbit, fit_selection_count, initial_orbit_from_observations,
     parse_observation_time,
 )
-from .orbit_engine import NBodyIntegrator, StateVector
+from .orbit_engine import MU_SUN, NBodyIntegrator, StateVector
 from .orbit_evolution import (
-    EvolutionResult, PLANET_LABELS, calculate_orbit_evolution,
+    ELEMENT_CENTERS, EvolutionResult, HILL_RADII_AU, PLANET_LABELS, PLANET_MU,
+    calculate_orbit_evolution, centered_snapshot, centered_solution,
     format_evolution_mpc_report, format_evolution_report, return_solution,
 )
 from .planetary import DE440_MD5, DE440_URL, PLANETS, de440_path
@@ -196,9 +197,9 @@ def datetime_from_jd(jd: float) -> datetime | None:
         return None
 
 
-def perihelion_jd_from_solution(solution: OrbitSolution) -> float:
+def perihelion_jd_from_solution(solution: OrbitSolution, mu: float = MU_SUN) -> float:
     """Return the nearest osculating perihelion epoch represented by the state."""
-    mean_motion = 0.01720209895 / abs(solution.semi_major_axis_au) ** 1.5
+    mean_motion = np.sqrt(mu / abs(solution.semi_major_axis_au) ** 3)
     mean_anomaly = float(solution.mean_anomaly_deg)
     if solution.eccentricity < 1.0:
         # Elliptic elements conventionally store M in [0, 360).  Values near
@@ -898,6 +899,7 @@ class OrbitEvolutionPanel(QWidget):
         super().__init__()
         self.solution = solution
         self.result: EvolutionResult | None = None
+        self._centered_cache: dict[tuple[str, str], tuple] = {}
         self.thread: QThread | None = None
         self.worker: OrbitEvolutionWorker | None = None
 
@@ -941,6 +943,10 @@ class OrbitEvolutionPanel(QWidget):
         self.graph_metric.addItem("Graf: výstupný uzel Ω", "node")
         self.graph_metric.addItem("Graf: argument perihelu ω", "arg_peri")
         self.graph_metric.currentIndexChanged.connect(self._draw_result)
+        self.element_center = QComboBox()
+        for key, label in ELEMENT_CENTERS:
+            self.element_center.addItem(f"Střed: {label}", key)
+        self.element_center.currentIndexChanged.connect(self._center_changed)
         self.report_format = QComboBox()
         self.report_format.addItem("TXT: čitelný přehled", "readable")
         self.report_format.addItem("TXT: MPC 1-line", "mpc")
@@ -950,6 +956,7 @@ class OrbitEvolutionPanel(QWidget):
         self.copy_report.clicked.connect(self._copy_report)
         self.save_report.clicked.connect(self._save_report)
         output_controls.addWidget(self.graph_metric)
+        output_controls.addWidget(self.element_center)
         output_controls.addStretch()
         output_controls.addWidget(self.report_format)
         output_controls.addWidget(self.copy_report); output_controls.addWidget(self.save_report)
@@ -1010,6 +1017,7 @@ class OrbitEvolutionPanel(QWidget):
         self.solution = solution
         self._update_source_note()
         self.result = None
+        self._centered_cache.clear()
         self.returns.setRowCount(0); self.encounters.setRowCount(0)
         self.copy_report.setEnabled(False); self.save_report.setEnabled(False)
         self.canvas.axes.clear(); self.canvas.style_axes(); self.canvas.draw_idle()
@@ -1063,6 +1071,7 @@ class OrbitEvolutionPanel(QWidget):
 
     def _completed(self, result: EvolutionResult) -> None:
         self.result = result
+        self._centered_cache.clear()
         self.copy_report.setEnabled(True); self.save_report.setEnabled(True)
         self.evolution_ready.emit(self.solution, result)
         phase_note = (
@@ -1075,8 +1084,70 @@ class OrbitEvolutionPanel(QWidget):
         self.note.setText(
             f"{result.model_note}  Krok vyhledávání událostí: {result.sample_step_days:.2f} dne. "
             f"{phase_note}"
+            + (
+                "  Detekováno planetocentrické zachycení: "
+                + ", ".join(
+                    f"{PLANET_LABELS.get(item.planet, item.planet)} "
+                    f"{(datetime_from_jd(item.start_jd) or datetime.min.replace(tzinfo=timezone.utc)).year}–"
+                    f"{(datetime_from_jd(item.end_jd) or datetime.min.replace(tzinfo=timezone.utc)).year}"
+                    for item in result.captures
+                )
+                + "."
+                if result.captures else ""
+            )
         )
-        displayed_states = result.snapshots or result.returns
+        self._populate_state_table()
+        self.encounters.setRowCount(len(result.encounters))
+        for row, item in enumerate(result.encounters):
+            date = datetime_from_jd(item.epoch_jd)
+            values = (
+                date.strftime("%Y-%m-%d %H:%M") if date else f"JD {item.epoch_jd:.2f}",
+                PLANET_LABELS.get(item.planet, item.planet), f"{item.distance_au:.6f}",
+                f"{item.hill_radii:.3f}", f"{item.relative_velocity_kms:.2f}",
+                "—" if item.delta_reciprocal_a is None else f"{item.delta_reciprocal_a:+.3e}",
+            )
+            for column, value in enumerate(values):
+                self.encounters.setItem(row, column, QTableWidgetItem(value))
+        if result.snapshots:
+            reciprocal_index = self.graph_metric.findData("reciprocal_a")
+            if reciprocal_index >= 0:
+                self.graph_metric.setCurrentIndex(reciprocal_index)
+        self._draw_result()
+
+    def _states_for_center(self, kind: str) -> tuple:
+        if self.result is None:
+            return ()
+        center = str(self.element_center.currentData() or "sun")
+        key = (center, kind)
+        if key in self._centered_cache:
+            return self._centered_cache[key]
+        source = (
+            (self.result.snapshots or self.result.returns)
+            if kind == "events" else self.result.timeline
+        )
+        if center == "sun":
+            converted = tuple(source)
+        else:
+            values = []
+            for item in source:
+                try:
+                    values.append(centered_snapshot(item, center))
+                except (ValueError, OrbitParseError, FloatingPointError):
+                    continue
+            converted = tuple(values)
+        self._centered_cache[key] = converted
+        return converted
+
+    def _center_changed(self, *_args) -> None:
+        self._populate_state_table()
+        self._draw_result()
+
+    def _populate_state_table(self) -> None:
+        if self.result is None:
+            self.returns.setRowCount(0)
+            return
+        displayed_states = self._states_for_center("events")
+        result = self.result
         if result.snapshots:
             self.returns.setHorizontalHeaderItem(0, QTableWidgetItem("Fáze"))
             self.returns.setHorizontalHeaderItem(1, QTableWidgetItem("Epocha (UTC)"))
@@ -1101,33 +1172,17 @@ class OrbitEvolutionPanel(QWidget):
                 cell = QTableWidgetItem(value)
                 cell.setTextAlignment(Qt.AlignCenter if column != 1 else Qt.AlignLeft | Qt.AlignVCenter)
                 self.returns.setItem(row, column, cell)
-        self.encounters.setRowCount(len(result.encounters))
-        for row, item in enumerate(result.encounters):
-            date = datetime_from_jd(item.epoch_jd)
-            values = (
-                date.strftime("%Y-%m-%d %H:%M") if date else f"JD {item.epoch_jd:.2f}",
-                PLANET_LABELS.get(item.planet, item.planet), f"{item.distance_au:.6f}",
-                f"{item.hill_radii:.3f}", f"{item.relative_velocity_kms:.2f}",
-                "—" if item.delta_reciprocal_a is None else f"{item.delta_reciprocal_a:+.3e}",
-            )
-            for column, value in enumerate(values):
-                self.encounters.setItem(row, column, QTableWidgetItem(value))
-        if result.snapshots:
-            reciprocal_index = self.graph_metric.findData("reciprocal_a")
-            if reciprocal_index >= 0:
-                self.graph_metric.setCurrentIndex(reciprocal_index)
-        self._draw_result()
 
     def _draw_result(self) -> None:
         ax = self.canvas.axes; ax.clear(); self.canvas.style_axes()
-        if not self.result or not (self.result.returns or self.result.snapshots):
-            ax.text(.5, .5, "V zadaném rozsahu nebylo nalezeno perihelium.",
+        if not self.result or not (self.result.timeline or self.result.returns or self.result.snapshots):
+            ax.text(.5, .5, "V zadaném rozsahu nejsou dostupné stavy dráhy.",
                     ha="center", va="center", transform=ax.transAxes, color="#afc2d8")
             self.canvas.draw_idle(); return
         metric_key = str(self.graph_metric.currentData() or "q")
         attribute, y_label, title_label = self.GRAPH_METRICS[metric_key]
-        displayed_states = self.result.snapshots or self.result.returns
-        timeline = self.result.timeline or displayed_states
+        displayed_states = self._states_for_center("events")
+        timeline = self._states_for_center("timeline") or displayed_states
         x = np.array([2000.0 + (item.epoch_jd - 2451545.0) / 365.25 for item in timeline])
         values = np.array([
             np.nan if getattr(item, attribute) is None else float(getattr(item, attribute))
@@ -1174,10 +1229,19 @@ class OrbitEvolutionPanel(QWidget):
                 label += f" {date.year}"
             ax.text(encounter_x, .98, label, transform=ax.get_xaxis_transform(),
                     ha="center", va="top", color="#f0c85a", fontsize=8)
+        for capture in self.result.captures:
+            start_x = 2000.0 + (capture.start_jd - 2451545.0) / 365.25
+            end_x = 2000.0 + (capture.end_jd - 2451545.0) / 365.25
+            ax.axvspan(start_x, end_x, color="#b07cff", alpha=.12, zorder=.1)
+            ax.text((start_x + end_x) / 2.0, .04,
+                    f"zachycení: {PLANET_LABELS.get(capture.planet, capture.planet)}",
+                    transform=ax.get_xaxis_transform(), ha="center", va="bottom",
+                    color="#c9a8ff", fontsize=8)
         ax.set_xlabel("rok")
         ax.set_ylabel(y_label)
         ax.set_title(
-            f"{self.solution.display_name or self.solution.designation} — vývoj {title_label}"
+            f"{self.solution.display_name or self.solution.designation} — vývoj {title_label} "
+            f"({self.element_center.currentText().replace('Střed: ', '')}-centrické elementy)"
         )
         ax.grid(color="#273750", alpha=.55, lw=.6)
         self.canvas.draw_idle()
@@ -1351,10 +1415,14 @@ class SolarSystemPanel(QWidget):
         self.evolution_count.addItem("Integrovaná dráha: zapnuta", -1)
         self.evolution_count.setCurrentIndex(1)
         self.evolution_count.setVisible(False)
-        self.evolution_count.currentIndexChanged.connect(
-            lambda _: self.set_time(self.playback.time.dateTime().toPython())
-        )
+        self.evolution_count.currentIndexChanged.connect(self._evolution_display_changed)
         controls.addWidget(self.evolution_count)
+        self.view_center = QComboBox()
+        for key, label in ELEMENT_CENTERS:
+            self.view_center.addItem(f"Střed: {label}", key)
+        self.view_center.setEnabled(False)
+        self.view_center.currentIndexChanged.connect(self._view_center_changed)
+        controls.addWidget(self.view_center)
         enlarge = QPushButton("Zvětšit ↗" if allow_detach else "Celá obrazovka (F11)")
         enlarge.setToolTip(
             "Otevře dráhu ve zvětšeném samostatném okně. Klávesou F11 přepnete celou obrazovku."
@@ -1404,6 +1472,7 @@ class SolarSystemPanel(QWidget):
         layout.addWidget(self.info)
         layout.addWidget(playback)
         self._camera_drag: tuple[float, float, int, int] | None = None
+        self._center_track_cache: dict[tuple[str, int], np.ndarray] = {}
         self.canvas.mpl_connect("button_press_event", self._camera_press)
         self.canvas.mpl_connect("motion_notify_event", self._camera_motion)
         self.canvas.mpl_connect("button_release_event", self._camera_release)
@@ -1430,6 +1499,9 @@ class SolarSystemPanel(QWidget):
             panel.set_evolution(self.evolution_source, self.evolution_result)
             panel.evolution_count.setCurrentIndex(
                 panel.evolution_count.findData(self.evolution_count.currentData())
+            )
+            panel.view_center.setCurrentIndex(
+                panel.view_center.findData(self.view_center.currentData())
             )
         window.setCentralWidget(panel)
         window.resize(1500, 950)
@@ -1497,10 +1569,50 @@ class SolarSystemPanel(QWidget):
     ) -> None:
         self.evolution_source = source
         self.evolution_result = result
+        self._center_track_cache.clear()
         self.evolution_count.setVisible(bool(
             result and result.trajectory_epochs is not None
             and result.trajectory_states is not None
         ))
+        self.view_center.setEnabled(bool(
+            result and result.trajectory_epochs is not None
+            and result.trajectory_states is not None
+        ))
+        if result is None:
+            self.view_center.setCurrentIndex(self.view_center.findData("sun"))
+
+    def _view_center_changed(self, *_args) -> None:
+        center = str(self.view_center.currentData() or "sun")
+        if center != "sun":
+            enabled = self.evolution_count.findData(-1)
+            if enabled >= 0 and int(self.evolution_count.currentData()) == 0:
+                self.evolution_count.setCurrentIndex(enabled)
+            target = max(.01, HILL_RADII_AU[center] * 1.6)
+            minimum, maximum = .0005, 5.0
+            fraction = np.log(np.clip(target, minimum, maximum) / minimum) / np.log(maximum / minimum)
+            self.view_zoom.setValue(int(round(fraction * self.view_zoom.maximum())))
+        else:
+            self.view_zoom.setValue(838)
+        self.set_time(self.playback.time.dateTime().toPython())
+
+    def _evolution_display_changed(self, *_args) -> None:
+        if (
+            int(self.evolution_count.currentData()) == 0
+            and str(self.view_center.currentData() or "sun") != "sun"
+        ):
+            self.view_center.setCurrentIndex(self.view_center.findData("sun"))
+            return
+        self.set_time(self.playback.time.dateTime().toPython())
+
+    def _center_positions(self, center: str, epochs: np.ndarray) -> np.ndarray:
+        if center == "sun":
+            return np.zeros((len(epochs), 3), dtype=float)
+        key = (center, id(epochs))
+        cached = self._center_track_cache.get(key)
+        if cached is None:
+            cached = np.stack([PLANETS.position(center, float(epoch)) for epoch in epochs])
+            self._center_track_cache[key] = cached
+        return cached
 
     def _integrated_trajectory(self) -> tuple[np.ndarray, np.ndarray] | None:
         result = self.evolution_result
@@ -1530,7 +1642,10 @@ class SolarSystemPanel(QWidget):
     def _visible_radius_au(self) -> float:
         # Logarithmic scale: sub-AU changes get fine control while the same
         # slider still reaches well beyond Neptune.
-        minimum, maximum = .06, 120.0
+        if str(self.view_center.currentData() or "sun") == "sun":
+            minimum, maximum = .06, 120.0
+        else:
+            minimum, maximum = .0005, 5.0
         fraction = self.view_zoom.value() / self.view_zoom.maximum()
         return minimum * (maximum / minimum) ** fraction
 
@@ -1555,6 +1670,12 @@ class SolarSystemPanel(QWidget):
         # apparently broken arcs with their ends floating inside the plot.
         # Open conics still need a finite plotting radius near their asymptote.
         current_jd = datetime_to_jd(time)
+        center = str(self.view_center.currentData() or "sun")
+        center_label = dict(ELEMENT_CENTERS).get(center, center)
+        center_now = (
+            np.zeros(3, dtype=float) if center == "sun"
+            else PLANETS.position(center, current_jd)
+        )
         trajectory = self._integrated_trajectory()
         if trajectory is not None:
             trajectory_epochs, trajectory_states = trajectory
@@ -1562,7 +1683,8 @@ class SolarSystemPanel(QWidget):
             # multi-century integration remains responsive during animation.
             stride = max(1, int(np.ceil(len(trajectory_epochs) / 6000)))
             plotted_epochs = trajectory_epochs[::stride]
-            xyz = trajectory_states[::stride, :3]
+            center_track = self._center_positions(center, trajectory_epochs)[::stride]
+            xyz = trajectory_states[::stride, :3] - center_track
             # Let the axes clip the projected curve.  Radial pre-clipping can
             # cut a tilted orbit whose distant part still projects into view.
             valid = np.all(np.isfinite(xyz), axis=1)
@@ -1630,27 +1752,39 @@ class SolarSystemPanel(QWidget):
                    ("jupiter", "Jupiter", 11.86, "#d0a17a"), ("saturn", "Saturn", 29.46, "#d8c58b"),
                    ("uranus", "Uran", 84.01, "#71d5de"), ("neptune", "Neptun", 164.8, "#537be8"))
         for key, name, years, color in planets:
-            if np.linalg.norm(PLANETS.position(key, current_jd)) > curve_radius * 1.15:
+            relative_position = PLANETS.position(key, current_jd) - center_now
+            if np.linalg.norm(relative_position) > curve_radius * 1.15:
                 continue
-            planet_jd = np.linspace(current_jd, current_jd + years * 365.256, 360)
-            path = np.stack([PLANETS.position(key, float(epoch)) for epoch in planet_jd])
-            path_x, path_y, _ = project_ecliptic_camera(path, azimuth, elevation)
-            ax.plot(path_x, path_y, color=color, alpha=.7, lw=1.15)
-            position = PLANETS.position(key, current_jd)
-            px, py, _ = project_ecliptic_camera(position, azimuth, elevation)
+            if key != center:
+                planet_jd = np.linspace(current_jd, current_jd + years * 365.256, 360)
+                path = np.stack([PLANETS.position(key, float(epoch)) for epoch in planet_jd])
+                if center != "sun":
+                    path -= np.stack([
+                        PLANETS.position(center, float(epoch)) for epoch in planet_jd
+                    ])
+                path_x, path_y, _ = project_ecliptic_camera(path, azimuth, elevation)
+                ax.plot(path_x, path_y, color=color, alpha=.7, lw=1.15)
+            px, py, _ = project_ecliptic_camera(relative_position, azimuth, elevation)
             ax.scatter(px, py, s=30 if key != "jupiter" else 46, color=color,
                        edgecolor="white", linewidth=.45, zorder=5)
             ax.annotate(name, (px, py), xytext=(4, 4), textcoords="offset points",
                         color=color, fontsize=8)
-        current = self._trajectory_position(trajectory, current_jd)
-        if current is None:
-            current = heliocentric_xyz(self.solution, np.array([current_jd]))[0]
+        heliocentric_current = self._trajectory_position(trajectory, current_jd)
+        if heliocentric_current is None:
+            heliocentric_current = heliocentric_xyz(self.solution, np.array([current_jd]))[0]
+        current = heliocentric_current - center_now
         object_x, object_y, _ = project_ecliptic_camera(current, azimuth, elevation)
         ax.scatter(object_x, object_y, s=42, color="#7fe7ff", edgecolor="white",
                    linewidth=.6, zorder=7)
         ax.annotate(self.solution.designation, (object_x, object_y), xytext=(6, 6),
                     textcoords="offset points", color="#7fe7ff", fontsize=9, fontweight="bold")
-        ax.scatter(0, 0, s=95, color="#ffd166", edgecolor="#fff0b3", linewidth=.8, zorder=8)
+        sun_position = -center_now
+        sun_x, sun_y, _ = project_ecliptic_camera(sun_position, azimuth, elevation)
+        ax.scatter(sun_x, sun_y, s=95, color="#ffd166", edgecolor="#fff0b3",
+                   linewidth=.8, zorder=8)
+        if center != "sun" and np.linalg.norm(sun_position) <= curve_radius * 1.15:
+            ax.annotate("Slunce", (sun_x, sun_y), xytext=(5, 5), textcoords="offset points",
+                        color="#ffd166", fontsize=8)
         axis_limit = plot_limit
         ax.set_xlim(-axis_limit * viewport_aspect, axis_limit * viewport_aspect)
         ax.set_ylim(-axis_limit, axis_limit)
@@ -1674,16 +1808,19 @@ class SolarSystemPanel(QWidget):
             ax.annotate(label, (axis_x[index], axis_y[index]), xytext=(4, 3),
                         textcoords="offset points", color=color, fontsize=8)
         ax.set_title(
-            f"{self.solution.designation} — " + time.strftime("%Y-%m-%d %H:%M UTC"),
+            f"{self.solution.designation} — {center_label}-centrický pohled — "
+            + time.strftime("%Y-%m-%d %H:%M UTC"),
             color="#edf5ff", y=.965, pad=0,
         )
         ax.set_axis_off()
         earth = PLANETS.position("earth", current_jd)
-        distance_earth = float(np.linalg.norm(current - earth))
-        distance_sun = float(np.linalg.norm(current))
+        distance_earth = float(np.linalg.norm(heliocentric_current - earth))
+        distance_sun = float(np.linalg.norm(heliocentric_current))
+        center_distance = float(np.linalg.norm(current))
+        center_text = "" if center == "sun" else f"    od {center_label} {center_distance:.6f} AU"
         self.info.setText(
             f"{time:%Y-%m-%d %H:%M UTC}    Δ od Země {distance_earth:.6f} AU    "
-            f"r od Slunce {distance_sun:.6f} AU"
+            f"r od Slunce {distance_sun:.6f} AU{center_text}"
         )
         self.canvas.draw_idle()
 
@@ -2729,6 +2866,15 @@ class PhotometryPanel(QWidget):
             dates, geom["r"], color="#ffb85c", lw=1.35, ls="-.",
             label="r od Slunce",
         )
+        perihelion_time = datetime_from_jd(perihelion_jd_from_solution(self.solution))
+        if perihelion_time is not None and start <= perihelion_time <= stop:
+            ax.axvline(perihelion_time, color="#ff7e67", lw=1.15, alpha=.9, ls=":")
+            ax.text(
+                perihelion_time, .98,
+                f"přísluní\n{perihelion_time:%Y-%m-%d %H:%M}",
+                transform=ax.get_xaxis_transform(), ha="center", va="top",
+                color="#ff9b88", fontsize=8,
+            )
         if start <= cursor <= stop:
             cursor_geom = apparent_geometry(self.solution, np.array([datetime_to_jd(cursor)]))
             cursor_mag = power_law_magnitude(
@@ -2987,6 +3133,7 @@ class ElementsPanel(QWidget):
     def __init__(self, solution: OrbitSolution) -> None:
         super().__init__()
         self.solution = solution
+        self._heliocentric_display_solution = solution
         self.display_solution = solution
         self.epoch_thread: QThread | None = None
         self.epoch_worker: EpochPropagationWorker | None = None
@@ -3018,6 +3165,11 @@ class ElementsPanel(QWidget):
         epoch_controls.addWidget(self.output_epoch)
         epoch_controls.addWidget(self.apply_epoch_button)
         epoch_controls.addWidget(reset_epoch)
+        self.element_center = QComboBox()
+        for key, label in ELEMENT_CENTERS:
+            self.element_center.addItem(f"Střed elementů: {label}", key)
+        self.element_center.currentIndexChanged.connect(self._apply_element_center)
+        epoch_controls.addWidget(self.element_center)
         epoch_controls.addStretch()
         self.epoch_note = QLabel(
             "Převod používá N-body integraci s planetami a případnými A1–A3. "
@@ -3039,6 +3191,12 @@ class ElementsPanel(QWidget):
         return f"{century}{value.year % 100:02d}{digit[value.month]}{digit[value.day]}"
 
     def _mpc_line(self) -> str:
+        center_control = getattr(self, "element_center", None)
+        if center_control is not None and str(center_control.currentData() or "sun") != "sun":
+            return (
+                "MPC 1-line elements jsou definovány pro heliocentrickou dráhu; "
+                "pro planetocentrické elementy nejsou exportovány."
+            )
         s = self.display_solution
         comet_match = re.match(r"^\s*([ACDPX])/\s*(\d{4})\s+([A-Z])(\d+)", s.designation, re.I)
         numbered_comet = re.match(r"^\s*(\d+)([PD])(?:/|\b)", s.designation, re.I)
@@ -3087,7 +3245,9 @@ class ElementsPanel(QWidget):
         )
 
     def _perihelion_jd(self) -> float:
-        return perihelion_jd_from_solution(self.display_solution)
+        center = str(self.element_center.currentData() or "sun")
+        mu = MU_SUN if center == "sun" else PLANET_MU[center]
+        return perihelion_jd_from_solution(self.display_solution, mu)
 
     def _uncertainty(self, name: str, digits: int) -> str:
         values = self.display_solution.element_uncertainties or {}
@@ -3101,8 +3261,14 @@ class ElementsPanel(QWidget):
         perihelion_time = datetime_from_jd(perihelion_jd)
         perihelion = s.semi_major_axis_au * (1.0 - s.eccentricity)
         aphelion = s.semi_major_axis_au * (1.0 + s.eccentricity) if s.eccentricity < 1.0 else None
-        period = 365.2569 * s.semi_major_axis_au ** 1.5 if s.semi_major_axis_au > 0 and s.eccentricity < 1 else None
-        mean_motion = np.degrees(0.01720209895 / abs(s.semi_major_axis_au) ** 1.5)
+        center = str(self.element_center.currentData() or "sun")
+        mu = MU_SUN if center == "sun" else PLANET_MU[center]
+        mean_motion_rad_day = np.sqrt(mu / abs(s.semi_major_axis_au) ** 3)
+        period = (
+            2.0 * np.pi / mean_motion_rad_day
+            if s.semi_major_axis_au > 0 and s.eccentricity < 1 else None
+        )
+        mean_motion = np.degrees(mean_motion_rad_day)
         if perihelion_time is None:
             perihelion_line = (
                 f"Perihelion: kalendářní datum mimo podporovaný rozsah "
@@ -3129,6 +3295,7 @@ class ElementsPanel(QWidget):
             )
         lines = [
             f"Orbital elements: {s.designation}",
+            f"Element center: {dict(ELEMENT_CENTERS).get(str(self.element_center.currentData() or 'sun'))}",
             perihelion_line,
             epoch_line,
             f"Planetary ephemeris: {PLANETS.model_name}",
@@ -3205,7 +3372,8 @@ class ElementsPanel(QWidget):
         self.text.setPlainText(self._report())
 
     def _reset_output_epoch(self) -> None:
-        self.display_solution = self.solution
+        self._heliocentric_display_solution = self.solution
+        self._apply_element_center()
         epoch_time = datetime_from_jd(self.solution.epoch_jd)
         if epoch_time is not None:
             self.output_epoch.setText(epoch_time.strftime("%Y-%m-%d %H:%M"))
@@ -3213,6 +3381,17 @@ class ElementsPanel(QWidget):
             "Zobrazena je epocha vlastního fitu. Převod používá N-body integraci; "
             f"aktivní planetární efemerida: {PLANETS.model_name}."
         )
+        self.redraw()
+
+    def _apply_element_center(self, *_args) -> None:
+        center = str(self.element_center.currentData() or "sun")
+        try:
+            self.display_solution = centered_solution(
+                self._heliocentric_display_solution, center
+            )
+        except (ValueError, OrbitParseError) as exc:
+            self.display_solution = self._heliocentric_display_solution
+            self.epoch_note.setText(f"Planetocentrické elementy nelze určit: {exc}")
         self.redraw()
 
     def _apply_output_epoch(self) -> None:
@@ -3254,7 +3433,8 @@ class ElementsPanel(QWidget):
         thread.start()
 
     def _epoch_ready(self, solution: object) -> None:
-        self.display_solution = solution
+        self._heliocentric_display_solution = solution
+        self._apply_element_center()
         target_time = self._epoch_target_time or datetime.now()
         self.epoch_note.setText(
             f"Elementy převedeny N-body integrací na {target_time:%Y-%m-%d %H:%M}. "
@@ -4174,7 +4354,8 @@ class MainWindow(QMainWindow):
             self._dirty_solution_tabs.add(4)
         self.statusBar().showMessage(
             f"Vývoj dráhy dokončen: {len(result.returns)} návratů, "
-            f"{len(result.encounters)} významných přiblížení.",
+            f"{len(result.encounters)} významných přiblížení, "
+            f"{len(result.captures)} planetocentrických zachycení.",
             12000,
         )
 

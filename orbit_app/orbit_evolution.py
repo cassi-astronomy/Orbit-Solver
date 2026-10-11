@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 import re
 
@@ -8,7 +8,7 @@ import numpy as np
 
 from .domain import OrbitSolution, is_comet_designation
 from .mpc_orbit import cartesian_to_elements
-from .orbit_engine import MU_SUN, NBodyIntegrator, StateVector
+from .orbit_engine import DEFAULT_PERTURBERS, MU_SUN, NBodyIntegrator, StateVector
 from .planetary import PLANETS
 
 
@@ -24,6 +24,8 @@ PLANET_LABELS = {
     "mercury": "Merkur", "venus": "Venuše", "earth": "Země", "mars": "Mars",
     "jupiter": "Jupiter", "saturn": "Saturn", "uranus": "Uran", "neptune": "Neptun",
 }
+PLANET_MU = {item.name: item.mu_au3_day2 for item in DEFAULT_PERTURBERS}
+ELEMENT_CENTERS = (("sun", "Slunce"),) + tuple(PLANET_LABELS.items())
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +51,15 @@ class PlanetEncounter:
     hill_radii: float
     relative_velocity_kms: float
     delta_reciprocal_a: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureInterval:
+    planet: str
+    start_jd: float
+    end_jd: float
+    minimum_distance_au: float
+    minimum_hill_radii: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +90,71 @@ class EvolutionResult:
     timeline: tuple[EvolutionSnapshot, ...] = field(default_factory=tuple)
     trajectory_epochs: np.ndarray | None = field(default=None, repr=False, compare=False)
     trajectory_states: np.ndarray | None = field(default=None, repr=False, compare=False)
+    captures: tuple[CaptureInterval, ...] = field(default_factory=tuple)
+
+
+def planet_velocity(body: str, epoch_jd: float, step_days: float = .02) -> np.ndarray:
+    """Central-difference heliocentric velocity from the active ephemeris."""
+    return (
+        PLANETS.position(body, epoch_jd + step_days)
+        - PLANETS.position(body, epoch_jd - step_days)
+    ) / (2.0 * step_days)
+
+
+def centered_snapshot(
+    item: EvolutionReturn | EvolutionSnapshot, center: str,
+) -> EvolutionSnapshot:
+    """Express a stored heliocentric state as osculating elements about a body."""
+    center = center.lower()
+    if center == "sun":
+        return _snapshot_from_state(
+            getattr(item, "phase", ""), item.epoch_jd, np.asarray(item.state, dtype=float)
+        )
+    if center not in PLANET_MU:
+        raise ValueError(f"Neznámý střed elementů: {center}")
+    state = np.asarray(item.state, dtype=float).copy()
+    state[:3] -= PLANETS.position(center, item.epoch_jd)
+    state[3:] -= planet_velocity(center, item.epoch_jd)
+    a, e, inc, node, arg_peri, _mean = cartesian_to_elements(
+        state[:3], state[3:], PLANET_MU[center]
+    )
+    period = 2.0 * np.pi * np.sqrt(a**3 / PLANET_MU[center]) / JULIAN_YEAR_DAYS \
+        if a > 0.0 and e < 1.0 else None
+    return EvolutionSnapshot(
+        phase=getattr(item, "phase", ""), epoch_jd=item.epoch_jd,
+        state=tuple(float(value) for value in state), semi_major_axis_au=float(a),
+        eccentricity=float(e), inclination_deg=float(inc), node_deg=float(node),
+        arg_peri_deg=float(arg_peri), perihelion_au=float(a * (1.0 - e)),
+        period_years=None if period is None else float(period),
+        reciprocal_a=float(1.0 / a) if a != 0.0 else float("nan"),
+    )
+
+
+def centered_solution(source: OrbitSolution, center: str) -> OrbitSolution:
+    """Return display-only osculating elements relative to a selected center."""
+    center = center.lower()
+    if center == "sun":
+        return source
+    if source.position_au is None or source.velocity_au_per_day is None:
+        raise ValueError("Planetocentrické elementy vyžadují kartézský stav.")
+    if center not in PLANET_MU:
+        raise ValueError(f"Neznámý střed elementů: {center}")
+    position = np.asarray(source.position_au, dtype=float) - PLANETS.position(
+        center, source.epoch_jd
+    )
+    velocity = np.asarray(source.velocity_au_per_day, dtype=float) - planet_velocity(
+        center, source.epoch_jd
+    )
+    a, e, inc, node, arg_peri, mean = cartesian_to_elements(
+        position, velocity, PLANET_MU[center]
+    )
+    return replace(
+        source, semi_major_axis_au=float(a), eccentricity=float(e),
+        inclination_deg=float(inc), node_deg=float(node), arg_peri_deg=float(arg_peri),
+        mean_anomaly_deg=float(mean), position_au=tuple(float(value) for value in position),
+        velocity_au_per_day=tuple(float(value) for value in velocity),
+        state_covariance=None, element_uncertainties=None, dynamical_1a=None,
+    )
 
 
 def _format_jd_utc(jd: float) -> str:
@@ -135,6 +211,16 @@ def format_evolution_report(
             )
     if not events:
         lines.append("Žádné perihelové průchody ani planetární setkání nebyly nalezeny.")
+    if result.captures:
+        lines.extend(("", "Dočasná planetocentrická zachycení"))
+        for capture in result.captures:
+            lines.append(
+                f"ZACHYCENÍ\t{_format_jd_utc(capture.start_jd)}\t"
+                f"{_format_jd_utc(capture.end_jd)}\t"
+                f"{PLANET_LABELS.get(capture.planet, capture.planet)}\t"
+                f"minimum {capture.minimum_distance_au:.9f} AU\t"
+                f"{capture.minimum_hill_radii:.5f} Hillova poloměru"
+            )
     lines.extend(("", "Vytvořeno programem Orbit Solver 1.0 — Martin Mašek"))
     return "\n".join(lines) + "\n"
 
@@ -239,6 +325,13 @@ def format_evolution_mpc_report(
                 f"d={item.distance_au:.6f} AU = {item.hill_radii:.3f} Hillova poloměru; "
                 f"v_rel={item.relative_velocity_kms:.2f} km/s; Delta(1/a)={delta}"
             )
+    for capture in result.captures:
+        lines.append(
+            f"# ZACHYCENÍ {PLANET_LABELS.get(capture.planet, capture.planet)}: "
+            f"{_format_jd_utc(capture.start_jd)} až {_format_jd_utc(capture.end_jd)} UTC; "
+            f"minimum={capture.minimum_distance_au:.6f} AU "
+            f"({capture.minimum_hill_radii:.3f} Hillova poloměru)"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -367,11 +460,35 @@ def calculate_orbit_evolution(
         returns = ()
 
     encounters: list[PlanetEncounter] = []
+    captures: list[CaptureInterval] = []
     for planet, hill_radius in HILL_RADII_AU.items():
         planet_positions = np.stack([
             PLANETS.position(planet, float(epoch)) for epoch in sample_epochs
         ])
         distances = np.linalg.norm(states[:, :3] - planet_positions, axis=1)
+        planet_velocities = np.gradient(planet_positions, sample_epochs, axis=0)
+        relative_velocities = states[:, 3:] - planet_velocities
+        specific_energy = (
+            .5 * np.sum(relative_velocities * relative_velocities, axis=1)
+            - PLANET_MU[planet] / np.maximum(distances, 1e-15)
+        )
+        captured = (specific_energy < 0.0) & (distances <= hill_radius)
+        padded = np.concatenate(([False], captured, [False])).astype(np.int8)
+        starts = np.flatnonzero(np.diff(padded) == 1)
+        stops = np.flatnonzero(np.diff(padded) == -1)
+        for first, stop in zip(starts, stops):
+            # A single isolated sample is too cadence-dependent to call a
+            # capture. Long-lived SL9-like and temporary-moon episodes span
+            # multiple samples and are robust under this criterion.
+            if stop - first < 2:
+                continue
+            local = distances[first:stop]
+            minimum = float(np.min(local))
+            captures.append(CaptureInterval(
+                planet=planet, start_jd=float(sample_epochs[first]),
+                end_jd=float(sample_epochs[stop - 1]), minimum_distance_au=minimum,
+                minimum_hill_radii=float(minimum / hill_radius),
+            ))
         candidate_indices = np.flatnonzero(
             (distances[1:-1] < distances[:-2])
             & (distances[1:-1] <= distances[2:])
@@ -459,6 +576,7 @@ def calculate_orbit_evolution(
         timeline=timeline,
         trajectory_epochs=np.asarray(sample_epochs, dtype=float),
         trajectory_states=np.asarray(states, dtype=float),
+        captures=tuple(sorted(captures, key=lambda item: item.start_jd)),
     )
 
 

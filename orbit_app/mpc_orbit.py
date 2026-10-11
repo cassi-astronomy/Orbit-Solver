@@ -117,7 +117,9 @@ def _coefficient_map(section: dict) -> dict[str, float]:
     return {str(name).lower(): float(value) for name, value in zip(names, values)}
 
 
-def cartesian_to_elements(position: np.ndarray, velocity: np.ndarray) -> tuple[float, float, float, float, float, float]:
+def cartesian_to_elements(
+    position: np.ndarray, velocity: np.ndarray, mu: float = MU_SUN,
+) -> tuple[float, float, float, float, float, float]:
     r = np.asarray(position, dtype=float)
     v = np.asarray(velocity, dtype=float)
     radius = np.linalg.norm(r)
@@ -126,10 +128,12 @@ def cartesian_to_elements(position: np.ndarray, velocity: np.ndarray) -> tuple[f
     h_norm = np.linalg.norm(h)
     node_vector = np.cross(np.array([0.0, 0.0, 1.0]), h)
     node_norm = np.linalg.norm(node_vector)
-    e_vector = ((speed2 - MU_SUN / radius) * r - np.dot(r, v) * v) / MU_SUN
+    if not np.isfinite(mu) or mu <= 0.0:
+        raise OrbitParseError("Gravitační parametr středu musí být kladný.")
+    e_vector = ((speed2 - mu / radius) * r - np.dot(r, v) * v) / mu
     eccentricity = float(np.linalg.norm(e_vector))
-    energy = speed2 / 2.0 - MU_SUN / radius
-    semi_major = -MU_SUN / (2.0 * energy)
+    energy = speed2 / 2.0 - mu / radius
+    semi_major = -mu / (2.0 * energy)
     if not np.isfinite(semi_major) or eccentricity < 0:
         raise OrbitParseError("Kartézský stav nevede na použitelnou kuželosečku.")
     inclination = np.degrees(np.arccos(np.clip(h[2] / h_norm, -1.0, 1.0)))

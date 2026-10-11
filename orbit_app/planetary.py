@@ -45,6 +45,30 @@ class AnalyticPlanetEphemeris:
     """Approximate heliocentric J2000-ecliptic planet positions in AU."""
 
     def position(self, body: str, jd: float) -> np.ndarray:
+        if body.lower() == "moon":
+            earth = self.position("earth", jd)
+            # Compact fallback for lunar perturbations when DE440 is absent.
+            # This is deliberately approximate; DE440 supplies the real lunar
+            # state whenever it is installed.
+            mean_longitude = np.radians(
+                (218.3164477 + 360.0 * (jd - J2000_JD) / 27.321661) % 360.0
+            )
+            node = np.radians((125.044555 - .05295377 * (jd - J2000_JD)) % 360.0)
+            inclination = np.radians(5.145)
+            argument = mean_longitude - node
+            radius = .00256955529
+            relative = np.array((
+                radius * (
+                    np.cos(node) * np.cos(argument)
+                    - np.sin(node) * np.sin(argument) * np.cos(inclination)
+                ),
+                radius * (
+                    np.sin(node) * np.cos(argument)
+                    + np.cos(node) * np.sin(argument) * np.cos(inclination)
+                ),
+                radius * np.sin(argument) * np.sin(inclination),
+            ))
+            return earth + relative
         base, rate = _ELEMENTS[body.lower()]
         centuries = (jd - J2000_JD) / 36525.0
         a, e, inc, longitude, long_peri, node = np.asarray(base) + np.asarray(rate) * centuries
@@ -124,9 +148,9 @@ class JplSpkPlanetEphemeris:
                 "(1549-12-31 až 2650-01-25)."
             )
         name = body.lower()
-        if name not in self._BARYCENTER_IDS:
+        if name != "moon" and name not in self._BARYCENTER_IDS:
             raise KeyError(f"Těleso {body!r} není v poskytovateli DE440 podporováno.")
-        target = self._BARYCENTER_IDS[name]
+        target = 3 if name == "moon" else self._BARYCENTER_IDS[name]
         barycentric = self._ssb_position(0, target, jd)
         if name == "mercury":
             barycentric += self._ssb_position(1, 199, jd)
@@ -134,6 +158,8 @@ class JplSpkPlanetEphemeris:
             barycentric += self._ssb_position(2, 299, jd)
         elif name == "earth":
             barycentric += self._ssb_position(3, 399, jd)
+        elif name == "moon":
+            barycentric += self._ssb_position(3, 301, jd)
         sun = self._ssb_position(0, 10, jd)
         return _equatorial_to_ecliptic((barycentric - sun) / AU_KM)
 

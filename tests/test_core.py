@@ -28,8 +28,9 @@ from orbit_app.orbit_engine import (
     nongravitational_acceleration,
 )
 from orbit_app.orbit_evolution import (
-    EvolutionResult, EvolutionReturn, EvolutionSnapshot, PlanetEncounter, evolution_span,
-    format_evolution_mpc_report, format_evolution_report,
+    EvolutionResult, EvolutionReturn, EvolutionSnapshot, PLANET_MU, PlanetEncounter,
+    centered_snapshot, evolution_span, format_evolution_mpc_report,
+    format_evolution_report,
 )
 from orbit_app.planetary import PLANETS
 from orbit_app.orbit_fit import (
@@ -626,6 +627,30 @@ class _NoPlanets:
 
 
 class NativeIntegratorTests(unittest.TestCase):
+    def test_planet_provider_includes_lunar_perturber(self):
+        earth = PLANETS.position("earth", 2451545.0)
+        moon = PLANETS.position("moon", 2451545.0)
+        distance = float(np.linalg.norm(moon - earth))
+        self.assertGreater(distance, .0023)
+        self.assertLess(distance, .0028)
+
+    def test_planetocentric_elements_use_selected_planet_mass(self):
+        radius = .01
+        speed = math.sqrt(PLANET_MU["jupiter"] / radius)
+        item = EvolutionSnapshot(
+            "", 2451545.0, (radius, 0.0, 0.0, 0.0, speed, 0.0),
+            radius, 0.0, 0.0, 0.0, 0.0, radius, None, 1.0 / radius,
+        )
+        with patch("orbit_app.orbit_evolution.PLANETS.position", return_value=np.zeros(3)), \
+                patch("orbit_app.orbit_evolution.planet_velocity", return_value=np.zeros(3)):
+            centered = centered_snapshot(item, "jupiter")
+        self.assertAlmostEqual(centered.semi_major_axis_au, radius, places=10)
+        self.assertAlmostEqual(centered.eccentricity, 0.0, places=10)
+        expected_years = 2.0 * math.pi * math.sqrt(
+            radius**3 / PLANET_MU["jupiter"]
+        ) / 365.25
+        self.assertAlmostEqual(centered.period_years, expected_years, places=10)
+
     def test_short_arc_planet_cache_preserves_cubic_motion(self):
         class PolynomialEphemeris:
             def position(self, body, jd):
