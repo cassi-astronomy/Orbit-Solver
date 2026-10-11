@@ -8,7 +8,7 @@ import numpy as np
 from orbit_app.domain import Observation, OrbitSolution
 from orbit_app.main_window import (
     CONSTELLATION_LABELS, CONSTELLATION_LINES, ElementsPanel, SkyPanel,
-    datetime_from_jd, format_dec_sexagesimal, format_ra_sexagesimal,
+    datetime_from_jd, equatorial_ra_ticks, format_dec_sexagesimal, format_ra_sexagesimal,
     is_comet_designation, observation_residual_score, parse_output_epoch,
     perihelion_jd_from_solution, project_ecliptic_camera,
     SKY_TRACK_HORIZONS, sky_track_sample_count, solar_orbit_clip_radius,
@@ -58,6 +58,14 @@ class PhotometryTests(unittest.TestCase):
 
 
 class SkyTrackTests(unittest.TestCase):
+    def test_equatorial_ra_ticks_are_unique_and_anchored_to_the_sky(self):
+        positions, labels = equatorial_ra_ticks(349.6, 60.0)
+        self.assertEqual(labels, ("22h", "23h", "00h", "01h"))
+        self.assertEqual(len(labels), len(set(labels)))
+        moved_positions, moved_labels = equatorial_ra_ticks(350.6, 60.0)
+        self.assertEqual(moved_labels, labels)
+        np.testing.assert_allclose(moved_positions, positions - 1.0)
+
     def test_equatorial_projection_uses_absolute_dec_and_wraps_ra(self):
         x, y, _ = SkyPanel._project_equatorial(
             np.array([359.0, 1.0, 10.0]), np.array([-5.0, 12.0, 25.0]), 0.0, 10.0

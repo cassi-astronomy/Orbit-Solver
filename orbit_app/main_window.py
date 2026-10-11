@@ -60,7 +60,6 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 from matplotlib.figure import Figure
 from matplotlib.projections import register_projection
-from matplotlib.ticker import FuncFormatter
 from mpl_toolkits.mplot3d import Axes3D
 
 from .domain import Observation, OrbitSolution
@@ -149,6 +148,35 @@ SKY_TRACK_HORIZONS = (
 def sky_track_sample_count(horizon_days: int) -> int:
     """Keep short tracks smooth without making multi-year views enormous."""
     return min(2401, max(241, int(horizon_days) * 5 + 1))
+
+
+def equatorial_ra_ticks(
+    center_ra_deg: float, field_deg: float,
+) -> tuple[np.ndarray, tuple[str, ...]]:
+    """Return sky-anchored RA ticks for a target-centred rectangular map."""
+    if field_deg <= 15.0:
+        step_hours = .25
+    elif field_deg <= 30.0:
+        step_hours = .5
+    elif field_deg <= 60.0:
+        step_hours = 1.0
+    elif field_deg <= 120.0:
+        step_hours = 2.0
+    else:
+        step_hours = 3.0
+    step_deg = 15.0 * step_hours
+    half_field = field_deg / 2.0
+    start = np.ceil((center_ra_deg - half_field) / step_deg) * step_deg
+    absolute = np.arange(start, center_ra_deg + half_field + step_deg * 1e-8, step_deg)
+    positions = absolute - center_ra_deg
+    labels: list[str] = []
+    for degrees in absolute:
+        total_minutes = int(round((degrees % 360.0) * 4.0)) % (24 * 60)
+        hours, minutes = divmod(total_minutes, 60)
+        labels.append(
+            f"{hours:02d}h" if minutes == 0 else f"{hours:02d}h{minutes:02d}"
+        )
+    return positions, tuple(labels)
 
 
 def datetime_from_jd(jd: float) -> datetime | None:
@@ -2249,18 +2277,30 @@ class SkyPanel(QWidget):
             line_x, line_y, line_distance = projection(
                 line[:, 0], line[:, 1], center_ra, center_dec
             )
-            visible_indices = np.flatnonzero(
-                visible_mask(line_x, line_y, line_distance, 1.05)
+            # Draw complete continuous strokes and let Matplotlib clip them at
+            # the viewport. Filtering vertices first made a side disappear as
+            # soon as one endpoint moved just outside the map (especially the
+            # Great Square of Pegasus). Split only at a true projection seam.
+            discontinuity = (
+                ~np.isfinite(line_x[:-1]) | ~np.isfinite(line_x[1:]) |
+                ~np.isfinite(line_y[:-1]) | ~np.isfinite(line_y[1:])
             )
-            if visible_indices.size:
-                discontinuity = np.diff(visible_indices) > 1
-                if full_sky:
-                    discontinuity |= np.hypot(np.diff(line_x[visible_indices]), np.diff(line_y[visible_indices])) > 80.0
-                breaks = np.where(discontinuity)[0] + 1
-                for segment in np.split(visible_indices, breaks):
-                    if len(segment) > 1:
-                        ax.plot(line_x[segment], line_y[segment], color="#526b8d",
-                                alpha=.72, lw=.65, zorder=0)
+            if equatorial:
+                discontinuity |= np.abs(np.diff(line_x)) > 180.0
+            elif full_sky:
+                discontinuity |= np.hypot(np.diff(line_x), np.diff(line_y)) > 80.0
+            else:
+                discontinuity |= (
+                    (line_distance[:-1] >= 179.0) |
+                    (line_distance[1:] >= 179.0) |
+                    (np.hypot(np.diff(line_x), np.diff(line_y)) > 120.0)
+                )
+            for segment in np.split(
+                np.arange(len(line_x)), np.where(discontinuity)[0] + 1
+            ):
+                if len(segment) > 1:
+                    ax.plot(line_x[segment], line_y[segment], color="#526b8d",
+                            alpha=.72, lw=.65, zorder=0, clip_on=True)
         if CONSTELLATION_LABELS:
             label_ra = np.array([item[1] for item in CONSTELLATION_LABELS])
             label_dec = np.array([item[2] for item in CONSTELLATION_LABELS])
@@ -2375,10 +2415,9 @@ class SkyPanel(QWidget):
             ax.set_xlim(horizontal_half, -horizontal_half); ax.set_ylim(-vertical_half, vertical_half)
             ax.set_aspect("auto")
         if equatorial:
-            decimals = 1 if selected_field <= 30.0 else 0
-            ax.xaxis.set_major_formatter(FuncFormatter(
-                lambda value, _: f"{((center_ra + value) % 360.0) / 15.0:.{decimals}f}h"
-            ))
+            tick_positions, tick_labels = equatorial_ra_ticks(center_ra, selected_field)
+            ax.set_xticks(tick_positions)
+            ax.set_xticklabels(tick_labels)
             ax.set_xlabel("RA — východ vlevo")
             ax.set_ylabel("Dec [°]")
             projection_name = "Rovníkový pohled (RA/Dec)"
