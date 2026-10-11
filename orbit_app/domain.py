@@ -8,7 +8,10 @@ from typing import Any
 
 def is_comet_designation(value: str) -> bool:
     """Recognize provisional and permanently numbered comet designations."""
-    return bool(re.match(r"^\s*(?:[ACDPX]/|\d+[PD](?:/|\b))", value or "", re.I))
+    # MPC interstellar designations (1I, 2I, 3I/ATLAS, …) behave like comet
+    # designations throughout the UI, including comet photometry and optional
+    # Marsden A1/A2/A3 parameters.
+    return bool(re.match(r"^\s*(?:[ACDPX]/|\d+[PDI](?:/|\b))", value or "", re.I))
 
 
 @dataclass(slots=True)

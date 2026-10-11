@@ -334,6 +334,10 @@ class MpcParsingTests(unittest.TestCase):
         self.assertEqual(solution.photometric_exponent, 4.0)
         self.assertFalse(solution.phase_correction)
 
+    def test_numbered_interstellar_designation_is_treated_as_comet(self):
+        self.assertTrue(is_comet_designation("3I"))
+        self.assertTrue(is_comet_designation("3I/ATLAS"))
+
     def test_mpc_display_name_for_named_asteroid(self):
         result = mpc_display_name({
             "iau_designation": "(9841)", "permid": "9841",

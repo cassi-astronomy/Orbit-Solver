@@ -3349,7 +3349,10 @@ class OrbitConstraintsDialog(QDialog):
         )
         self.download_de440.clicked.connect(self._download_de440)
         form.addRow(self.download_de440)
-        comet = is_comet_designation(solution.designation)
+        comet = (
+            is_comet_designation(solution.designation)
+            or is_comet_designation(solution.display_name or "")
+        )
         self.is_comet = comet
         self.original_future = QCheckBox(
             "Po fitu spočítat původní a budoucí barycentrickou dráhu v 250 AU"
