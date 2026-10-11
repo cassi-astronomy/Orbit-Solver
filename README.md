@@ -138,10 +138,15 @@ QT_QPA_PLATFORM=xcb python3 run.py
    odhad, protože katalogová dráha ještě nemusí existovat.
 4. Podle potřeby omezte časový rozsah, vyřaďte chybná měření a zvolte
    **Spočítat vlastní dráhu**.
+   Automatický fit používá nejistoty z ADES, kontroluje odlehlé měření po
+   celých pozorovacích sériích a vyřazené řádky viditelně odškrtne v tabulce.
+   U krátkého oblouku porovná také volnou a téměř parabolickou větev, aby pár
+   chybných pozdních měření nestáhl řešení do jiné lokální dráhy.
    Pokud je oblouk příliš krátký nebo běžný počáteční odhad selže, použijte
    **Předběžná dráha z krátkého oblouku**. Doporučené systematické hledání
-   prohledává vzdálenost a radiální rychlost; alternativní Väisälova metoda
-   vytvoří hypotézu pro ručně zadanou perihelovou vzdálenost `q`.
+   prohledává vzdálenost a radiální rychlost a od šesti měření provede také
+   robustní diferenciální korekci; alternativní Väisälova metoda vytvoří
+   hypotézu pro ručně zadanou perihelovou vzdálenost `q`.
 5. Výsledek prohlížejte v záložkách **Elementy**, **Efemerida**,
    **Vývoj dráhy**, **Sluneční soustava**, **Pohled ze Země** a
    **Světelná křivka**.

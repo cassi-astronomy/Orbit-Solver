@@ -32,6 +32,7 @@ from orbit_app.orbit_evolution import (
 )
 from orbit_app.planetary import PLANETS
 from orbit_app.orbit_fit import (
+    _automatic_orbit_score, _isolated_latest_batch,
     _observation_offsets_gcrs, _observation_sigma_arcsec,
     _truncate_rows_to_recent_years, fit_selection_count, parse_observation_time,
 )
@@ -481,6 +482,31 @@ class PreviewGeometryTests(unittest.TestCase):
 
 
 class OrbitFitSelectionTests(unittest.TestCase):
+    def test_isolated_latest_station_batch_is_detected(self):
+        start = datetime(2026, 10, 5, tzinfo=timezone.utc)
+        observations = [
+            Observation(
+                time=(start + timedelta(hours=index * 8)).isoformat(),
+                ra_deg=1.0, dec_deg=2.0, station=f"A{index % 3}",
+            )
+            for index in range(10)
+        ]
+        observations.extend([
+            Observation(
+                time=(start + timedelta(days=5, minutes=index * 10)).isoformat(),
+                ra_deg=1.0, dec_deg=2.0, station="E62",
+            )
+            for index in range(2)
+        ])
+        self.assertEqual(_isolated_latest_batch(observations, None), observations[-2:])
+
+    def test_automatic_score_discourages_strong_short_arc_hyperbola(self):
+        free = OrbitSolution("X", 2461000.5, -50.0, 1.07, 150, 266, 339, -1)
+        free.fit_normalized_rms = .70
+        parabolic = OrbitSolution("X", 2461000.5, -1e8, 1.00000001, 150, 266, 342, 0)
+        parabolic.fit_normalized_rms = .72
+        self.assertLess(_automatic_orbit_score(parabolic), _automatic_orbit_score(free))
+
     def test_fit_selection_count_respects_window_and_manual_exclusion(self):
         from orbit_app.domain import Observation
         observations = [

@@ -492,7 +492,7 @@ def initial_orbit_from_observations(
     )
 
 
-def fit_orbit(
+def _fit_orbit_once(
     observations: list[Observation], initial: OrbitSolution | None,
     constraints: dict[str, float] | None = None,
     truncate_years: float | None = None,
@@ -543,13 +543,38 @@ def fit_orbit(
             for index, name in enumerate(nongrav_names)
         }
 
+    full_engine = NBodyIntegrator(
+        PLANETS, relative_tolerance=3e-11, absolute_tolerance=2e-13,
+        nongravitational_parameters=initial_nongrav,
+    )
+    arc_days = float(np.ptp(epochs))
+    # On a discovery arc of a few days, repeatedly looking up all eight
+    # planets while scipy estimates a numerical Jacobian dominates the run
+    # time.  Differential correction can use the solar force field here: the
+    # missing, almost constant planetary acceleration is absorbed into the
+    # fitted state at the central epoch.  A final correction below always uses
+    # the full DE ephemeris, so this shortcut does not become the reported
+    # orbit.
+    use_fast_differential_correction = arc_days <= 30.0 and not nongrav_names
+    optimizer_engine = (
+        NBodyIntegrator(
+            PLANETS, perturbers=(), relative_tolerance=3e-11,
+            absolute_tolerance=2e-13,
+        )
+        if use_fast_differential_correction else full_engine
+    )
+
     def propagate(
         vector: np.ndarray, state: StateVector, output_epochs: np.ndarray,
+        engine: NBodyIntegrator,
     ) -> np.ndarray:
-        engine = NBodyIntegrator(
-            PLANETS, relative_tolerance=3e-11, absolute_tolerance=2e-13,
-            nongravitational_parameters=nongrav_from_vector(vector),
-        )
+        parameters = nongrav_from_vector(vector)
+        if parameters != engine.nongravitational_parameters:
+            engine = NBodyIntegrator(
+                PLANETS, perturbers=engine.perturbers,
+                relative_tolerance=engine.rtol, absolute_tolerance=engine.atol,
+                nongravitational_parameters=parameters,
+            )
         return engine.propagate(state, output_epochs)
 
     reference_epoch = float(np.median(epochs))
@@ -563,24 +588,28 @@ def fit_orbit(
         np.array([initial_nongrav.get(name, 0.0) / 1e-8 for name in nongrav_names]),
     ))
     initial_vector = np.concatenate((
-        propagate(source_parameters, source_state, np.array([reference_epoch]))[0],
+        propagate(source_parameters, source_state, np.array([reference_epoch]), full_engine)[0],
         source_parameters[6:],
     ))
 
-    def astrometric_residuals(vector: np.ndarray) -> np.ndarray:
+    def astrometric_residuals(
+        vector: np.ndarray, engine: NBodyIntegrator = optimizer_engine,
+    ) -> np.ndarray:
         state = StateVector(reference_epoch, vector[:3], vector[3:6])
-        propagated = propagate(vector, state, epochs)
+        propagated = propagate(vector, state, epochs, engine)
         earth = earth_heliocentric_ecliptic(epochs)
         light_time = np.linalg.norm(propagated[:, :3] - earth, axis=1) / C_AU_PER_DAY
-        emitted = propagate(vector, state, epochs - light_time)
+        emitted = propagate(vector, state, epochs - light_time, engine)
         computed_ra, computed_dec = _equatorial_direction(emitted, epochs, observer_offsets)
         delta_ra = (computed_ra - observed_ra + 180.0) % 360.0 - 180.0
         delta_ra *= np.cos(np.radians(observed_dec))
         delta_dec = computed_dec - observed_dec
         return np.column_stack((delta_ra, delta_dec)).ravel() * 3600.0
 
-    def residuals(vector: np.ndarray) -> np.ndarray:
-        astrometry = astrometric_residuals(vector) / astrometric_sigmas
+    def residuals_with_engine(
+        vector: np.ndarray, engine: NBodyIntegrator,
+    ) -> np.ndarray:
+        astrometry = astrometric_residuals(vector, engine) / astrometric_sigmas
         if not constraints:
             return astrometry
         try:
@@ -599,6 +628,9 @@ def fit_orbit(
             else:
                 penalties.append((actual - target) * 1e6)
         return np.append(astrometry, penalties)
+
+    def residuals(vector: np.ndarray) -> np.ndarray:
+        return residuals_with_engine(vector, optimizer_engine)
 
     fine_scale = np.concatenate((
         np.array([1e-3, 1e-3, 1e-3, 1e-5, 1e-5, 1e-5]),
@@ -635,15 +667,24 @@ def fit_orbit(
         method="trf",
         x_scale=("jac" if derived_initial else fine_scale),
         bounds=(lower_bounds, upper_bounds),
-        loss="soft_l1",
-        f_scale=1.5,
-        max_nfev=40 if derived_initial else 14,
+        loss="linear",
+        max_nfev=100 if derived_initial else 24,
         verbose=0,
     )
+    if use_fast_differential_correction:
+        # Polish the fast short-arc solution with the complete planetary force
+        # model.  Starting in the correct basin needs only a few evaluations.
+        result = least_squares(
+            lambda vector: residuals_with_engine(vector, full_engine),
+            result.x,
+            method="trf", x_scale=fine_scale,
+            bounds=(lower_bounds, upper_bounds), loss="linear",
+            max_nfev=8, verbose=0,
+        )
     if not result.success and result.nfev < 2:
         raise OrbitFitError(result.message)
     elements = cartesian_to_elements(result.x[:3], result.x[3:6])
-    final_astrometric_residual = astrometric_residuals(result.x)
+    final_astrometric_residual = astrometric_residuals(result.x, full_engine)
     rms = float(np.sqrt(np.mean(np.square(final_astrometric_residual))))
     normalized_rms = float(np.sqrt(np.mean(np.square(
         final_astrometric_residual / astrometric_sigmas
@@ -684,10 +725,12 @@ def fit_orbit(
     report_ra = np.array([item[2] for item in reportable])
     report_dec = np.array([item[3] for item in reportable])
     report_state = StateVector(reference_epoch, result.x[:3], result.x[3:6])
-    report_positions = propagate(result.x, report_state, report_epochs)
+    report_positions = propagate(result.x, report_state, report_epochs, full_engine)
     report_earth = earth_heliocentric_ecliptic(report_epochs)
     report_light_time = np.linalg.norm(report_positions[:, :3] - report_earth, axis=1) / C_AU_PER_DAY
-    report_emitted = propagate(result.x, report_state, report_epochs - report_light_time)
+    report_emitted = propagate(
+        result.x, report_state, report_epochs - report_light_time, full_engine
+    )
     computed_ra, computed_dec = _equatorial_direction(report_emitted, report_epochs, report_offsets)
     observed_minus_computed_ra = (report_ra - computed_ra + 180.0) % 360.0 - 180.0
     observed_minus_computed_ra *= np.cos(np.radians(report_dec)) * 3600.0
@@ -701,3 +744,152 @@ def fit_orbit(
         observation.residual_dec_arcsec = float(residual_dec)
         observation.used_in_fit = id(observation) in fitted_ids
     return solution, rms, len(usable)
+
+
+def _isolated_latest_batch(
+    observations: list[Observation], truncate_years: float | None,
+) -> list[Observation]:
+    """Return a small final observing batch separated by a substantial gap.
+
+    Such a batch is particularly influential on a short arc.  Testing it as a
+    group before allowing it to determine the range curvature prevents two bad
+    follow-up positions from pulling the fit into a different admissible orbit.
+    """
+    parsed: list[tuple[Observation, datetime]] = []
+    for observation in observations:
+        if (
+            observation.excluded_from_fit or observation.ra_deg is None
+            or observation.dec_deg is None or not observation.time
+        ):
+            continue
+        try:
+            parsed.append((observation, parse_observation_time(observation.time)))
+        except ValueError:
+            continue
+    parsed.sort(key=lambda item: item[1])
+    if truncate_years is not None and parsed:
+        cutoff = parsed[-1][1] - timedelta(days=365.25 * truncate_years)
+        parsed = [item for item in parsed if item[1] >= cutoff]
+    if len(parsed) < 10:
+        return []
+    epochs = np.asarray([item[1].timestamp() / 86400.0 for item in parsed])
+    gaps = np.diff(epochs)
+    split = int(np.argmax(gaps)) + 1
+    tail = parsed[split:]
+    maximum_tail = max(2, min(5, int(np.ceil(len(parsed) * 0.15))))
+    if gaps[split - 1] < 0.75 or not (1 <= len(tail) <= maximum_tail):
+        return []
+    # A final isolated series should be one coherent station/night batch.
+    stations = {item[0].station for item in tail}
+    if len(stations) != 1 or (tail[-1][1] - tail[0][1]).total_seconds() > 12 * 3600:
+        return []
+    return [item[0] for item in tail]
+
+
+def _normalized_observation_residual(observation: Observation) -> float:
+    if observation.residual_ra_arcsec is None or observation.residual_dec_arcsec is None:
+        return 0.0
+    sigma_ra, sigma_dec = _observation_sigma_arcsec(observation)
+    return float(np.hypot(
+        observation.residual_ra_arcsec / sigma_ra,
+        observation.residual_dec_arcsec / sigma_dec,
+    ))
+
+
+def _automatic_orbit_score(solution: OrbitSolution) -> float:
+    """Find_Orb-style short-arc score: fit quality plus orbit plausibility."""
+    residual_score = float(
+        solution.fit_normalized_rms
+        if solution.fit_normalized_rms is not None else solution.fit_rms_arcsec or 1e9
+    ) / 2.0
+    eccentricity = float(solution.eccentricity)
+    score = residual_score + eccentricity / 2.0
+    if eccentricity > 1.01:
+        score += (eccentricity - 1.01) * 1000.0
+    return score
+
+
+def _prefer_parabolic_short_arc(
+    observations: list[Observation], candidate: tuple[OrbitSolution, float, int],
+    truncate_years: float | None,
+) -> tuple[OrbitSolution, float, int]:
+    """Try Find_Orb's second, near-parabolic branch for a hyperbolic short arc."""
+    solution = candidate[0]
+    if solution.eccentricity <= 1.01:
+        return candidate
+    try:
+        parabolic = _fit_orbit_once(
+            observations, solution, {"e": 1.0}, truncate_years, None,
+        )
+    except Exception:
+        return candidate
+    # A physical prior must never excuse a visibly poorer astrometric fit.
+    if parabolic[1] > candidate[1] * 1.10:
+        return candidate
+    return (
+        parabolic
+        if _automatic_orbit_score(parabolic[0]) < _automatic_orbit_score(solution)
+        else candidate
+    )
+
+
+def fit_orbit(
+    observations: list[Observation], initial: OrbitSolution | None,
+    constraints: dict[str, float] | None = None,
+    truncate_years: float | None = None,
+    nongravitational: dict[str, float] | None = None,
+) -> tuple[OrbitSolution, float, int]:
+    """Fit an orbit with conservative automatic rejection of astrometric blunders."""
+    latest_batch = _isolated_latest_batch(observations, truncate_years)
+    if latest_batch and not constraints and not nongravitational:
+        for observation in latest_batch:
+            observation.excluded_from_fit = True
+        try:
+            candidate = _fit_orbit_once(
+                observations, initial, constraints, truncate_years, nongravitational,
+            )
+            scores = [_normalized_observation_residual(item) for item in latest_batch]
+            # Treat a same-station follow-up series as one batch.  Requiring a
+            # median above 3 sigma, or one >3 sigma with every point >2.5,
+            # avoids rejecting a whole batch for one merely noisy coordinate.
+            reject_batch = bool(scores) and (
+                float(np.median(scores)) > 3.0
+                or (max(scores) > 3.0 and min(scores) > 2.5)
+            )
+            if reject_batch:
+                for observation in latest_batch:
+                    observation.raw["automatic_exclusion"] = True
+                    observation.used_in_fit = False
+                return _prefer_parabolic_short_arc(
+                    observations, candidate, truncate_years,
+                )
+        except Exception:
+            # The core may itself be too short; fall back to the complete set.
+            pass
+        for observation in latest_batch:
+            observation.excluded_from_fit = False
+            observation.raw.pop("automatic_exclusion", None)
+
+    result = _fit_orbit_once(
+        observations, initial, constraints, truncate_years, nongravitational,
+    )
+    if not constraints and not nongravitational:
+        result = _prefer_parabolic_short_arc(observations, result, truncate_years)
+    # Traditional post-fit rejection remains useful for isolated blunders
+    # which do not form a separated final batch.  Remove at most one pass so a
+    # weak preliminary orbit cannot cascade into wholesale data rejection.
+    if not constraints and not nongravitational:
+        outliers = [
+            item for item in observations
+            if not item.excluded_from_fit and item.used_in_fit
+            and _normalized_observation_residual(item) > 3.0
+        ]
+        if outliers and len(observations) - len(outliers) >= 6:
+            for observation in outliers:
+                observation.excluded_from_fit = True
+                observation.raw["automatic_exclusion"] = True
+            result = _fit_orbit_once(
+                observations, result[0], constraints, truncate_years, nongravitational,
+            )
+            result = _prefer_parabolic_short_arc(observations, result, truncate_years)
+    return result

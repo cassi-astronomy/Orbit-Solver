@@ -363,8 +363,11 @@ class ObservationModel(QAbstractTableModel):
         if not index.isValid() or self.columns[index.column()][1] != "excluded_from_fit":
             return False
         if role == Qt.CheckStateRole:
-            self.rows[index.row()].excluded_from_fit = value != Qt.Checked
-            self.rows[index.row()].used_in_fit = None
+            observation = self.rows[index.row()]
+            observation.excluded_from_fit = value != Qt.Checked
+            observation.used_in_fit = None
+            if value == Qt.Checked:
+                observation.raw.pop("automatic_exclusion", None)
             self.dataChanged.emit(index, index, [Qt.CheckStateRole, Qt.DisplayRole])
             return True
         return False
@@ -645,10 +648,13 @@ class PreliminaryOrbitWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            solution = initial_orbit_from_observations(
-                self.observations, self.method, self.perihelion_distance_au,
-                minimum_observations=3,
-            )
+            if self.method == "systematic" and fit_selection_count(self.observations, None) >= 6:
+                solution, _, _ = fit_orbit(self.observations, None)
+            else:
+                solution = initial_orbit_from_observations(
+                    self.observations, self.method, self.perihelion_distance_au,
+                    minimum_observations=3,
+                )
             self.success.emit((solution, self.method, self.perihelion_distance_au))
         except Exception as exc:
             self.error.emit(str(exc))
