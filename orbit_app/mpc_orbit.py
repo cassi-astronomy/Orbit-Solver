@@ -50,9 +50,16 @@ def mpc_display_name(designation_data: object, fallback: str) -> str:
     ).strip()
     iau_designation = str(designation_data.get("iau_designation") or "").strip()
 
-    is_comet = "/" in primary
+    permanent_comet = bool(re.fullmatch(r"\d+[PD]", permanent, re.I))
+    is_comet = permanent_comet or "/" in primary
+    if permanent_comet and name:
+        # MPC can retain the historical discovery designation (for example
+        # P/1818 W1) as the primary provisional designation.  Once a comet has
+        # a permanent periodic number, its familiar canonical caption is
+        # 2P/Encke rather than the designation of one particular apparition.
+        return f"{permanent.upper()}/{name}"
     canonical = (
-        primary if is_comet else
+        permanent.upper() if permanent_comet else primary if is_comet else
         iau_designation or (f"({permanent})" if permanent else "") or primary or fallback
     )
     if name:
@@ -87,7 +94,7 @@ def mpc_identifier_choices(identifier_data: object, fallback: str) -> list[tuple
         group = str(row.get("group") or "").strip()
         is_comet = "/" in primary or group.casefold() == "comets"
         if is_comet:
-            caption = f"{primary or fallback} ({name})" if name else primary or fallback
+            caption = mpc_display_name(row, fallback)
             kind = "kometa"
         else:
             number = f"({permanent})" if permanent else primary

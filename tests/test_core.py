@@ -294,6 +294,13 @@ class MpcParsingTests(unittest.TestCase):
         }, "C/1995 O1")
         self.assertEqual(result, "C/1995 O1 (Hale-Bopp)")
 
+    def test_numbered_comet_prefers_permanent_name_over_old_apparition(self):
+        result = mpc_display_name({
+            "name": "Encke", "permid": "2P",
+            "unpacked_primary_provisional_designation": "P/1818 W1",
+        }, "2P")
+        self.assertEqual(result, "2P/Encke")
+
     def test_ambiguous_masek_identifier_offers_comet_and_asteroid(self):
         choices = mpc_identifier_choices({
             "found": 2,
