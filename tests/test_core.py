@@ -7,7 +7,8 @@ import numpy as np
 
 from orbit_app.domain import Observation, OrbitSolution
 from orbit_app.main_window import (
-    CONSTELLATION_LABELS, CONSTELLATION_LINES, ElementsPanel, ObservationModel, SkyPanel,
+    CONSTELLATION_LABELS, CONSTELLATION_LINES, ElementsPanel, ObservationModel,
+    PlaybackBar, SkyPanel,
     datetime_from_jd, equatorial_ra_ticks, format_dec_sexagesimal, format_ra_sexagesimal,
     is_comet_designation, observation_residual_score, observations_to_tsv, parse_output_epoch,
     perihelion_jd_from_solution, project_ecliptic_camera,
@@ -58,6 +59,15 @@ class PhotometryTests(unittest.TestCase):
 
 
 class SkyTrackTests(unittest.TestCase):
+    def test_standard_playback_has_intermediate_day_speeds(self):
+        self.assertIn(("1 den/s", 1), PlaybackBar.STANDARD_SPEEDS)
+        self.assertIn(("2 dny/s", 2), PlaybackBar.STANDARD_SPEEDS)
+        self.assertIn(("5 dní/s", 5), PlaybackBar.STANDARD_SPEEDS)
+        self.assertLess(
+            PlaybackBar.STANDARD_SPEEDS.index(("2 dny/s", 2)),
+            PlaybackBar.STANDARD_SPEEDS.index(("5 dní/s", 5)),
+        )
+
     def test_equatorial_ra_ticks_are_unique_and_anchored_to_the_sky(self):
         positions, labels = equatorial_ra_ticks(349.6, 60.0)
         self.assertEqual(labels, ("22h", "23h", "00h", "01h"))

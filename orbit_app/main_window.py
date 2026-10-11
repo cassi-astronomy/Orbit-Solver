@@ -1171,7 +1171,8 @@ class PlaybackBar(QWidget):
     STANDARD_SPEEDS = (
         ("1 min/s", 1 / 1440), ("10 min/s", 10 / 1440),
         ("1 h/s", 1 / 24), ("6 h/s", 6 / 24),
-        ("1 den/s", 1), ("10 dní/s", 10), ("25 dní/s", 25),
+        ("1 den/s", 1), ("2 dny/s", 2), ("5 dní/s", 5),
+        ("10 dní/s", 10), ("25 dní/s", 25),
         ("50 dní/s", 50), ("100 dní/s", 100),
     )
     VISIBILITY_SPEEDS = (
