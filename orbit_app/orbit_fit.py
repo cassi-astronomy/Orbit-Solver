@@ -300,6 +300,28 @@ def _observation_sigmas(rows: list[tuple[Observation, datetime, float, float]]) 
     ], dtype=float)
 
 
+def _representative_indices(epochs: np.ndarray, maximum: int = 120) -> np.ndarray:
+    """Sample both observation density and elapsed time over a large data set."""
+    values = np.asarray(epochs, dtype=float)
+    if values.size <= maximum:
+        return np.arange(values.size, dtype=int)
+    # Rank sampling represents dense observing runs.  Time sampling prevents
+    # thousands of recent measurements from leaving an older, sparse part of
+    # the arc represented by only one point (which can make a fit interpolate
+    # the chosen rows while failing catastrophically between them).
+    rank_count = maximum // 2
+    time_count = maximum - rank_count
+    rank_indices = np.linspace(0, values.size - 1, rank_count).astype(int)
+    targets = np.linspace(values[0], values[-1], time_count)
+    right = np.searchsorted(values, targets, side="left")
+    right = np.clip(right, 0, values.size - 1)
+    left = np.clip(right - 1, 0, values.size - 1)
+    time_indices = np.where(
+        np.abs(values[right] - targets) < np.abs(values[left] - targets), right, left,
+    )
+    return np.unique(np.concatenate((rank_indices, time_indices))).astype(int)
+
+
 def initial_orbit_from_observations(
     observations: list[Observation], method: str = "systematic",
     perihelion_distance_au: float | None = None,
@@ -614,7 +636,8 @@ def _fit_orbit_once(
     usable.sort(key=lambda item: item[1])
     # Bound interactive run time while retaining the full time baseline.
     if len(usable) > 120:
-        indices = np.unique(np.linspace(0, len(usable) - 1, 120).astype(int))
+        all_usable_epochs = dynamical_jd([item[1] for item in usable])
+        indices = _representative_indices(all_usable_epochs, 120)
         usable = [usable[index] for index in indices]
     usable_times = [item[1] for item in usable]
     epochs = dynamical_jd(usable_times)
@@ -647,11 +670,12 @@ def _fit_orbit_once(
     # the full DE ephemeris, so this shortcut does not become the reported
     # orbit.
     use_fast_differential_correction = arc_days <= 30.0 and not nongrav_names
+    use_interpolated_ephemeris = arc_days <= 730.0
     full_ephemeris = (
         _InterpolatedPlanetEphemeris(
             PLANETS, float(np.min(epochs)) - 2.0, float(np.max(epochs)) + 2.0,
         )
-        if use_fast_differential_correction else PLANETS
+        if use_interpolated_ephemeris else PLANETS
     )
     full_engine = NBodyIntegrator(
         full_ephemeris, relative_tolerance=3e-11, absolute_tolerance=2e-13,
@@ -852,6 +876,19 @@ def _fit_orbit_once(
         observation.residual_ra_arcsec = float(residual_ra)
         observation.residual_dec_arcsec = float(residual_dec)
         observation.used_in_fit = id(observation) in fitted_ids
+
+    # The RMS shown to the user must describe the same O-C values displayed in
+    # the table.  Refuse a numerically inconsistent result instead of offering
+    # thousands-of-arcseconds residuals beside a deceptively small fit RMS.
+    fitted_report = np.asarray([
+        (item[0].residual_ra_arcsec, item[0].residual_dec_arcsec)
+        for item in reportable if id(item[0]) in fitted_ids
+    ], dtype=float)
+    report_rms = float(np.sqrt(np.mean(np.square(fitted_report))))
+    if not np.isfinite(report_rms) or not np.isclose(report_rms, rms, rtol=2e-3, atol=2e-3):
+        raise OrbitFitError(
+            "Kontrola O−C odhalila numericky nekonzistentní fit; původní dráha zůstala zachována."
+        )
     return solution, rms, len(usable)
 
 
@@ -884,22 +921,54 @@ def _prefer_parabolic_short_arc(
 ) -> tuple[OrbitSolution, float, int]:
     """Try Find_Orb's second, near-parabolic branch for a hyperbolic short arc."""
     solution = candidate[0]
-    if solution.eccentricity <= 1.01:
+    # A parabolic prior is useful only for an ambiguous, mildly hyperbolic
+    # discovery orbit.  It is physically wrong for a securely interstellar
+    # object such as 3I/ATLAS and must not be attempted on a long arc.
+    if solution.eccentricity <= 1.01 or solution.eccentricity >= 1.2:
         return candidate
+    valid_times: list[datetime] = []
+    for observation in observations:
+        if observation.excluded_from_fit or not observation.time:
+            continue
+        try:
+            valid_times.append(parse_observation_time(observation.time))
+        except ValueError:
+            pass
+    if len(valid_times) >= 2 and (max(valid_times) - min(valid_times)).days > 30:
+        return candidate
+
+    previous_report = [
+        (
+            observation.residual_ra_arcsec,
+            observation.residual_dec_arcsec,
+            observation.used_in_fit,
+        )
+        for observation in observations
+    ]
+
+    def restore_candidate_report() -> None:
+        for observation, values in zip(observations, previous_report):
+            (
+                observation.residual_ra_arcsec,
+                observation.residual_dec_arcsec,
+                observation.used_in_fit,
+            ) = values
+
     try:
         parabolic = _fit_orbit_once(
             observations, solution, {"e": 1.0}, truncate_years, None,
         )
     except Exception:
+        restore_candidate_report()
         return candidate
     # A physical prior must never excuse a visibly poorer astrometric fit.
     if parabolic[1] > candidate[1] * 1.10:
+        restore_candidate_report()
         return candidate
-    return (
-        parabolic
-        if _automatic_orbit_score(parabolic[0]) < _automatic_orbit_score(solution)
-        else candidate
-    )
+    if _automatic_orbit_score(parabolic[0]) < _automatic_orbit_score(solution):
+        return parabolic
+    restore_candidate_report()
+    return candidate
 
 
 def fit_orbit(

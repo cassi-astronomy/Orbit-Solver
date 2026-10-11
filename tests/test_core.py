@@ -36,7 +36,9 @@ from orbit_app.orbit_fit import (
     _automatic_orbit_score, _InterpolatedPlanetEphemeris,
     _observation_offsets_gcrs, _observation_sigma_arcsec,
     _perihelion_offset_days_from_state,
-    _truncate_rows_to_recent_years, fit_orbit, fit_selection_count, parse_observation_time,
+    _prefer_parabolic_short_arc,
+    _representative_indices, _truncate_rows_to_recent_years,
+    fit_orbit, fit_selection_count, parse_observation_time,
 )
 from orbit_app.photometry import estimate_absolute_magnitude, power_law_magnitude
 from orbit_app.preview_orbit import apparent_geometry, demo_solution, heliocentric_xyz, orbital_curve_xyz, solve_kepler
@@ -484,6 +486,54 @@ class PreviewGeometryTests(unittest.TestCase):
 
 
 class OrbitFitSelectionTests(unittest.TestCase):
+    def test_interstellar_solution_is_never_replaced_by_parabolic_trial(self):
+        interstellar = OrbitSolution("3I", 2461200.5, -0.26, 6.1, 175, 322, 128, 10)
+        interstellar.fit_normalized_rms = 1.0
+        observation = Observation(
+            designation="3I", time="2025-07-01T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
+            residual_ra_arcsec=0.2, residual_dec_arcsec=-0.1, used_in_fit=True,
+        )
+        candidate = (interstellar, 0.8, 1)
+        with patch("orbit_app.orbit_fit._fit_orbit_once") as trial:
+            result = _prefer_parabolic_short_arc([observation], candidate, None)
+        self.assertIs(result, candidate)
+        trial.assert_not_called()
+
+    def test_rejected_parabolic_trial_restores_candidate_residuals(self):
+        free = OrbitSolution("X", 2461000.5, -50.0, 1.03, 150, 266, 339, -1)
+        free.fit_normalized_rms = 0.5
+        parabolic = OrbitSolution("X", 2461000.5, -1e8, 1.0, 150, 266, 342, 0)
+        parabolic.fit_normalized_rms = 5.0
+        observation = Observation(
+            designation="X", time="2026-10-01T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
+            residual_ra_arcsec=0.2, residual_dec_arcsec=-0.1, used_in_fit=True,
+        )
+
+        def rejected_trial(*args, **kwargs):
+            observation.residual_ra_arcsec = 10000.0
+            observation.residual_dec_arcsec = -20000.0
+            observation.used_in_fit = False
+            return parabolic, 10.0, 1
+
+        with patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=rejected_trial):
+            result = _prefer_parabolic_short_arc([observation], (free, 0.5, 1), None)
+        self.assertIs(result[0], free)
+        self.assertEqual(observation.residual_ra_arcsec, 0.2)
+        self.assertEqual(observation.residual_dec_arcsec, -0.1)
+        self.assertTrue(observation.used_in_fit)
+
+    def test_large_fit_sample_represents_sparse_time_interval(self):
+        dense_recent = np.linspace(90.0, 100.0, 900)
+        epochs = np.concatenate((np.linspace(0.0, 10.0, 100), dense_recent))
+        indices = _representative_indices(epochs, 120)
+        selected = epochs[indices]
+        self.assertLessEqual(len(indices), 120)
+        # Pure rank sampling would retain only about six old observations;
+        # the elapsed-time half must add independent coverage of that arc.
+        self.assertGreater(np.count_nonzero(selected < 50.0), 6)
+        self.assertEqual(selected[0], epochs[0])
+        self.assertEqual(selected[-1], epochs[-1])
+
     def test_parabolic_perihelion_offset_is_finite_at_singularity(self):
         q = 3.2
         state = np.array([q, 0.0, 0.0, 0.0, math.sqrt(2.0 * MU_SUN / q), 0.0])
