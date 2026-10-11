@@ -498,10 +498,29 @@ class NativeIntegratorTests(unittest.TestCase):
     def test_mpc_evolution_export_contains_elements_and_commented_encounter(self):
         solution, result = self._evolution_export_fixture()
         report = format_evolution_mpc_report(solution, result)
-        self.assertIn("CK24Y010", report)
+        self.assertIn("K24Y010", report)
         self.assertIn("# SETKÁNÍ", report)
-        element_lines = [line for line in report.splitlines() if "CK24Y010" in line]
+        element_lines = [line for line in report.splitlines() if "K24Y010" in line]
         self.assertEqual(len(element_lines), 2)
+        self.assertRegex(element_lines[0], r"^\s+CK24Y010\s+20\d{2} \d{2} \d{2}\.\d{4}")
+
+    def test_numbered_comet_evolution_export_uses_perihelion_date_and_q(self):
+        _, result = self._evolution_export_fixture()
+        solution = OrbitSolution(
+            "2P", 2462500.5, 2.2178179, .8472983, 11.34795,
+            334.01955, 187.28396, 286.52227,
+            absolute_magnitude=14.36, photometric_exponent=4.0,
+            display_name="2P/Encke",
+        )
+        report = format_evolution_mpc_report(solution, result)
+        element_lines = [
+            line for line in report.splitlines()
+            if line and not line.startswith("#")
+        ]
+        self.assertEqual(len(element_lines), 2)
+        self.assertRegex(element_lines[0], r"^\s*2P\s+20\d{2} \d{2} \d{2}\.\d{4}")
+        self.assertIn(" 0.840000", element_lines[0])
+        self.assertNotIn("  0.00000 ", element_lines[0])
 
     def test_evolution_year_range_is_asymmetric(self):
         solution = OrbitSolution(

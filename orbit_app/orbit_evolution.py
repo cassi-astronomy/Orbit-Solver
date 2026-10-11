@@ -130,17 +130,23 @@ def _packed_mpc_epoch(jd: float) -> str:
 
 
 def _mpc_return_line(solution: OrbitSolution, item: EvolutionReturn) -> str:
-    comet = re.match(
+    provisional_comet = re.match(
         r"^\s*([ACDPX])/\s*(\d{4})\s+([A-Z])(\d+)", solution.designation, re.I
     )
-    if comet:
-        orbit_type, year_text, half_month, sequence_text = comet.groups()
-        year = int(year_text)
-        century = {18: "I", 19: "J", 20: "K", 21: "L"}.get(year // 100, "?")
-        packed = (
-            f"{orbit_type.upper()}{century}{year % 100:02d}{half_month.upper()}"
-            f"{int(sequence_text):02d}0"
-        )
+    numbered_comet = re.match(r"^\s*(\d+)([PD])(?:/|\b)", solution.designation, re.I)
+    if provisional_comet or numbered_comet:
+        periodic_number = int(numbered_comet.group(1)) if numbered_comet else 0
+        packed_provisional = ""
+        if provisional_comet:
+            orbit_type, year_text, half_month, sequence_text = provisional_comet.groups()
+            year = int(year_text)
+            century = {18: "I", 19: "J", 20: "K", 21: "L"}.get(year // 100, "?")
+            packed_provisional = (
+                f"{century}{year % 100:02d}{half_month.upper()}"
+                f"{int(sequence_text):02d}0"
+            )
+        else:
+            orbit_type = numbered_comet.group(2).upper()
         try:
             perihelion = datetime(2000, 1, 1, 12, tzinfo=timezone.utc) + timedelta(
                 days=item.epoch_jd - 2451545.0
@@ -151,12 +157,15 @@ def _mpc_return_line(solution: OrbitSolution, item: EvolutionReturn) -> str:
             perihelion.hour * 3600 + perihelion.minute * 60 + perihelion.second
             + perihelion.microsecond / 1e6
         ) / 86400.0
+        number_field = f"{periodic_number:4d}" if numbered_comet else "    "
+        prefix = f"{number_field}{orbit_type.upper()}{packed_provisional:<7}"
+        slope_parameter = 2.5 * solution.photometric_exponent
         return (
-            f"    {packed:<8}  {perihelion.year:04d} {perihelion.month:02d} {day_fraction:07.4f}  "
-            f"{item.perihelion_au:8.6f}  {item.eccentricity:8.6f}  "
+            f"{prefix}  {perihelion.year:04d} {perihelion.month:02d} {day_fraction:07.4f} "
+            f"{item.perihelion_au:9.6f}  {item.eccentricity:8.6f}  "
             f"{item.arg_peri_deg:8.4f}  {item.node_deg:8.4f}  "
             f"{item.inclination_deg:8.4f}  {perihelion:%Y%m%d}  "
-            f"{solution.absolute_magnitude:4.1f}  {solution.photometric_exponent:3.1f}      "
+            f"{solution.absolute_magnitude:4.1f} {slope_parameter:4.1f}  "
             f"{solution.display_name or solution.designation}"
         )
     mean_motion = np.degrees(0.01720209895 / abs(item.semi_major_axis_au) ** 1.5)
