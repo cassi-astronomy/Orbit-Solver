@@ -855,46 +855,6 @@ def _fit_orbit_once(
     return solution, rms, len(usable)
 
 
-def _isolated_latest_batch(
-    observations: list[Observation], truncate_years: float | None,
-) -> list[Observation]:
-    """Return a small final observing batch separated by a substantial gap.
-
-    Such a batch is particularly influential on a short arc.  Testing it as a
-    group before allowing it to determine the range curvature prevents two bad
-    follow-up positions from pulling the fit into a different admissible orbit.
-    """
-    parsed: list[tuple[Observation, datetime]] = []
-    for observation in observations:
-        if (
-            observation.excluded_from_fit or observation.ra_deg is None
-            or observation.dec_deg is None or not observation.time
-        ):
-            continue
-        try:
-            parsed.append((observation, parse_observation_time(observation.time)))
-        except ValueError:
-            continue
-    parsed.sort(key=lambda item: item[1])
-    if truncate_years is not None and parsed:
-        cutoff = parsed[-1][1] - timedelta(days=365.25 * truncate_years)
-        parsed = [item for item in parsed if item[1] >= cutoff]
-    if len(parsed) < 10:
-        return []
-    epochs = np.asarray([item[1].timestamp() / 86400.0 for item in parsed])
-    gaps = np.diff(epochs)
-    split = int(np.argmax(gaps)) + 1
-    tail = parsed[split:]
-    maximum_tail = max(2, min(5, int(np.ceil(len(parsed) * 0.15))))
-    if gaps[split - 1] < 0.75 or not (1 <= len(tail) <= maximum_tail):
-        return []
-    # A final isolated series should be one coherent station/night batch.
-    stations = {item[0].station for item in tail}
-    if len(stations) != 1 or (tail[-1][1] - tail[0][1]).total_seconds() > 12 * 3600:
-        return []
-    return [item[0] for item in tail]
-
-
 def _normalized_observation_residual(observation: Observation) -> float:
     if observation.residual_ra_arcsec is None or observation.residual_dec_arcsec is None:
         return 0.0
@@ -949,36 +909,11 @@ def fit_orbit(
     nongravitational: dict[str, float] | None = None,
 ) -> tuple[OrbitSolution, float, int]:
     """Fit an orbit with conservative automatic rejection of astrometric blunders."""
-    latest_batch = _isolated_latest_batch(observations, truncate_years)
-    if latest_batch and not constraints and not nongravitational:
-        for observation in latest_batch:
-            observation.excluded_from_fit = True
-        try:
-            candidate = _fit_orbit_once(
-                observations, initial, constraints, truncate_years, nongravitational,
-            )
-            scores = [_normalized_observation_residual(item) for item in latest_batch]
-            # Treat a same-station follow-up series as one batch.  Requiring a
-            # median above 3 sigma, or one >3 sigma with every point >2.5,
-            # avoids rejecting a whole batch for one merely noisy coordinate.
-            reject_batch = bool(scores) and (
-                float(np.median(scores)) > 3.0
-                or (max(scores) > 3.0 and min(scores) > 2.5)
-            )
-            if reject_batch:
-                for observation in latest_batch:
-                    observation.raw["automatic_exclusion"] = True
-                    observation.used_in_fit = False
-                return _prefer_parabolic_short_arc(
-                    observations, candidate, truncate_years,
-                )
-        except Exception:
-            # The core may itself be too short; fall back to the complete set.
-            pass
-        for observation in latest_batch:
-            observation.excluded_from_fit = False
-            observation.raw.pop("automatic_exclusion", None)
-
+    # Always establish the residuals against a solution containing every
+    # currently enabled measurement.  A chronologically isolated follow-up
+    # batch is not evidence of bad astrometry: on a short arc it can select a
+    # different but perfectly valid range solution (as the E62 follow-up of
+    # A11HAVq does).  Only actual post-fit residuals may trigger rejection.
     result = _fit_orbit_once(
         observations, initial, constraints, truncate_years, nongravitational,
     )

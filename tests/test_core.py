@@ -2,6 +2,7 @@ import math
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -32,10 +33,10 @@ from orbit_app.orbit_evolution import (
 )
 from orbit_app.planetary import PLANETS
 from orbit_app.orbit_fit import (
-    _automatic_orbit_score, _InterpolatedPlanetEphemeris, _isolated_latest_batch,
+    _automatic_orbit_score, _InterpolatedPlanetEphemeris,
     _observation_offsets_gcrs, _observation_sigma_arcsec,
     _perihelion_offset_days_from_state,
-    _truncate_rows_to_recent_years, fit_selection_count, parse_observation_time,
+    _truncate_rows_to_recent_years, fit_orbit, fit_selection_count, parse_observation_time,
 )
 from orbit_app.photometry import estimate_absolute_magnitude, power_law_magnitude
 from orbit_app.preview_orbit import apparent_geometry, demo_solution, heliocentric_xyz, orbital_curve_xyz, solve_kepler
@@ -492,7 +493,7 @@ class OrbitFitSelectionTests(unittest.TestCase):
             _perihelion_offset_days_from_state(perturbed, force_parabolic=True)
         ))
 
-    def test_isolated_latest_station_batch_is_detected(self):
+    def test_isolated_latest_station_batch_is_fitted_before_outlier_decision(self):
         start = datetime(2026, 10, 5, tzinfo=timezone.utc)
         observations = [
             Observation(
@@ -508,7 +509,17 @@ class OrbitFitSelectionTests(unittest.TestCase):
             )
             for index in range(2)
         ])
-        self.assertEqual(_isolated_latest_batch(observations, None), observations[-2:])
+        solution = OrbitSolution("X", 2461320.5, -80.0, 1.04, 150, 266, 339, -1)
+        solution.fit_normalized_rms = 0.6
+        candidate = (solution, 0.3, len(observations))
+        with (
+            patch("orbit_app.orbit_fit._fit_orbit_once", return_value=candidate) as fit_once,
+            patch("orbit_app.orbit_fit._prefer_parabolic_short_arc", return_value=candidate),
+        ):
+            result = fit_orbit(observations, None)
+        self.assertIs(result, candidate)
+        fit_once.assert_called_once()
+        self.assertTrue(all(not item.excluded_from_fit for item in observations))
 
     def test_automatic_score_discourages_strong_short_arc_hyperbola(self):
         free = OrbitSolution("X", 2461000.5, -50.0, 1.07, 150, 266, 339, -1)
