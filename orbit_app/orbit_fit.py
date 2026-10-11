@@ -71,6 +71,41 @@ def fit_selection_count(
     return len(_truncate_rows_to_recent_years(parsed, years))
 
 
+def _perihelion_offset_days_from_state(
+    state_vector: np.ndarray, force_parabolic: bool = False,
+) -> float:
+    """Time since perihelion, avoiding the singular ``a, M`` form at e=1."""
+    position = np.asarray(state_vector[:3], dtype=float)
+    velocity = np.asarray(state_vector[3:6], dtype=float)
+    radius = float(np.linalg.norm(position))
+    angular_momentum = np.cross(position, velocity)
+    h_norm = float(np.linalg.norm(angular_momentum))
+    speed2 = float(np.dot(velocity, velocity))
+    eccentricity_vector = (
+        (speed2 - MU_SUN / radius) * position
+        - float(np.dot(position, velocity)) * velocity
+    ) / MU_SUN
+    eccentricity = float(np.linalg.norm(eccentricity_vector))
+    if force_parabolic or abs(eccentricity - 1.0) < 1e-4:
+        if eccentricity <= 1e-12 or h_norm <= 1e-18:
+            raise ValueError("Nelze určit směr perihelu.")
+        cosine = float(np.dot(eccentricity_vector, position)) / (eccentricity * radius)
+        sine = float(
+            np.dot(np.cross(eccentricity_vector, position), angular_momentum)
+        ) / (eccentricity * radius * h_norm)
+        true_anomaly = float(np.arctan2(sine, cosine))
+        barker_d = float(np.tan(true_anomaly / 2.0))
+        semilatus_rectum = h_norm * h_norm / MU_SUN
+        return 0.5 * np.sqrt(semilatus_rectum ** 3 / MU_SUN) * (
+            barker_d + barker_d ** 3 / 3.0
+        )
+    a, e, _, _, _, mean_anomaly = cartesian_to_elements(position, velocity)
+    mean_motion = 0.01720209895 / abs(a) ** 1.5
+    if e < 1.0:
+        mean_anomaly = (mean_anomaly + 180.0) % 360.0 - 180.0
+    return float(np.radians(mean_anomaly) / mean_motion)
+
+
 def _formal_element_uncertainties(
     state_vector: np.ndarray, elements: tuple[float, float, float, float, float, float],
     astrometric_jacobian: np.ndarray, astrometric_residual: np.ndarray,
@@ -98,21 +133,36 @@ def _formal_element_uncertainties(
             element_jacobian[:, column] = difference / (2.0 * step)
         element_covariance = element_jacobian @ state_covariance @ element_jacobian.T
         sigma = np.sqrt(np.maximum(0.0, np.diag(element_covariance)))
-        a, e, _, _, _, mean_anomaly = elements
-        q_gradient = np.array([1.0 - e, -a, 0.0, 0.0, 0.0, 0.0])
-        q_sigma = float(np.sqrt(max(0.0, q_gradient @ element_covariance @ q_gradient)))
+        a, e, _, _, _, _ = elements
+        q_state_gradient = np.empty(6, dtype=float)
+        peri_state_gradient = np.empty(6, dtype=float)
+        near_parabolic = abs(e - 1.0) < 1e-3
+        for column in range(6):
+            step = max(
+                abs(float(state_vector[column])) * 1e-6,
+                1e-8 if column < 3 else 1e-10,
+            )
+            plus = state_vector.copy(); plus[column] += step
+            minus = state_vector.copy(); minus[column] -= step
+            plus_elements = cartesian_to_elements(plus[:3], plus[3:6])
+            minus_elements = cartesian_to_elements(minus[:3], minus[3:6])
+            plus_q = plus_elements[0] * (1.0 - plus_elements[1])
+            minus_q = minus_elements[0] * (1.0 - minus_elements[1])
+            q_state_gradient[column] = (plus_q - minus_q) / (2.0 * step)
+            plus_peri = _perihelion_offset_days_from_state(plus, near_parabolic)
+            minus_peri = _perihelion_offset_days_from_state(minus, near_parabolic)
+            # T = epoch - elapsed time, hence the minus sign.  It vanishes
+            # after squaring but documents the quantity being propagated.
+            peri_state_gradient[column] = -(plus_peri - minus_peri) / (2.0 * step)
+        q_sigma = float(np.sqrt(max(
+            0.0, q_state_gradient @ state_covariance @ q_state_gradient,
+        )))
         mean_motion_rad = 0.01720209895 / abs(a) ** 1.5
         mean_motion_deg = np.degrees(mean_motion_rad)
         mean_motion_sigma = abs(1.5 * mean_motion_deg / a) * sigma[0]
-        peri_gradient = np.zeros(6)
-        anomaly_for_perihelion = (
-            (mean_anomaly + 180.0) % 360.0 - 180.0
-            if e < 1.0 else mean_anomaly
-        )
-        mean_radians = np.radians(anomaly_for_perihelion)
-        peri_gradient[0] = -1.5 * mean_radians / (a * mean_motion_rad)
-        peri_gradient[5] = -np.pi / (180.0 * mean_motion_rad)
-        peri_sigma = float(np.sqrt(max(0.0, peri_gradient @ element_covariance @ peri_gradient)))
+        peri_sigma = float(np.sqrt(max(
+            0.0, peri_state_gradient @ state_covariance @ peri_state_gradient,
+        )))
         names = ("a", "e", "i", "node", "arg_peri", "mean_anomaly")
         uncertainties = {name: float(value) for name, value in zip(names, sigma)}
         uncertainties.update({

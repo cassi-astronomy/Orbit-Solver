@@ -34,6 +34,7 @@ from orbit_app.planetary import PLANETS
 from orbit_app.orbit_fit import (
     _automatic_orbit_score, _isolated_latest_batch,
     _observation_offsets_gcrs, _observation_sigma_arcsec,
+    _perihelion_offset_days_from_state,
     _truncate_rows_to_recent_years, fit_selection_count, parse_observation_time,
 )
 from orbit_app.photometry import estimate_absolute_magnitude, power_law_magnitude
@@ -482,6 +483,15 @@ class PreviewGeometryTests(unittest.TestCase):
 
 
 class OrbitFitSelectionTests(unittest.TestCase):
+    def test_parabolic_perihelion_offset_is_finite_at_singularity(self):
+        q = 3.2
+        state = np.array([q, 0.0, 0.0, 0.0, math.sqrt(2.0 * MU_SUN / q), 0.0])
+        self.assertAlmostEqual(_perihelion_offset_days_from_state(state), 0.0)
+        perturbed = state.copy(); perturbed[0] += 1e-7
+        self.assertTrue(np.isfinite(
+            _perihelion_offset_days_from_state(perturbed, force_parabolic=True)
+        ))
+
     def test_isolated_latest_station_batch_is_detected(self):
         start = datetime(2026, 10, 5, tzinfo=timezone.utc)
         observations = [
