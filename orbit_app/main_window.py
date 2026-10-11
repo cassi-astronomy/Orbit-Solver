@@ -16,7 +16,7 @@ os.environ.setdefault("QT_API", "pyside6")
 
 from PySide6.QtCore import (
     QAbstractTableModel, QByteArray, QItemSelectionModel, QModelIndex, QObject,
-    QThread, Qt, QTimer, QUrl, Signal, Slot,
+    QThread, Qt, QTimer, QUrl, QUrlQuery, Signal, Slot,
 )
 from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
@@ -546,11 +546,133 @@ class MpcNetworkClient(QObject):
                 body = json.loads(bytes(reply.readAll()).decode("utf-8"))
                 solution = parse_mpc_orbit(body, designation)
             except (UnicodeDecodeError, json.JSONDecodeError, OrbitParseError) as exc:
+                if re.fullmatch(r"D/1993\s+F2-[A-HJ-NP-W]", designation, re.I):
+                    self._request_sl9_horizons_metadata(designation)
+                    return
                 self.orbit_error.emit(str(exc))
                 return
             self.orbit_success.emit(solution)
         finally:
             reply.deleteLater()
+
+    @staticmethod
+    def _sl9_spk_id(designation: str) -> int:
+        letter = designation.strip().upper().rsplit("-", 1)[-1]
+        letters = "ABCDEFGHJKLMNPQRSTUVW"
+        return 1000181 + letters.index(letter)
+
+    def _request_sl9_horizons_metadata(self, designation: str) -> None:
+        spk_id = self._sl9_spk_id(designation)
+        url = QUrl("https://ssd.jpl.nasa.gov/api/horizons.api")
+        query = QUrlQuery()
+        for key, value in (
+            ("format", "json"), ("COMMAND", f"'DES={spk_id};'"),
+            ("OBJ_DATA", "'YES'"), ("MAKE_EPHEM", "'NO'"),
+        ):
+            query.addQueryItem(key, value)
+        url.setQuery(query)
+        request = QNetworkRequest(url)
+        request.setRawHeader(b"User-Agent", b"OrbitSolver/1.0")
+        request.setTransferTimeout(30_000)
+        reply = self.manager.get(request); self._active.add(reply)
+        reply.finished.connect(
+            lambda: self._sl9_metadata_finished(reply, designation, spk_id)
+        )
+
+    def _sl9_metadata_finished(
+        self, reply: QNetworkReply, designation: str, spk_id: int,
+    ) -> None:
+        self._active.discard(reply)
+        try:
+            if reply.error() != QNetworkReply.NoError:
+                self.orbit_error.emit(f"JPL Horizons dotaz selhal: {reply.errorString()}")
+                return
+            body = json.loads(bytes(reply.readAll()).decode("utf-8"))
+            result = str(body.get("result") or "")
+            match = re.search(r"\bEPOCH=\s*([0-9.]+)", result)
+            if match is None:
+                self.orbit_error.emit("JPL Horizons nevrátil epochu fragmentu SL9.")
+                return
+            self._request_sl9_horizons_vector(designation, spk_id, float(match.group(1)))
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            self.orbit_error.emit(f"JPL Horizons vrátil nečitelná data: {exc}")
+        finally:
+            reply.deleteLater()
+
+    def _request_sl9_horizons_vector(
+        self, designation: str, spk_id: int, epoch_jd: float,
+    ) -> None:
+        url = QUrl("https://ssd.jpl.nasa.gov/api/horizons.api")
+        query = QUrlQuery()
+        parameters = (
+            ("format", "json"), ("COMMAND", f"'DES={spk_id};'"),
+            ("OBJ_DATA", "'YES'"), ("MAKE_EPHEM", "'YES'"),
+            ("EPHEM_TYPE", "'VECTORS'"), ("CENTER", "'500@10'"),
+            ("TLIST", f"'{epoch_jd:.8f}'"), ("TLIST_TYPE", "'JD'"),
+            ("OUT_UNITS", "'AU-D'"), ("REF_PLANE", "'ECLIPTIC'"),
+            ("VEC_TABLE", "'2'"), ("VEC_CORR", "'NONE'"),
+        )
+        for key, value in parameters:
+            query.addQueryItem(key, value)
+        url.setQuery(query)
+        request = QNetworkRequest(url)
+        request.setRawHeader(b"User-Agent", b"OrbitSolver/1.0")
+        request.setTransferTimeout(30_000)
+        reply = self.manager.get(request); self._active.add(reply)
+        reply.finished.connect(
+            lambda: self._sl9_vector_finished(reply, designation, epoch_jd)
+        )
+
+    def _sl9_vector_finished(
+        self, reply: QNetworkReply, designation: str, epoch_jd: float,
+    ) -> None:
+        self._active.discard(reply)
+        try:
+            if reply.error() != QNetworkReply.NoError:
+                self.orbit_error.emit(f"JPL Horizons dotaz selhal: {reply.errorString()}")
+                return
+            body = json.loads(bytes(reply.readAll()).decode("utf-8"))
+            result = str(body.get("result") or "")
+            self.orbit_success.emit(
+                self._parse_sl9_horizons_vector(result, designation, epoch_jd)
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, OrbitParseError) as exc:
+            self.orbit_error.emit(f"JPL Horizons stav SL9 nelze načíst: {exc}")
+        finally:
+            reply.deleteLater()
+
+    @staticmethod
+    def _parse_sl9_horizons_vector(
+        result: str, designation: str, epoch_jd: float,
+    ) -> OrbitSolution:
+        # OBJ_DATA contains another cartesian state in the ICRF frame.  Only
+        # the requested AU/day ecliptic vector between the ephemeris sentinels
+        # is suitable for the application's J2000-ecliptic dynamics.
+        ephemeris = re.search(r"\$\$SOE(.*?)\$\$EOE", result, re.S)
+        if ephemeris is None:
+            raise ValueError("vektor není ve výsledku")
+        block = ephemeris.group(1)
+        number = r"([+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+\-]?\d+)?)"
+        position = re.search(
+            rf"X\s*=\s*{number}\s+Y\s*=\s*{number}\s+Z\s*=\s*{number}", block
+        )
+        velocity = re.search(
+            rf"VX\s*=\s*{number}\s+VY\s*=\s*{number}\s+VZ\s*=\s*{number}", block
+        )
+        if position is None or velocity is None:
+            raise ValueError("vektor není ve výsledku")
+        state = np.array([float(value) for value in (*position.groups(), *velocity.groups())])
+        a, e, inc, node, arg_peri, mean = cartesian_to_elements(state[:3], state[3:])
+        name_match = re.search(r"Target body name:\s*([^\r\n{]+)", result)
+        display = name_match.group(1).strip() if name_match else designation
+        return OrbitSolution(
+            designation=designation, display_name=display, epoch_jd=epoch_jd,
+            semi_major_axis_au=a, eccentricity=e, inclination_deg=inc,
+            node_deg=node, arg_peri_deg=arg_peri, mean_anomaly_deg=mean,
+            photometric_exponent=4.0, phase_correction=False,
+            position_au=tuple(state[:3]), velocity_au_per_day=tuple(state[3:]),
+            data_source="JPL Horizons",
+        )
 
     def _identifier_finished(self, reply: QNetworkReply, designation: str) -> None:
         self._active.discard(reply)
@@ -4219,7 +4341,9 @@ class MainWindow(QMainWindow):
         self._apply_solution(solution)
         self.object_title.setText(self.current_display_name)
         observation_note = f" • {len(self.current_observations)} pozorování" if self.current_observations else ""
-        self.object_label.setText(f"Výchozí kartézský stav MPC{observation_note}")
+        self.object_label.setText(
+            f"Výchozí kartézský stav {solution.data_source}{observation_note}"
+        )
         if continue_with_fit:
             self.statusBar().showMessage(
                 "Výchozí dráha MPC načtena; spouštím vlastní fit z astrometrie…"

@@ -56,6 +56,7 @@ class OrbitSolution:
     display_name: str | None = None
     nongravitational_parameters: dict[str, float] | None = None
     dynamical_1a: dict[str, float | str] | None = None
+    data_source: str = "MPC"
 
 
 @dataclass(slots=True)

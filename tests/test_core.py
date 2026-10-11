@@ -8,7 +8,7 @@ import numpy as np
 
 from orbit_app.domain import Observation, OrbitSolution
 from orbit_app.main_window import (
-    CONSTELLATION_LABELS, CONSTELLATION_LINES, ElementsPanel, ObservationModel,
+    CONSTELLATION_LABELS, CONSTELLATION_LINES, ElementsPanel, MpcNetworkClient, ObservationModel,
     PlaybackBar, SkyPanel, SolarSystemPanel,
     datetime_from_jd, equatorial_ra_ticks, format_dec_sexagesimal, format_ra_sexagesimal,
     is_comet_designation, observation_residual_score, observations_to_tsv, parse_output_epoch,
@@ -199,6 +199,31 @@ class ObservationResidualTests(unittest.TestCase):
 
 
 class MpcParsingTests(unittest.TestCase):
+    def test_sl9_fragment_ids_skip_unused_i_and_o_letters(self):
+        self.assertEqual(MpcNetworkClient._sl9_spk_id("D/1993 F2-A"), 1000181)
+        self.assertEqual(MpcNetworkClient._sl9_spk_id("D/1993 F2-J"), 1000189)
+        self.assertEqual(MpcNetworkClient._sl9_spk_id("D/1993 F2-W"), 1000201)
+
+    def test_sl9_horizons_parser_uses_requested_ecliptic_ephemeris_block(self):
+        result = """
+Target body name: Shoemaker-Levy 9-A
+ Initial ICRF cartesian coordinates:
+ X = 9.900000000E+01 Y = 9.900000000E+01 Z = 9.900000000E+01
+ VX= 9.900000000E+01 VY= 9.900000000E+01 VZ= 9.900000000E+01
+$$SOE
+ 2449480.500000000 = A.D. 1994-May-08 00:00:00.0000 TDB
+ X = 5.000000000E+00 Y = 1.000000000E-01 Z = -2.000000000E-02
+ VX= -1.000000000E-04 VY= 7.000000000E-03 VZ= 1.000000000E-04
+$$EOE
+"""
+        solution = MpcNetworkClient._parse_sl9_horizons_vector(
+            result, "D/1993 F2-A", 2449480.5,
+        )
+        self.assertEqual(solution.data_source, "JPL Horizons")
+        self.assertEqual(solution.display_name, "Shoemaker-Levy 9-A")
+        np.testing.assert_allclose(solution.position_au, [5.0, .1, -.02])
+        np.testing.assert_allclose(solution.velocity_au_per_day, [-.0001, .007, .0001])
+
     def test_ec0001_reference_file_has_24_observations(self):
         path = Path(__file__).with_name("data") / "ec0001.obs"
         observations = parse_mpc80(path.read_text(encoding="utf-8"))

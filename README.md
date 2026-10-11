@@ -73,6 +73,9 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
   planetárním setkání;
 - volitelný lokální planetocentrický pohled pro zachycené objekty; lunární
   perturbace jsou zahrnuty (z DE440, nebo přibližným modelem bez něj).
+- fragmenty komety Shoemaker–Levy 9 lze načíst jejich úplným označením, například
+  `D/1993 F2-A`; pokud MPC neposkytne kartézský stav, program automaticky použije
+  historický heliocentrický ekliptikální vektor příslušného fragmentu z JPL Horizons.
 
 ## Požadavky
 
@@ -174,8 +177,8 @@ aplikací nutné porovnat s MPC, JPL Horizons nebo jiným nezávislým softwarem
   kliknutím stáhnout a aktivovat JPL DE440 (přibližně 114 MB, 1549–2650).
   Výpočty mimo pokrytí aktivního kernelu program odmítne místo tichého přechodu
   na méně přesný model.
-- Samostatný Měsíc, Pluto, relativistické členy a perturbace hmotných planetek
-  zatím nejsou v dynamickém modelu zahrnuty.
+- Samostatný Měsíc je zahrnut; Pluto, relativistické členy a perturbace hmotných
+  planetek zatím v dynamickém modelu zahrnuty nejsou.
 - Konstantní A1/A2/A3 při integraci komety přes mnoho návratů jsou modelový
   předpoklad; skutečná negravitační aktivita komety se může mezi návraty měnit.
 - Velmi těsné průlety u povrchu Jupiteru zatím nezahrnují jeho zploštění ani
