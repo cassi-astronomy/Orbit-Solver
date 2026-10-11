@@ -4,6 +4,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
+from scipy.interpolate import CubicSpline
 from scipy.optimize import least_squares
 
 from .domain import Observation, OrbitSolution
@@ -16,10 +17,37 @@ from .orbit_engine import MU_SUN, NBodyIntegrator, StateVector
 from .planetary import PLANETS
 
 C_AU_PER_DAY = 173.1446326846693
+_PLANET_NAMES = (
+    "mercury", "venus", "earth", "mars",
+    "jupiter", "saturn", "uranus", "neptune",
+)
 
 
 class OrbitFitError(RuntimeError):
     pass
+
+
+class _InterpolatedPlanetEphemeris:
+    """Dense short-arc cache around an underlying planetary ephemeris."""
+
+    def __init__(self, source, start_jd: float, stop_jd: float, step_days: float = 0.125):
+        self.source = source
+        count = max(5, int(np.ceil((stop_jd - start_jd) / step_days)) + 1)
+        self.epochs = np.linspace(start_jd, stop_jd, count)
+        self.splines = {
+            body: CubicSpline(
+                self.epochs,
+                np.vstack([source.position(body, float(epoch)) for epoch in self.epochs]),
+                axis=0,
+            )
+            for body in _PLANET_NAMES
+        }
+
+    def position(self, body: str, jd: float) -> np.ndarray:
+        epoch = float(jd)
+        if epoch < self.epochs[0] or epoch > self.epochs[-1]:
+            return np.asarray(self.source.position(body, epoch), dtype=float)
+        return np.asarray(self.splines[body.lower()](epoch), dtype=float)
 
 
 def _equatorial_to_ecliptic(vectors: np.ndarray) -> np.ndarray:
@@ -194,8 +222,12 @@ def parse_observation_time(value: str) -> datetime:
 
 def _equatorial_direction(
     states: np.ndarray, epochs: np.ndarray, station_offsets: np.ndarray | None = None,
+    earth_positions: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    earth = earth_heliocentric_ecliptic(epochs)
+    earth = (
+        earth_heliocentric_ecliptic(epochs)
+        if earth_positions is None else np.asarray(earth_positions, dtype=float)
+    )
     vectors = states[:, :3] - earth
     eps = np.radians(23.4392911)
     equatorial = np.column_stack((
@@ -410,6 +442,12 @@ def initial_orbit_from_observations(
     sample_dec = np.asarray([item[3] for item in sample])
     sample_offsets = _observation_offsets_gcrs(sample)
     sample_sigmas = _observation_sigmas(sample)
+    # Every trial state is compared at the same observation epochs.  Reading
+    # the DE kernel for Earth's position inside each range/range-rate trial
+    # dominated short-arc solve time, even though those positions never
+    # change.  Compute them once and reuse them for both light-time and sky
+    # direction calculations.
+    sample_earth = earth_heliocentric_ecliptic(sample_epochs)
     # Initial range/range-rate search needs only the broad basin of attraction.
     # Over a short discovery arc a solar two-body model is sufficient and is
     # far cheaper than evaluating all eight planetary perturbers hundreds of
@@ -436,10 +474,13 @@ def initial_orbit_from_observations(
             vector = state_for(parameters)
             state = StateVector(reference_epoch, vector[:3], vector[3:])
             propagated = engine.propagate(state, sample_epochs)
-            earth = earth_heliocentric_ecliptic(sample_epochs)
-            light_time = np.linalg.norm(propagated[:, :3] - earth, axis=1) / C_AU_PER_DAY
+            light_time = np.linalg.norm(
+                propagated[:, :3] - sample_earth, axis=1
+            ) / C_AU_PER_DAY
             emitted = engine.propagate(state, sample_epochs - light_time)
-            computed_ra, computed_dec = _equatorial_direction(emitted, sample_epochs, sample_offsets)
+            computed_ra, computed_dec = _equatorial_direction(
+                emitted, sample_epochs, sample_offsets, sample_earth,
+            )
             delta_ra = (computed_ra - sample_ra + 180.0) % 360.0 - 180.0
             delta_ra *= np.cos(np.radians(sample_dec))
             physical = np.column_stack((delta_ra, computed_dec - sample_dec)).ravel() * 3600.0
@@ -593,7 +634,7 @@ def _fit_orbit_once(
             for index, name in enumerate(nongrav_names)
         }
 
-    full_engine = NBodyIntegrator(
+    exact_full_engine = NBodyIntegrator(
         PLANETS, relative_tolerance=3e-11, absolute_tolerance=2e-13,
         nongravitational_parameters=initial_nongrav,
     )
@@ -606,6 +647,16 @@ def _fit_orbit_once(
     # the full DE ephemeris, so this shortcut does not become the reported
     # orbit.
     use_fast_differential_correction = arc_days <= 30.0 and not nongrav_names
+    full_ephemeris = (
+        _InterpolatedPlanetEphemeris(
+            PLANETS, float(np.min(epochs)) - 2.0, float(np.max(epochs)) + 2.0,
+        )
+        if use_fast_differential_correction else PLANETS
+    )
+    full_engine = NBodyIntegrator(
+        full_ephemeris, relative_tolerance=3e-11, absolute_tolerance=2e-13,
+        nongravitational_parameters=initial_nongrav,
+    )
     optimizer_engine = (
         NBodyIntegrator(
             PLANETS, perturbers=(), relative_tolerance=3e-11,
@@ -621,7 +672,7 @@ def _fit_orbit_once(
         parameters = nongrav_from_vector(vector)
         if parameters != engine.nongravitational_parameters:
             engine = NBodyIntegrator(
-                PLANETS, perturbers=engine.perturbers,
+                engine.ephemeris, perturbers=engine.perturbers,
                 relative_tolerance=engine.rtol, absolute_tolerance=engine.atol,
                 nongravitational_parameters=parameters,
             )
@@ -638,19 +689,25 @@ def _fit_orbit_once(
         np.array([initial_nongrav.get(name, 0.0) / 1e-8 for name in nongrav_names]),
     ))
     initial_vector = np.concatenate((
-        propagate(source_parameters, source_state, np.array([reference_epoch]), full_engine)[0],
+        propagate(
+            source_parameters, source_state, np.array([reference_epoch]), exact_full_engine,
+        )[0],
         source_parameters[6:],
     ))
+    earth_at_observations = earth_heliocentric_ecliptic(epochs)
 
     def astrometric_residuals(
         vector: np.ndarray, engine: NBodyIntegrator = optimizer_engine,
     ) -> np.ndarray:
         state = StateVector(reference_epoch, vector[:3], vector[3:6])
         propagated = propagate(vector, state, epochs, engine)
-        earth = earth_heliocentric_ecliptic(epochs)
-        light_time = np.linalg.norm(propagated[:, :3] - earth, axis=1) / C_AU_PER_DAY
+        light_time = np.linalg.norm(
+            propagated[:, :3] - earth_at_observations, axis=1
+        ) / C_AU_PER_DAY
         emitted = propagate(vector, state, epochs - light_time, engine)
-        computed_ra, computed_dec = _equatorial_direction(emitted, epochs, observer_offsets)
+        computed_ra, computed_dec = _equatorial_direction(
+            emitted, epochs, observer_offsets, earth_at_observations,
+        )
         delta_ra = (computed_ra - observed_ra + 180.0) % 360.0 - 180.0
         delta_ra *= np.cos(np.radians(observed_dec))
         delta_dec = computed_dec - observed_dec
@@ -781,7 +838,9 @@ def _fit_orbit_once(
     report_emitted = propagate(
         result.x, report_state, report_epochs - report_light_time, full_engine
     )
-    computed_ra, computed_dec = _equatorial_direction(report_emitted, report_epochs, report_offsets)
+    computed_ra, computed_dec = _equatorial_direction(
+        report_emitted, report_epochs, report_offsets, report_earth,
+    )
     observed_minus_computed_ra = (report_ra - computed_ra + 180.0) % 360.0 - 180.0
     observed_minus_computed_ra *= np.cos(np.radians(report_dec)) * 3600.0
     observed_minus_computed_dec = (report_dec - computed_dec) * 3600.0
