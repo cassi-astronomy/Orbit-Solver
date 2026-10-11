@@ -3833,6 +3833,14 @@ class OrbitConstraintsDialog(QDialog):
             dynamics_note.setWordWrap(True)
             dynamics_note.setObjectName("muted")
             form.addRow(dynamics_note)
+            comparison_note = QLabel(
+                "Pro přímé porovnání s publikovanou dráhou zapněte stejnou sadu "
+                "parametrů. Například řešení JPL s A1+A2 nelze přesně porovnávat "
+                "s fitem A1+A2+A3; volný A3 může kvůli korelacím posunout i A1 a A2."
+            )
+            comparison_note.setWordWrap(True)
+            comparison_note.setObjectName("muted")
+            form.addRow(comparison_note)
         note = QLabel(
             (
                 "Fixace elementů je vynucena během diferenciální korekce. Pro parabolickou "

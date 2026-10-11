@@ -610,6 +610,9 @@ def _fit_orbit_once(
     constraints: dict[str, float] | None = None,
     truncate_years: float | None = None,
     nongravitational: dict[str, float] | None = None,
+    maximum_observations: int | None = 120,
+    max_nfev: int | None = None,
+    robust_loss: bool = False,
 ) -> tuple[OrbitSolution, float, int]:
     derived_initial = initial is None
     if initial is None:
@@ -635,9 +638,9 @@ def _fit_orbit_once(
         raise OrbitFitError("Pro vlastní fit je potřeba alespoň šest platných astrometrických pozorování.")
     usable.sort(key=lambda item: item[1])
     # Bound interactive run time while retaining the full time baseline.
-    if len(usable) > 120:
+    if maximum_observations is not None and len(usable) > maximum_observations:
         all_usable_epochs = dynamical_jd([item[1] for item in usable])
-        indices = _representative_indices(all_usable_epochs, 120)
+        indices = _representative_indices(all_usable_epochs, maximum_observations)
         usable = [usable[index] for index in indices]
     usable_times = [item[1] for item in usable]
     epochs = dynamical_jd(usable_times)
@@ -798,8 +801,12 @@ def _fit_orbit_once(
         method="trf",
         x_scale=("jac" if derived_initial else fine_scale),
         bounds=(lower_bounds, upper_bounds),
-        loss="linear",
-        max_nfev=100 if derived_initial else 24,
+        loss="soft_l1" if robust_loss else "linear",
+        f_scale=3.0,
+        max_nfev=(
+            max_nfev if max_nfev is not None
+            else 100 if derived_initial else 24
+        ),
         verbose=0,
     )
     if use_fast_differential_correction:
@@ -985,24 +992,47 @@ def fit_orbit(
     # A11HAVq does).  Only actual post-fit residuals may trigger rejection.
     result = _fit_orbit_once(
         observations, initial, constraints, truncate_years, nongravitational,
+        maximum_observations=120,
     )
     if not constraints and not nongravitational:
         result = _prefer_parabolic_short_arc(observations, result, truncate_years)
+    # The representative subset above is only a fast route into the correct
+    # basin.  A1/A2/A3 and their covariance are sensitive to the full time and
+    # station distribution, so the reported solution must be corrected using
+    # every enabled measurement.  Starting from the subset solution normally
+    # needs only a few iterations.
+    result = _fit_orbit_once(
+        observations, result[0], constraints, truncate_years, nongravitational,
+        maximum_observations=None, max_nfev=12, robust_loss=True,
+    )
     # Traditional post-fit rejection remains useful for isolated blunders
     # which do not form a separated final batch.  Remove at most one pass so a
     # weak preliminary orbit cannot cascade into wholesale data rejection.
-    if not constraints and not nongravitational:
-        outliers = [
+    if not constraints:
+        candidates = [
             item for item in observations
             if not item.excluded_from_fit and item.used_in_fit
             and _normalized_observation_residual(item) > 3.0
         ]
+        active_count = sum(
+            not item.excluded_from_fit and bool(item.used_in_fit)
+            for item in observations
+        )
+        # A bad provisional solution must not erase a large fraction of the
+        # arc in one automatic pass. Keep at least 95% and remove the worst
+        # normalized residuals first; the user can inspect/reject more later.
+        maximum_rejections = max(1, int(np.ceil(active_count * .05)))
+        outliers = sorted(
+            candidates, key=_normalized_observation_residual, reverse=True,
+        )[:maximum_rejections]
         if outliers and len(observations) - len(outliers) >= 6:
             for observation in outliers:
                 observation.excluded_from_fit = True
                 observation.raw["automatic_exclusion"] = True
             result = _fit_orbit_once(
                 observations, result[0], constraints, truncate_years, nongravitational,
+                maximum_observations=None, max_nfev=12,
             )
-            result = _prefer_parabolic_short_arc(observations, result, truncate_years)
+            if not nongravitational:
+                result = _prefer_parabolic_short_arc(observations, result, truncate_years)
     return result

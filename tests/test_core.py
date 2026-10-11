@@ -542,6 +542,46 @@ class PreviewGeometryTests(unittest.TestCase):
 
 
 class OrbitFitSelectionTests(unittest.TestCase):
+    def test_fit_uses_subset_only_as_seed_then_all_observations(self):
+        solution = OrbitSolution(
+            "C/2023 A3", 2460400.5, -4000.0, 1.0001, 139.0,
+            21.5, 308.5, 0.0,
+            position_au=(1.0, 0.0, 0.0), velocity_au_per_day=(0.0, .02, 0.0),
+        )
+        candidate = (solution, .8, 120)
+        final = (solution, .7, 6314)
+        observations = [Observation() for _ in range(6)]
+        with patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=[candidate, final]) as mocked:
+            result = fit_orbit(observations, solution, constraints={"e": 1.0001})
+        self.assertEqual(result[2], 6314)
+        self.assertEqual(mocked.call_args_list[0].kwargs["maximum_observations"], 120)
+        self.assertIsNone(mocked.call_args_list[1].kwargs["maximum_observations"])
+        self.assertTrue(mocked.call_args_list[1].kwargs["robust_loss"])
+
+    def test_nongravitational_fit_still_filters_worst_outlier(self):
+        solution = OrbitSolution(
+            "C/2023 A3", 2460400.5, -4000.0, 1.0001, 139.0,
+            21.5, 308.5, 0.0,
+            position_au=(1.0, 0.0, 0.0), velocity_au_per_day=(0.0, .02, 0.0),
+        )
+        observations = [Observation(ra_deg=1.0, dec_deg=2.0) for _ in range(20)]
+
+        def staged_fit(*_args, **_kwargs):
+            if staged_fit.calls == 1:
+                for index, observation in enumerate(observations):
+                    observation.used_in_fit = True
+                    observation.residual_ra_arcsec = 10.0 if index == 0 else .1
+                    observation.residual_dec_arcsec = .1
+            staged_fit.calls += 1
+            return solution, .7, len(observations)
+
+        staged_fit.calls = 0
+        with patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=staged_fit) as mocked:
+            fit_orbit(observations, solution, nongravitational={"A1": 1e-8})
+        self.assertEqual(mocked.call_count, 3)
+        self.assertTrue(observations[0].excluded_from_fit)
+        self.assertTrue(observations[0].raw["automatic_exclusion"])
+
     def test_interpolated_ephemeris_includes_the_moon(self):
         start = 2451545.0
         cached = _InterpolatedPlanetEphemeris(PLANETS, start, start + 1.0)
@@ -631,7 +671,9 @@ class OrbitFitSelectionTests(unittest.TestCase):
         ):
             result = fit_orbit(observations, None)
         self.assertIs(result, candidate)
-        fit_once.assert_called_once()
+        self.assertEqual(fit_once.call_count, 2)
+        self.assertIsNone(fit_once.call_args_list[0].args[1])
+        self.assertIs(fit_once.call_args_list[1].args[1], solution)
         self.assertTrue(all(not item.excluded_from_fit for item in observations))
 
     def test_automatic_score_discourages_strong_short_arc_hyperbola(self):
