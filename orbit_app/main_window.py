@@ -1065,15 +1065,29 @@ class OrbitEvolutionPanel(QWidget):
         self.result = result
         self.copy_report.setEnabled(True); self.save_report.setEnabled(True)
         self.evolution_ready.emit(self.solution, result)
-        self.note.setText(
-            f"{result.model_note}  Krok vyhledávání událostí: {result.sample_step_days:.2f} dne. "
+        phase_note = (
+            "Vstup a výstup jsou oskulační stavy na hranicích zvoleného intervalu. "
+            "Svislé značky v grafu ukazují planetární setkání. Dvojklikem zobrazíte stav "
+            "ve Sluneční soustavě."
+            if result.snapshots else
             "Dvojklikem na návrat jej zobrazíte ve Sluneční soustavě."
         )
-        self.returns.setRowCount(len(result.returns))
-        for row, item in enumerate(result.returns):
+        self.note.setText(
+            f"{result.model_note}  Krok vyhledávání událostí: {result.sample_step_days:.2f} dne. "
+            f"{phase_note}"
+        )
+        displayed_states = result.snapshots or result.returns
+        if result.snapshots:
+            self.returns.setHorizontalHeaderItem(0, QTableWidgetItem("Fáze"))
+            self.returns.setHorizontalHeaderItem(1, QTableWidgetItem("Epocha (UTC)"))
+        else:
+            self.returns.setHorizontalHeaderItem(0, QTableWidgetItem("Návrat"))
+            self.returns.setHorizontalHeaderItem(1, QTableWidgetItem("Perihelium (UTC)"))
+        self.returns.setRowCount(len(displayed_states))
+        for row, item in enumerate(displayed_states):
             date = datetime_from_jd(item.epoch_jd)
             values = (
-                f"{item.index:+d}" if item.index else "0",
+                item.phase if result.snapshots else (f"{item.index:+d}" if item.index else "0"),
                 date.strftime("%Y-%m-%d %H:%M") if date else f"JD {item.epoch_jd:.2f}",
                 f"{item.perihelion_au:.6f}", f"{item.eccentricity:.8f}",
                 f"{item.semi_major_axis_au:.6f}",
@@ -1096,27 +1110,53 @@ class OrbitEvolutionPanel(QWidget):
             )
             for column, value in enumerate(values):
                 self.encounters.setItem(row, column, QTableWidgetItem(value))
+        if result.snapshots:
+            reciprocal_index = self.graph_metric.findData("reciprocal_a")
+            if reciprocal_index >= 0:
+                self.graph_metric.setCurrentIndex(reciprocal_index)
         self._draw_result()
 
     def _draw_result(self) -> None:
         ax = self.canvas.axes; ax.clear(); self.canvas.style_axes()
-        if not self.result or not self.result.returns:
+        if not self.result or not (self.result.returns or self.result.snapshots):
             ax.text(.5, .5, "V zadaném rozsahu nebylo nalezeno perihelium.",
                     ha="center", va="center", transform=ax.transAxes, color="#afc2d8")
             self.canvas.draw_idle(); return
         metric_key = str(self.graph_metric.currentData() or "q")
         attribute, y_label, title_label = self.GRAPH_METRICS[metric_key]
-        x = np.array([item.index for item in self.result.returns], dtype=float)
+        displayed_states = self.result.snapshots or self.result.returns
+        if self.result.snapshots:
+            perihelion_epoch = next(
+                item.epoch_jd for item in self.result.snapshots if item.phase == "perihel"
+            )
+            x = np.array([
+                (item.epoch_jd - perihelion_epoch) / 365.25 for item in displayed_states
+            ], dtype=float)
+        else:
+            x = np.array([item.index for item in displayed_states], dtype=float)
         values = np.array([
             np.nan if getattr(item, attribute) is None else float(getattr(item, attribute))
-            for item in self.result.returns
+            for item in displayed_states
         ])
         finite = np.isfinite(values)
         colours = ["#5ca9ff" if value < 0 else "#ffad5c" if value > 0 else "#55e3e9" for value in x]
         ax.plot(x[finite], values[finite], color="#657d99", lw=1.0, alpha=.7)
         ax.scatter(x[finite], values[finite], c=np.asarray(colours)[finite], s=42, zorder=3)
         ax.axvline(0, color="#55e3e9", lw=.8, alpha=.45)
-        ax.set_xlabel("návrat (0 = nejbližší epoše dráhy)")
+        if self.result.snapshots:
+            ax.set_xlabel("roky od perihelu (vstupní → výstupní dráha)")
+            for item, x_value, y_value in zip(displayed_states, x, values):
+                if np.isfinite(y_value):
+                    ax.annotate(item.phase, (x_value, y_value), xytext=(5, 7),
+                                textcoords="offset points", color="#b9cbe0", fontsize=8)
+            for encounter in self.result.encounters:
+                encounter_x = (encounter.epoch_jd - perihelion_epoch) / 365.25
+                ax.axvline(encounter_x, color="#f0c85a", lw=.8, alpha=.5, ls="--")
+                ax.text(encounter_x, .98, PLANET_LABELS.get(encounter.planet, encounter.planet),
+                        transform=ax.get_xaxis_transform(), ha="center", va="top",
+                        color="#f0c85a", fontsize=8)
+        else:
+            ax.set_xlabel("návrat (0 = nejbližší epoše dráhy)")
         ax.set_ylabel(y_label)
         ax.set_title(
             f"{self.solution.display_name or self.solution.designation} — vývoj {title_label}"
@@ -1163,9 +1203,12 @@ class OrbitEvolutionPanel(QWidget):
         self.note.setText(f"Chronologický výstup byl uložen do {path}")
 
     def _open_return(self, row: int, _column: int) -> None:
-        if not self.result or not (0 <= row < len(self.result.returns)):
+        if not self.result:
             return
-        item = self.result.returns[row]
+        displayed_states = self.result.snapshots or self.result.returns
+        if not (0 <= row < len(displayed_states)):
+            return
+        item = displayed_states[row]
         date = datetime_from_jd(item.epoch_jd)
         if date is not None:
             self.show_return.emit(return_solution(self.solution, item), date)

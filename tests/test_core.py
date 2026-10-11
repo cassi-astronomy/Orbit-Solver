@@ -28,7 +28,7 @@ from orbit_app.orbit_engine import (
     nongravitational_acceleration,
 )
 from orbit_app.orbit_evolution import (
-    EvolutionResult, EvolutionReturn, PlanetEncounter, evolution_span,
+    EvolutionResult, EvolutionReturn, EvolutionSnapshot, PlanetEncounter, evolution_span,
     format_evolution_mpc_report, format_evolution_report,
 )
 from orbit_app.planetary import PLANETS
@@ -658,6 +658,30 @@ class NativeIntegratorTests(unittest.TestCase):
         self.assertLess(report.index("SETKÁNÍ"), report.rindex("PERIHELIUM"))
         self.assertIn("Jupiter", report)
         self.assertIn("Martin Mašek", report)
+
+    def test_open_orbit_export_uses_inbound_perihelion_outbound_states(self):
+        solution, base = self._evolution_export_fixture()
+        snapshots = tuple(
+            EvolutionSnapshot(
+                phase, epoch, (0, 0, 0, 0, 0, 0), -0.25, 6.0, 175.0,
+                322.0, 128.0, 1.25, None, -4.0 + offset,
+            )
+            for phase, epoch, offset in (
+                ("vstup", 2460500.0, 0.0),
+                ("perihel", 2461000.0, .001),
+                ("výstup", 2461700.0, .002),
+            )
+        )
+        result = EvolutionResult(
+            base.returns, base.encounters, base.start_jd, base.end_jd,
+            base.sample_step_days, base.model_note, snapshots,
+        )
+        report = format_evolution_report(solution, result)
+        self.assertIn("STAV\t", report)
+        self.assertIn("\tvstup\t", report)
+        self.assertIn("\tperihel\t", report)
+        self.assertIn("\tvýstup\t", report)
+        self.assertNotIn("PERIHELIUM\t", report)
 
     def test_mpc_evolution_export_contains_elements_and_commented_encounter(self):
         solution, result = self._evolution_export_fixture()

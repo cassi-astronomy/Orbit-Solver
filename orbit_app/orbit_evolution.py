@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import re
 
 import numpy as np
 
-from .domain import OrbitSolution
+from .domain import OrbitSolution, is_comet_designation
 from .mpc_orbit import cartesian_to_elements
 from .orbit_engine import MU_SUN, NBodyIntegrator, StateVector
 from .planetary import PLANETS
@@ -52,6 +52,22 @@ class PlanetEncounter:
 
 
 @dataclass(frozen=True, slots=True)
+class EvolutionSnapshot:
+    """Osculating state at an inbound, perihelion, or outbound open-orbit phase."""
+    phase: str
+    epoch_jd: float
+    state: tuple[float, ...]
+    semi_major_axis_au: float
+    eccentricity: float
+    inclination_deg: float
+    node_deg: float
+    arg_peri_deg: float
+    perihelion_au: float
+    period_years: float | None
+    reciprocal_a: float
+
+
+@dataclass(frozen=True, slots=True)
 class EvolutionResult:
     returns: tuple[EvolutionReturn, ...]
     encounters: tuple[PlanetEncounter, ...]
@@ -59,6 +75,7 @@ class EvolutionResult:
     end_jd: float
     sample_step_days: float
     model_note: str
+    snapshots: tuple[EvolutionSnapshot, ...] = field(default_factory=tuple)
 
 
 def _format_jd_utc(jd: float) -> str:
@@ -83,20 +100,22 @@ def format_evolution_report(
         f"Krok vyhledávání událostí [dny]:\t{result.sample_step_days:.6f}",
         f"Model:\t{result.model_note}",
         "",
-        "Chronologický přehled (hodnoty elementů jsou oskulační v perihelu)",
-        "Typ\tDatum UTC\tNávrat / planeta\tq [AU]\te\ta [AU]\tP [roky]\t1/a [AU^-1]"
+        "Chronologický přehled (elementy jsou oskulační v uvedené epoše)",
+        "Typ\tDatum UTC\tFáze / návrat / planeta\tq [AU]\te\ta [AU]\tP [roky]\t1/a [AU^-1]"
         "\ti [deg]\tOmega [deg]\tomega [deg]\tVzdálenost [AU]\tHillovy poloměry"
         "\tv rel. [km/s]\tDelta(1/a) [AU^-1]",
     ]
-    events: list[tuple[float, int, EvolutionReturn | PlanetEncounter]] = []
-    events.extend((item.epoch_jd, 0, item) for item in result.returns)
+    events: list[tuple[float, int, EvolutionReturn | EvolutionSnapshot | PlanetEncounter]] = []
+    orbital_states = result.snapshots or result.returns
+    events.extend((item.epoch_jd, 0, item) for item in orbital_states)
     events.extend((item.epoch_jd, 1, item) for item in result.encounters)
     for _epoch, _event_type, item in sorted(events, key=lambda row: (row[0], row[1])):
-        if isinstance(item, EvolutionReturn):
+        if isinstance(item, (EvolutionReturn, EvolutionSnapshot)):
             period = "" if item.period_years is None else f"{item.period_years:.8f}"
+            marker = item.phase if isinstance(item, EvolutionSnapshot) else f"{item.index:+d}"
             lines.append(
-                "PERIHELIUM\t"
-                f"{_format_jd_utc(item.epoch_jd)}\t{item.index:+d}\t"
+                f"{'STAV' if isinstance(item, EvolutionSnapshot) else 'PERIHELIUM'}\t"
+                f"{_format_jd_utc(item.epoch_jd)}\t{marker}\t"
                 f"{item.perihelion_au:.9f}\t{item.eccentricity:.10f}\t"
                 f"{item.semi_major_axis_au:.9f}\t{period}\t{item.reciprocal_a:.10e}\t"
                 f"{item.inclination_deg:.7f}\t{item.node_deg:.7f}\t"
@@ -190,11 +209,20 @@ def format_evolution_mpc_report(
         "# Řádky začínající # jsou komentáře a planetární setkání.",
         f"# {result.model_note}",
     ]
-    events: list[tuple[float, int, EvolutionReturn | PlanetEncounter]] = []
-    events.extend((item.epoch_jd, 0, item) for item in result.returns)
+    events: list[tuple[float, int, EvolutionReturn | EvolutionSnapshot | PlanetEncounter]] = []
+    orbital_states = result.snapshots or result.returns
+    events.extend((item.epoch_jd, 0, item) for item in orbital_states)
     events.extend((item.epoch_jd, 1, item) for item in result.encounters)
     for _epoch, _kind, item in sorted(events, key=lambda row: (row[0], row[1])):
-        if isinstance(item, EvolutionReturn):
+        if isinstance(item, EvolutionSnapshot):
+            lines.append(
+                f"# STAV {item.phase} — {_format_jd_utc(item.epoch_jd)} UTC; "
+                f"q={item.perihelion_au:.9f} AU; e={item.eccentricity:.10f}; "
+                f"a={item.semi_major_axis_au:.9f} AU; 1/a={item.reciprocal_a:+.10e} AU^-1; "
+                f"i={item.inclination_deg:.7f}; Omega={item.node_deg:.7f}; "
+                f"omega={item.arg_peri_deg:.7f}"
+            )
+        elif isinstance(item, EvolutionReturn):
             lines.append(f"# Návrat {item.index:+d} — {_format_jd_utc(item.epoch_jd)} UTC")
             lines.append(_mpc_return_line(solution, item))
         else:
@@ -275,6 +303,18 @@ def _return_from_state(index: int, epoch: float, state: np.ndarray) -> Evolution
         perihelion_au=float(a * (1.0 - e)),
         period_years=None if period is None else float(period),
         reciprocal_a=float(1.0 / a) if a != 0.0 else float("nan"),
+    )
+
+
+def _snapshot_from_state(phase: str, epoch: float, state: np.ndarray) -> EvolutionSnapshot:
+    item = _return_from_state(0, epoch, state)
+    return EvolutionSnapshot(
+        phase=phase, epoch_jd=item.epoch_jd, state=item.state,
+        semi_major_axis_au=item.semi_major_axis_au,
+        eccentricity=item.eccentricity, inclination_deg=item.inclination_deg,
+        node_deg=item.node_deg, arg_peri_deg=item.arg_peri_deg,
+        perihelion_au=item.perihelion_au, period_years=item.period_years,
+        reciprocal_a=item.reciprocal_a,
     )
 
 
@@ -367,6 +407,28 @@ def calculate_orbit_evolution(
                 delta_reciprocal_a=delta_1a,
             ))
     encounters.sort(key=lambda item: item.epoch_jd)
+    snapshots: tuple[EvolutionSnapshot, ...] = ()
+    comet = (
+        is_comet_designation(solution.designation)
+        or is_comet_designation(solution.display_name or "")
+    )
+    open_source = not (
+        solution.eccentricity < 1.0 and solution.semi_major_axis_au > 0.0
+    )
+    # This view is useful for every single-pass comet, not only an object
+    # already classified as interstellar at the source epoch.  A dynamically
+    # new Oort-cloud comet may arrive weakly bound and leave hyperbolic after
+    # planetary perturbations, while still having exactly one perihelion in a
+    # centuries-long integration.
+    if len(returns) == 1 and (open_source or comet):
+        perihelion = returns[0]
+        perihelion_state = np.asarray(perihelion.state, dtype=float)
+        perihelion_epoch = perihelion.epoch_jd
+        snapshots = (
+            _snapshot_from_state("vstup", float(sample_epochs[0]), states[0]),
+            _snapshot_from_state("perihel", perihelion_epoch, perihelion_state),
+            _snapshot_from_state("výstup", float(sample_epochs[-1]), states[-1]),
+        )
     return EvolutionResult(
         returns=returns, encounters=tuple(encounters), start_jd=start_jd, end_jd=end_jd,
         sample_step_days=sample_step,
@@ -374,6 +436,7 @@ def calculate_orbit_evolution(
             "Orientační výpočet: planetární perturbace a A1/A2/A3 jsou zahrnuty, "
             f"polohy planet používají model {PLANETS.model_name}."
         ),
+        snapshots=snapshots,
     )
 
 
