@@ -1081,13 +1081,15 @@ class OrbitEvolutionPanel(QWidget):
             self.returns.setHorizontalHeaderItem(0, QTableWidgetItem("Fáze"))
             self.returns.setHorizontalHeaderItem(1, QTableWidgetItem("Epocha (UTC)"))
         else:
-            self.returns.setHorizontalHeaderItem(0, QTableWidgetItem("Návrat"))
+            self.returns.setHorizontalHeaderItem(0, QTableWidgetItem("Rok návratu"))
             self.returns.setHorizontalHeaderItem(1, QTableWidgetItem("Perihelium (UTC)"))
         self.returns.setRowCount(len(displayed_states))
         for row, item in enumerate(displayed_states):
             date = datetime_from_jd(item.epoch_jd)
             values = (
-                item.phase if result.snapshots else (f"{item.index:+d}" if item.index else "0"),
+                item.phase if result.snapshots else (
+                    str(date.year) if date else f"JD {item.epoch_jd:.0f}"
+                ),
                 date.strftime("%Y-%m-%d %H:%M") if date else f"JD {item.epoch_jd:.2f}",
                 f"{item.perihelion_au:.6f}", f"{item.eccentricity:.8f}",
                 f"{item.semi_major_axis_au:.6f}",
@@ -1125,38 +1127,54 @@ class OrbitEvolutionPanel(QWidget):
         metric_key = str(self.graph_metric.currentData() or "q")
         attribute, y_label, title_label = self.GRAPH_METRICS[metric_key]
         displayed_states = self.result.snapshots or self.result.returns
-        if self.result.snapshots:
-            perihelion_epoch = next(
-                item.epoch_jd for item in self.result.snapshots if item.phase == "perihel"
-            )
-            x = np.array([
-                (item.epoch_jd - perihelion_epoch) / 365.25 for item in displayed_states
-            ], dtype=float)
-        else:
-            x = np.array([item.index for item in displayed_states], dtype=float)
+        timeline = self.result.timeline or displayed_states
+        x = np.array([2000.0 + (item.epoch_jd - 2451545.0) / 365.25 for item in timeline])
         values = np.array([
+            np.nan if getattr(item, attribute) is None else float(getattr(item, attribute))
+            for item in timeline
+        ])
+        if metric_key in {"node", "arg_peri"}:
+            values = np.degrees(np.unwrap(np.radians(values)))
+        finite = np.isfinite(values)
+        # NaN values (notably the period while an orbit is open) deliberately
+        # break the curve instead of drawing a misleading bridge.
+        ax.plot(x, values, color="#67cfe8", lw=1.45, alpha=.9)
+        return_x = np.array([
+            2000.0 + (item.epoch_jd - 2451545.0) / 365.25 for item in displayed_states
+        ])
+        return_y = np.array([
             np.nan if getattr(item, attribute) is None else float(getattr(item, attribute))
             for item in displayed_states
         ])
-        finite = np.isfinite(values)
-        colours = ["#5ca9ff" if value < 0 else "#ffad5c" if value > 0 else "#55e3e9" for value in x]
-        ax.plot(x[finite], values[finite], color="#657d99", lw=1.0, alpha=.7)
-        ax.scatter(x[finite], values[finite], c=np.asarray(colours)[finite], s=42, zorder=3)
-        ax.axvline(0, color="#55e3e9", lw=.8, alpha=.45)
+        if metric_key in {"node", "arg_peri"} and np.any(np.isfinite(values)):
+            return_y = np.interp(return_x, x[finite], values[finite])
+        return_finite = np.isfinite(return_y)
+        ax.scatter(return_x[return_finite], return_y[return_finite],
+                   color="#f1f5f9", edgecolor="#55e3e9", s=38, zorder=4)
+        source_year = 2000.0 + (self.solution.epoch_jd - 2451545.0) / 365.25
+        ax.axvline(source_year, color="#55e3e9", lw=.8, alpha=.4)
         if self.result.snapshots:
-            ax.set_xlabel("roky od perihelu (vstupní → výstupní dráha)")
-            for item, x_value, y_value in zip(displayed_states, x, values):
+            for item, x_value, y_value in zip(displayed_states, return_x, return_y):
                 if np.isfinite(y_value):
                     ax.annotate(item.phase, (x_value, y_value), xytext=(5, 7),
                                 textcoords="offset points", color="#b9cbe0", fontsize=8)
-            for encounter in self.result.encounters:
-                encounter_x = (encounter.epoch_jd - perihelion_epoch) / 365.25
-                ax.axvline(encounter_x, color="#f0c85a", lw=.8, alpha=.5, ls="--")
-                ax.text(encounter_x, .98, PLANET_LABELS.get(encounter.planet, encounter.planet),
-                        transform=ax.get_xaxis_transform(), ha="center", va="top",
-                        color="#f0c85a", fontsize=8)
         else:
-            ax.set_xlabel("návrat (0 = nejbližší epoše dráhy)")
+            for item, x_value, y_value in zip(displayed_states, return_x, return_y):
+                if np.isfinite(y_value):
+                    date = datetime_from_jd(item.epoch_jd)
+                    ax.annotate(str(date.year) if date else "", (x_value, y_value),
+                                xytext=(4, 6), textcoords="offset points",
+                                color="#b9cbe0", fontsize=8)
+        for encounter in self.result.encounters:
+            encounter_x = 2000.0 + (encounter.epoch_jd - 2451545.0) / 365.25
+            ax.axvline(encounter_x, color="#f0c85a", lw=.9, alpha=.65, ls="--")
+            date = datetime_from_jd(encounter.epoch_jd)
+            label = PLANET_LABELS.get(encounter.planet, encounter.planet)
+            if date:
+                label += f" {date.year}"
+            ax.text(encounter_x, .98, label, transform=ax.get_xaxis_transform(),
+                    ha="center", va="top", color="#f0c85a", fontsize=8)
+        ax.set_xlabel("rok")
         ax.set_ylabel(y_label)
         ax.set_title(
             f"{self.solution.display_name or self.solution.designation} — vývoj {title_label}"
@@ -1329,11 +1347,9 @@ class SolarSystemPanel(QWidget):
         )
         controls.addWidget(self.show_orbit_curtain)
         self.evolution_count = QComboBox()
-        self.evolution_count.addItem("Vývoj dráhy: vypnut", 0)
-        for count in (1, 3, 5, 10):
-            self.evolution_count.addItem(f"Vývoj dráhy: ±{count} návratů", count)
-        self.evolution_count.addItem("Vývoj dráhy: vše", -1)
-        self.evolution_count.setCurrentIndex(2)
+        self.evolution_count.addItem("Integrovaná dráha: vypnuta", 0)
+        self.evolution_count.addItem("Integrovaná dráha: zapnuta", -1)
+        self.evolution_count.setCurrentIndex(1)
         self.evolution_count.setVisible(False)
         self.evolution_count.currentIndexChanged.connect(
             lambda _: self.set_time(self.playback.time.dateTime().toPython())
@@ -1481,7 +1497,35 @@ class SolarSystemPanel(QWidget):
     ) -> None:
         self.evolution_source = source
         self.evolution_result = result
-        self.evolution_count.setVisible(bool(result and result.returns))
+        self.evolution_count.setVisible(bool(
+            result and result.trajectory_epochs is not None
+            and result.trajectory_states is not None
+        ))
+
+    def _integrated_trajectory(self) -> tuple[np.ndarray, np.ndarray] | None:
+        result = self.evolution_result
+        if (
+            result is None or result.trajectory_epochs is None
+            or result.trajectory_states is None
+            or int(self.evolution_count.currentData()) == 0
+        ):
+            return None
+        epochs = result.trajectory_epochs
+        states = result.trajectory_states
+        return epochs, states
+
+    @staticmethod
+    def _trajectory_position(
+        trajectory: tuple[np.ndarray, np.ndarray] | None, epoch_jd: float,
+    ) -> np.ndarray | None:
+        if trajectory is None:
+            return None
+        epochs, states = trajectory
+        if epoch_jd < epochs[0] or epoch_jd > epochs[-1]:
+            return None
+        return np.array([
+            np.interp(epoch_jd, epochs, states[:, coordinate]) for coordinate in range(3)
+        ])
 
     def _visible_radius_au(self) -> float:
         # Logarithmic scale: sub-AU changes get fine control while the same
@@ -1510,45 +1554,31 @@ class SolarSystemPanel(QWidget):
         # viewport when the camera is tilted; pre-clipping therefore produced
         # apparently broken arcs with their ends floating inside the plot.
         # Open conics still need a finite plotting radius near their asymptote.
-        orbit_radius = solar_orbit_clip_radius(self.solution, curve_radius)
-        if self.evolution_result is not None and self.evolution_source is not None:
-            count = int(self.evolution_count.currentData())
-            if count != 0:
-                evolution_items = self.evolution_result.returns
-                if count > 0:
-                    evolution_items = tuple(
-                        item for item in evolution_items if abs(item.index) <= count
-                    )
-                for item in evolution_items:
-                    if item.index == 0:
-                        continue
-                    evolved = return_solution(self.evolution_source, item)
-                    evolved_radius = solar_orbit_clip_radius(evolved, curve_radius)
-                    evolved_xyz, evolved_valid = orbital_curve_xyz(
-                        evolved, max_radius_au=evolved_radius, samples=1400
-                    )
-                    indices = np.flatnonzero(evolved_valid)
-                    if len(indices) < 2:
-                        continue
-                    breaks = np.where(np.diff(indices) > 1)[0] + 1
-                    colour = "#559de8" if item.index < 0 else "#e99a4b"
-                    distance = max(1, abs(item.index))
-                    alpha = max(.16, .48 - .025 * distance)
-                    for segment in np.split(indices, breaks):
-                        if len(segment) < 2:
-                            continue
-                        sx, sy, _ = project_ecliptic_camera(
-                            evolved_xyz[segment], azimuth, elevation
-                        )
-                        ax.plot(sx, sy, color=colour, lw=.9, alpha=alpha, zorder=.45)
-        xyz, valid = orbital_curve_xyz(self.solution, max_radius_au=orbit_radius)
-        valid_indices = np.flatnonzero(valid)
-        if valid_indices.size:
+        current_jd = datetime_to_jd(time)
+        trajectory = self._integrated_trajectory()
+        if trajectory is not None:
+            trajectory_epochs, trajectory_states = trajectory
+            # Plot at most 6000 points; this is visually continuous while a
+            # multi-century integration remains responsive during animation.
+            stride = max(1, int(np.ceil(len(trajectory_epochs) / 6000)))
+            plotted_epochs = trajectory_epochs[::stride]
+            xyz = trajectory_states[::stride, :3]
+            # Let the axes clip the projected curve.  Radial pre-clipping can
+            # cut a tilted orbit whose distant part still projects into view.
+            valid = np.all(np.isfinite(xyz), axis=1)
+            valid_indices = np.flatnonzero(valid)
             breaks = np.where(np.diff(valid_indices) > 1)[0] + 1
-            orbit_segments = [
-                segment for segment in np.split(valid_indices, breaks)
-                if len(segment) > 1
-            ]
+            orbit_segments = [segment for segment in np.split(valid_indices, breaks)
+                              if len(segment) > 1]
+        else:
+            orbit_radius = solar_orbit_clip_radius(self.solution, curve_radius)
+            xyz, valid = orbital_curve_xyz(self.solution, max_radius_au=orbit_radius)
+            plotted_epochs = None
+            valid_indices = np.flatnonzero(valid)
+            breaks = np.where(np.diff(valid_indices) > 1)[0] + 1
+            orbit_segments = [segment for segment in np.split(valid_indices, breaks)
+                              if len(segment) > 1]
+        if orbit_segments:
             if self.show_orbit_curtain.isChecked():
                 for segment in orbit_segments:
                     segment_xyz = xyz[segment]
@@ -1581,12 +1611,24 @@ class SolarSystemPanel(QWidget):
                     screen_x, screen_y, _ = project_ecliptic_camera(
                         xyz[segment], azimuth, elevation
                     )
-                    ax.plot(screen_x, screen_y, color="#52a9ff", lw=1.55, alpha=.92)
+                    if plotted_epochs is None:
+                        ax.plot(screen_x, screen_y, color="#52a9ff", lw=1.55, alpha=.92)
+                    else:
+                        segment_epochs = plotted_epochs[segment]
+                        past = segment_epochs <= current_jd
+                        for mask, colour in ((past, "#19d3c5"), (~past, "#d879ff")):
+                            indices = np.flatnonzero(mask)
+                            if len(indices) < 2:
+                                continue
+                            colour_breaks = np.where(np.diff(indices) > 1)[0] + 1
+                            for colour_segment in np.split(indices, colour_breaks):
+                                if len(colour_segment) > 1:
+                                    ax.plot(screen_x[colour_segment], screen_y[colour_segment],
+                                            color=colour, lw=1.65, alpha=.92)
         planets = (("mercury", "Merkur", .241, "#aaaeb5"), ("venus", "Venuše", .615, "#e4bd70"),
                    ("earth", "Země", 1.0, "#4ea1ff"), ("mars", "Mars", 1.881, "#e0714c"),
                    ("jupiter", "Jupiter", 11.86, "#d0a17a"), ("saturn", "Saturn", 29.46, "#d8c58b"),
                    ("uranus", "Uran", 84.01, "#71d5de"), ("neptune", "Neptun", 164.8, "#537be8"))
-        current_jd = datetime_to_jd(time)
         for key, name, years, color in planets:
             if np.linalg.norm(PLANETS.position(key, current_jd)) > curve_radius * 1.15:
                 continue
@@ -1600,7 +1642,9 @@ class SolarSystemPanel(QWidget):
                        edgecolor="white", linewidth=.45, zorder=5)
             ax.annotate(name, (px, py), xytext=(4, 4), textcoords="offset points",
                         color=color, fontsize=8)
-        current = heliocentric_xyz(self.solution, np.array([datetime_to_jd(time)]))[0]
+        current = self._trajectory_position(trajectory, current_jd)
+        if current is None:
+            current = heliocentric_xyz(self.solution, np.array([current_jd]))[0]
         object_x, object_y, _ = project_ecliptic_camera(current, azimuth, elevation)
         ax.scatter(object_x, object_y, s=42, color="#7fe7ff", edgecolor="white",
                    linewidth=.6, zorder=7)
@@ -2534,6 +2578,7 @@ class PhotometryPanel(QWidget):
         self.solution = solution
         self.observations: list[Observation] = []
         self.canvas = PlotCanvas()
+        self.distance_axes = self.canvas.axes.twinx()
         controls = QHBoxLayout()
         self.kind = QComboBox(); self.kind.addItems(["Planetka", "Kometa – celková jasnost"])
         self.absolute = QDoubleSpinBox(); self.absolute.setRange(-10, 40); self.absolute.setValue(solution.absolute_magnitude)
@@ -2655,7 +2700,12 @@ class PhotometryPanel(QWidget):
 
     def redraw(self) -> None:
         ax = self.canvas.axes
-        ax.clear(); self.canvas.style_axes()
+        distance_ax = self.distance_axes
+        ax.clear(); distance_ax.clear(); self.canvas.style_axes()
+        distance_ax.set_facecolor("none")
+        distance_ax.tick_params(colors="#aebfd3")
+        distance_ax.spines["right"].set_color("#405675")
+        distance_ax.yaxis.label.set_color("#aebfd3")
         start = self.date_from.dateTime().toPython().replace(tzinfo=timezone.utc)
         stop = self.date_to.dateTime().toPython().replace(tzinfo=timezone.utc)
         cursor = self.cursor_time.dateTime().toPython().replace(tzinfo=timezone.utc)
@@ -2668,7 +2718,17 @@ class PhotometryPanel(QWidget):
         magnitude = power_law_magnitude(self.absolute.value(), geom["delta"], geom["r"], self.exponent.value())
         if self.kind.currentIndex() == 0 and self.phase.isChecked():
             magnitude += hg_phase_correction(geom["phase"], self.solution.slope_g)
-        ax.plot(dates, magnitude, color="#55c7ff", lw=2.2)
+        magnitude_line, = ax.plot(
+            dates, magnitude, color="#55c7ff", lw=2.2, label="zdánlivá magnituda"
+        )
+        earth_line, = distance_ax.plot(
+            dates, geom["delta"], color="#55e3a4", lw=1.35, ls="--",
+            label="Δ od Země",
+        )
+        sun_line, = distance_ax.plot(
+            dates, geom["r"], color="#ffb85c", lw=1.35, ls="-.",
+            label="r od Slunce",
+        )
         if start <= cursor <= stop:
             cursor_geom = apparent_geometry(self.solution, np.array([datetime_to_jd(cursor)]))
             cursor_mag = power_law_magnitude(
@@ -2682,6 +2742,16 @@ class PhotometryPanel(QWidget):
                         xytext=(8, 8), textcoords="offset points", color="#ffdf8a", fontsize=9)
         ax.invert_yaxis(); ax.grid(color="#23354d", alpha=.55)
         ax.set_ylabel("Zdánlivá magnituda"); ax.set_xlabel("Datum")
+        distance_ax.set_ylabel("Vzdálenost [AU]")
+        legend = ax.legend(
+            [magnitude_line, earth_line, sun_line],
+            ["zdánlivá magnituda", "Δ od Země", "r od Slunce"],
+            loc="best", framealpha=.72,
+        )
+        legend.get_frame().set_facecolor("#111d30")
+        legend.get_frame().set_edgecolor("#334760")
+        for text_item in legend.get_texts():
+            text_item.set_color("#d9e6f5")
         ax.set_title(f"Předpověď jasnosti — fotometrický exponent n = {self.exponent.value():.2f}")
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
         self.canvas.figure.autofmt_xdate(rotation=25)

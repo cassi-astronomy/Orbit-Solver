@@ -9,7 +9,7 @@ import numpy as np
 from orbit_app.domain import Observation, OrbitSolution
 from orbit_app.main_window import (
     CONSTELLATION_LABELS, CONSTELLATION_LINES, ElementsPanel, ObservationModel,
-    PlaybackBar, SkyPanel,
+    PlaybackBar, SkyPanel, SolarSystemPanel,
     datetime_from_jd, equatorial_ra_ticks, format_dec_sexagesimal, format_ra_sexagesimal,
     is_comet_designation, observation_residual_score, observations_to_tsv, parse_output_epoch,
     perihelion_jd_from_solution, project_ecliptic_camera,
@@ -413,6 +413,16 @@ class MpcParsingTests(unittest.TestCase):
 
 
 class PreviewGeometryTests(unittest.TestCase):
+    def test_integrated_trajectory_interpolates_animation_position(self):
+        epochs = np.array([100.0, 102.0])
+        states = np.array([
+            [1.0, 2.0, 3.0, 0.0, 0.0, 0.0],
+            [5.0, 8.0, 11.0, 0.0, 0.0, 0.0],
+        ])
+        position = SolarSystemPanel._trajectory_position((epochs, states), 101.0)
+        np.testing.assert_allclose(position, [3.0, 5.0, 7.0])
+        self.assertIsNone(SolarSystemPanel._trajectory_position((epochs, states), 99.0))
+
     def test_julian_date_conversion_does_not_use_windows_timestamp_range(self):
         self.assertEqual(datetime_from_jd(2451545.0), datetime(2000, 1, 1, 12, tzinfo=timezone.utc))
         self.assertIsNone(datetime_from_jd(-1e20))

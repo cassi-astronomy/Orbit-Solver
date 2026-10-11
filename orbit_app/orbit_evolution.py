@@ -76,6 +76,9 @@ class EvolutionResult:
     sample_step_days: float
     model_note: str
     snapshots: tuple[EvolutionSnapshot, ...] = field(default_factory=tuple)
+    timeline: tuple[EvolutionSnapshot, ...] = field(default_factory=tuple)
+    trajectory_epochs: np.ndarray | None = field(default=None, repr=False, compare=False)
+    trajectory_states: np.ndarray | None = field(default=None, repr=False, compare=False)
 
 
 def _format_jd_utc(jd: float) -> str:
@@ -407,6 +410,22 @@ def calculate_orbit_evolution(
                 delta_reciprocal_a=delta_1a,
             ))
     encounters.sort(key=lambda item: item.epoch_jd)
+    # Keep the complete integrated trajectory for the Solar System animation,
+    # but calculate osculating elements only for a display-sized time series.
+    # Extra points around perihelia and encounters preserve the dynamically
+    # interesting changes even in integrations spanning several centuries.
+    display_indices = set(
+        np.linspace(0, sample_count - 1, min(sample_count, 2400), dtype=int).tolist()
+    )
+    event_epochs = list(refined_epochs) + [item.epoch_jd for item in encounters]
+    for event_epoch in event_epochs:
+        center = int(np.searchsorted(sample_epochs, event_epoch))
+        for offset in range(-5, 6):
+            display_indices.add(int(np.clip(center + offset, 0, sample_count - 1)))
+    timeline = tuple(
+        _snapshot_from_state("", float(sample_epochs[index]), states[index])
+        for index in sorted(display_indices)
+    )
     snapshots: tuple[EvolutionSnapshot, ...] = ()
     comet = (
         is_comet_designation(solution.designation)
@@ -437,6 +456,9 @@ def calculate_orbit_evolution(
             f"polohy planet používají model {PLANETS.model_name}."
         ),
         snapshots=snapshots,
+        timeline=timeline,
+        trajectory_epochs=np.asarray(sample_epochs, dtype=float),
+        trajectory_states=np.asarray(states, dtype=float),
     )
 
 

@@ -49,20 +49,24 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
 - rovníková mapa oblohy, středová azimutální projekce a obzorový graf viditelnosti;
 - hvězdy do 6. magnitudy, obrazce a latinské zkratky 88 souhvězdí, rovník a ekliptika;
 - volné posouvání mapy, sledování objektu a samostatné zvětšené okno;
-- světelná křivka pro planetky i komety s nastavitelným fotometrickým modelem.
+- světelná křivka pro planetky i komety s nastavitelným fotometrickým modelem
+  a souběžnými křivkami vzdálenosti od Země a od Slunce.
 
 ### Dlouhodobý vývoj dráhy
 
 - integrace podle počtu minulých/budoucích návratů nebo podle samostatného počtu
   let v obou směrech;
-- tabulka oskulačních elementů v jednotlivých perihelových průchodech;
+- tabulka oskulačních elementů v jednotlivých perihelových průchodech, označených
+  přímo rokem návratu;
 - hledání přiblížení k planetám, vzdálenost v AU a Hillových poloměrech,
   relativní rychlost a orientační změna `1/a`;
-- přepínatelný graf vývoje `q`, `a`, `e`, periody, `1/a`, sklonu, uzlu nebo
-  argumentu perihelu;
+- přepínatelný graf průběžného vývoje `q`, `a`, `e`, periody, `1/a`, sklonu,
+  uzlu nebo argumentu perihelu na lineární časové ose; změny při setkáních se
+  projeví v okamžiku setkání a setkání jsou v grafu vyznačena;
 - chronologický export jako čitelný tabulkový TXT nebo MPC 1-line elements;
-- zobrazení minulých a budoucích oskulačních drah různými barvami ve Sluneční
-  soustavě.
+- zobrazení numericky integrované minulé a budoucí trajektorie výrazně odlišnými
+  barvami ve Sluneční soustavě; animovaná poloha sleduje i změny dráhy po
+  planetárním setkání.
 
 ## Požadavky
 
