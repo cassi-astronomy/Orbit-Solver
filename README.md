@@ -23,9 +23,9 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
 - import pozorování ze souboru a vložení ze schránky ve formátu MPC 80-column;
 - podpora družicových pozorování a topocentrické paralaxy podle kódu stanice MPC;
 - vlastní šestiparametrový fit kartézského stavu s planetárními perturbacemi;
-- dvoustupňový výpočet velkých souborů: reprezentativní vzorek slouží pouze
-  k rychlému počátečnímu přiblížení, závěrečný fit a kovariance používají všechna
-  aktivní pozorování;
+- rychlý gravitační fit velkých souborů z časově i početně reprezentativního
+  vzorku; při výpočtu A1/A2/A3 slouží vzorek pouze k počátečnímu přiblížení a
+  závěrečný fit i kovariance používají všechna aktivní pozorování;
 - výpočet z celého oblouku nebo pouze z posledních 2, 5 či 10 let;
 - ruční zařazení a vyřazení jednotlivých pozorování;
 - barevná rezidua O−C, automatické vyřazení reziduí nad 2″ a funkce `Worst obs`;

@@ -996,26 +996,30 @@ def fit_orbit(
     )
     if not constraints and not nongravitational:
         result = _prefer_parabolic_short_arc(observations, result, truncate_years)
-    # The representative subset above is only a fast route into the correct
-    # basin.  A1/A2/A3 and their covariance are sensitive to the full time and
-    # station distribution, so the reported solution must be corrected using
-    # every enabled measurement.  Starting from the subset solution normally
-    # needs only a few iterations.
-    result = _fit_orbit_once(
-        observations, result[0], constraints, truncate_years, nongravitational,
-        maximum_observations=None, max_nfev=12, robust_loss=True,
-    )
+    # For an ordinary six-parameter orbit the representative subset keeps the
+    # interactive calculation fast. A1/A2/A3 are far more sensitive to the
+    # complete time/station distribution, so a nongravitational solution uses
+    # the subset only as a seed and is finally corrected on every enabled row.
+    if nongravitational:
+        result = _fit_orbit_once(
+            observations, result[0], constraints, truncate_years, nongravitational,
+            maximum_observations=None, max_nfev=12, robust_loss=True,
+        )
     # Traditional post-fit rejection remains useful for isolated blunders
     # which do not form a separated final batch.  Remove at most one pass so a
     # weak preliminary orbit cannot cascade into wholesale data rejection.
     if not constraints:
         candidates = [
             item for item in observations
-            if not item.excluded_from_fit and item.used_in_fit
+            if not item.excluded_from_fit
+            and item.residual_ra_arcsec is not None
+            and item.residual_dec_arcsec is not None
             and _normalized_observation_residual(item) > 3.0
         ]
         active_count = sum(
-            not item.excluded_from_fit and bool(item.used_in_fit)
+            not item.excluded_from_fit
+            and item.residual_ra_arcsec is not None
+            and item.residual_dec_arcsec is not None
             for item in observations
         )
         # A bad provisional solution must not erase a large fraction of the
@@ -1031,7 +1035,8 @@ def fit_orbit(
                 observation.raw["automatic_exclusion"] = True
             result = _fit_orbit_once(
                 observations, result[0], constraints, truncate_years, nongravitational,
-                maximum_observations=None, max_nfev=12,
+                maximum_observations=None if nongravitational else 120,
+                max_nfev=12,
             )
             if not nongravitational:
                 result = _prefer_parabolic_short_arc(observations, result, truncate_years)

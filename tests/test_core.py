@@ -542,7 +542,7 @@ class PreviewGeometryTests(unittest.TestCase):
 
 
 class OrbitFitSelectionTests(unittest.TestCase):
-    def test_fit_uses_subset_only_as_seed_then_all_observations(self):
+    def test_nongravitational_fit_uses_subset_as_seed_then_all_observations(self):
         solution = OrbitSolution(
             "C/2023 A3", 2460400.5, -4000.0, 1.0001, 139.0,
             21.5, 308.5, 0.0,
@@ -552,7 +552,10 @@ class OrbitFitSelectionTests(unittest.TestCase):
         final = (solution, .7, 6314)
         observations = [Observation() for _ in range(6)]
         with patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=[candidate, final]) as mocked:
-            result = fit_orbit(observations, solution, constraints={"e": 1.0001})
+            result = fit_orbit(
+                observations, solution, constraints={"e": 1.0001},
+                nongravitational={"A1": 1e-8},
+            )
         self.assertEqual(result[2], 6314)
         self.assertEqual(mocked.call_args_list[0].kwargs["maximum_observations"], 120)
         self.assertIsNone(mocked.call_args_list[1].kwargs["maximum_observations"])
@@ -671,9 +674,8 @@ class OrbitFitSelectionTests(unittest.TestCase):
         ):
             result = fit_orbit(observations, None)
         self.assertIs(result, candidate)
-        self.assertEqual(fit_once.call_count, 2)
+        fit_once.assert_called_once()
         self.assertIsNone(fit_once.call_args_list[0].args[1])
-        self.assertIs(fit_once.call_args_list[1].args[1], solution)
         self.assertTrue(all(not item.excluded_from_fit for item in observations))
 
     def test_automatic_score_discourages_strong_short_arc_hyperbola(self):
