@@ -24,7 +24,7 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
 - podpora družicových pozorování a topocentrické paralaxy podle kódu stanice MPC;
 - vlastní šestiparametrový fit kartézského stavu s planetárními perturbacemi;
 - rychlý gravitační fit velkých souborů z časově i početně reprezentativního
-  vzorku; u hustého krátkého oblouku a při výpočtu A1/A2/A3 slouží vzorek pouze
+  vzorku; u krátkého objevitelského oblouku a při výpočtu A1/A2/A3 slouží vzorek pouze
   k počátečnímu přiblížení a závěrečný fit i kovariance používají všechna
   aktivní pozorování;
 - výpočet z celého oblouku nebo pouze z posledních 2, 5 či 10 let;
@@ -160,8 +160,9 @@ QT_QPA_PLATFORM=xcb python3 run.py
    **Spočítat vlastní dráhu**.
    Automatický fit používá nejistoty z ADES, kontroluje odlehlá měření po
    celých pozorovacích sériích a vyřazené řádky viditelně odškrtne v tabulce.
-   U hustého krátkého oblouku nejprve rychle prosije několik odlišných
-   vzdálenostních větví, nejlepší dopočítá ze všech pozorování a až potom smí
+   U krátkého oblouku s alespoň šesti měřeními nejprve rychle prosije několik
+   odlišných vzdálenostních větví (i když už existuje předběžný odhad), nejlepší
+   dopočítá ze všech pozorování a až potom smí
    vyřazovat skutečně velká rezidua. Porovná také volnou a téměř parabolickou
    větev, aby pár chybných pozdních měření nestáhl řešení do jiné lokální dráhy.
    Pokud je oblouk příliš krátký nebo běžný počáteční odhad selže, použijte

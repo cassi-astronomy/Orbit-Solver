@@ -1112,8 +1112,13 @@ def fit_orbit(
         and (max(active_times) - min(active_times)).total_seconds() <= 30.0 * 86400.0
     )
     active_count = len(active_times)
+    # Range is intrinsically weakly constrained on a discovery arc.  This is
+    # true for a 20-observation PCCP object just as much as for a 400-row one,
+    # and an existing preliminary/MPC seed may itself sit in the wrong local
+    # basin.  Use several range branches whenever a six-parameter solution is
+    # possible; the cost naturally stays lower for the smaller data sets.
     multibranch = bool(
-        initial is None and short_arc and active_count > 120
+        short_arc and active_count >= 6
         and not constraints and not nongravitational
     )
     if multibranch:
@@ -1121,11 +1126,15 @@ def fit_orbit(
             observations, return_candidates=True,
         )
         assert isinstance(initial_candidates, list)
+        if initial is not None:
+            # Treat a supplied preliminary/catalogue orbit as a useful extra
+            # hypothesis, never as the only branch allowed to converge.
+            initial_candidates.insert(0, initial)
         screened: list[tuple[float, OrbitSolution]] = []
         # Six locally optimised hypotheses followed by the twelve raw ranges
         # with the best complete-arc score cover the useful systematic region
         # without making every hypothesis pay for a full DE440 correction.
-        for candidate in initial_candidates[:18]:
+        for candidate in initial_candidates[:19 if initial is not None else 18]:
             try:
                 trial = _fit_orbit_once(
                     observations, candidate, constraints, truncate_years,

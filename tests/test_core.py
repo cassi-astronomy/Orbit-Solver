@@ -600,6 +600,40 @@ class OrbitFitSelectionTests(unittest.TestCase):
         self.assertFalse(_is_automatic_rejection_candidate(tiny_sigma, .25))
         self.assertTrue(_is_automatic_rejection_candidate(obvious_blunder, .25))
 
+    def test_four_day_candidate_compares_range_branches_even_with_initial_orbit(self):
+        start = datetime(2026, 10, 12, tzinfo=timezone.utc)
+        observations = [
+            Observation(
+                time=(start + timedelta(hours=index * 3.25)).isoformat(),
+                ra_deg=10.0 + index / 100.0, dec_deg=-20.0,
+            )
+            for index in range(29)
+        ]
+        supplied = OrbitSolution("PCCP", 2461327.5, 3.6, .19, 17, 233, 356, 58)
+        wrong = OrbitSolution("PCCP", 2461327.5, 3.5, .18, 17, 233, 350, 60)
+        right = OrbitSolution("PCCP", 2461327.5, 5.0, .30, 16.8, 227, 72, 4.5)
+
+        def staged_fit(_observations, candidate, *_args, **kwargs):
+            rms = .24 if candidate is right else .40
+            for observation in observations:
+                observation.residual_ra_arcsec = rms
+                observation.residual_dec_arcsec = 0.0
+                observation.used_in_fit = True
+            return candidate, rms, len(observations)
+
+        with (
+            patch(
+                "orbit_app.orbit_fit.initial_orbit_from_observations",
+                return_value=[wrong, right],
+            ) as ranging,
+            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=staged_fit) as fit_once,
+            patch("orbit_app.orbit_fit._prefer_parabolic_short_arc", side_effect=lambda _, value, __: value),
+        ):
+            result = fit_orbit(observations, supplied)
+        self.assertIs(result[0], right)
+        ranging.assert_called_once_with(observations, return_candidates=True)
+        self.assertGreaterEqual(fit_once.call_count, 6)
+
     def test_interpolated_ephemeris_includes_the_moon(self):
         start = 2451545.0
         cached = _InterpolatedPlanetEphemeris(PLANETS, start, start + 1.0)
@@ -675,7 +709,7 @@ class OrbitFitSelectionTests(unittest.TestCase):
         ]
         observations.extend([
             Observation(
-                time=(start + timedelta(days=5, minutes=index * 10)).isoformat(),
+                time=(start + timedelta(days=35, minutes=index * 10)).isoformat(),
                 ra_deg=1.0, dec_deg=2.0, station="E62",
             )
             for index in range(2)
