@@ -326,7 +326,8 @@ def initial_orbit_from_observations(
     observations: list[Observation], method: str = "systematic",
     perihelion_distance_au: float | None = None,
     minimum_observations: int = 6,
-) -> OrbitSolution:
+    return_candidates: bool = False,
+) -> OrbitSolution | list[OrbitSolution]:
     """Estimate a heliocentric state from angles and times without an MPC orbit.
 
     The observed line-of-sight motion supplies the transverse velocity.  A
@@ -470,6 +471,15 @@ def initial_orbit_from_observations(
     # change.  Compute them once and reuse them for both light-time and sky
     # direction calculations.
     sample_earth = earth_heliocentric_ecliptic(sample_epochs)
+    # The small sample makes each individual trial cheap, but different range
+    # branches can be almost indistinguishable on it.  Score the few optimised
+    # finalists against the complete arc so a dense multi-station PCCP data
+    # set can select the physically correct basin.
+    all_offsets = _observation_offsets_gcrs(parsed)
+    all_earth = earth_heliocentric_ecliptic(all_epochs)
+    all_ra = np.asarray([item[2] for item in parsed])
+    all_dec = np.asarray([item[3] for item in parsed])
+    all_sigmas = _observation_sigmas(parsed)
     # Initial range/range-rate search needs only the broad basin of attraction.
     # Over a short discovery arc a solar two-body model is sufficient and is
     # far cheaper than evaluating all eight planetary perturbers hundreds of
@@ -510,13 +520,46 @@ def initial_orbit_from_observations(
         except (RuntimeError, ValueError, FloatingPointError):
             return np.full(sample_count * 2, 1e9)
 
+    def full_arc_score(parameters: np.ndarray) -> float:
+        """Robust RMS on all rows, used only to rank a few range branches."""
+        try:
+            vector = state_for(parameters)
+            state = StateVector(reference_epoch, vector[:3], vector[3:])
+            propagated = engine.propagate(state, all_epochs)
+            light_time = np.linalg.norm(
+                propagated[:, :3] - all_earth, axis=1
+            ) / C_AU_PER_DAY
+            emitted = engine.propagate(state, all_epochs - light_time)
+            computed_ra, computed_dec = _equatorial_direction(
+                emitted, all_epochs, all_offsets, all_earth,
+            )
+            delta_ra = (computed_ra - all_ra + 180.0) % 360.0 - 180.0
+            delta_ra *= np.cos(np.radians(all_dec))
+            residual = np.column_stack((
+                delta_ra, computed_dec - all_dec,
+            )).ravel() * 3600.0 / all_sigmas
+            pairs = residual.reshape(-1, 2)
+            radial = np.linalg.norm(pairs, axis=1)
+            # Ignore at most the worst two percent while selecting a basin;
+            # actual rejection remains a separate, visible post-fit step.
+            cutoff = float(np.quantile(radial, .98)) if len(radial) >= 20 else np.inf
+            retained = pairs[radial <= cutoff]
+            return float(np.sqrt(np.mean(np.square(retained))))
+        except (RuntimeError, ValueError, FloatingPointError):
+            return 1e9
+
     seeds: list[tuple[float, np.ndarray]] = []
+    raw_range_seeds: list[np.ndarray] = []
     if method == "systematic":
         for distance in np.geomspace(0.03, 60.0, 14):
             for radial_velocity in (-0.04, 0.0, 0.04):
                 parameters = np.array([np.log(distance), radial_velocity])
                 residual = angular_residual(parameters)
                 seeds.append((float(np.median(np.abs(residual))), parameters))
+        raw_range_seeds = [
+            np.array([np.log(distance), 0.0])
+            for distance in np.geomspace(0.03, 60.0, 32)
+        ]
     else:
         # Intersect the observed ray with a heliocentric sphere r=q.  At
         # perihelion the heliocentric radial velocity is zero; solving that
@@ -575,34 +618,83 @@ def initial_orbit_from_observations(
             heliocentric_radial_velocity / 1e-7,
         ))
 
+    # Do not let several nearly identical grid points consume every nonlinear
+    # attempt.  Distinct topocentric ranges represent genuinely different
+    # short-arc orbit families and must each get a chance to converge.
+    diverse_seeds: list[np.ndarray] = []
+    for _, seed in seeds:
+        if all(abs(float(seed[0] - item[0])) >= .45 for item in diverse_seeds):
+            diverse_seeds.append(seed)
+        if len(diverse_seeds) >= 6:
+            break
     best: tuple[float, np.ndarray] | None = None
-    for _, seed in seeds[:4]:
+    finalists: list[tuple[float, np.ndarray]] = []
+    for seed in diverse_seeds:
+        # Preserve genuinely different range families.  With one global
+        # distance bound every trial slid into the same nearest local minimum,
+        # so the apparent multi-start search was illusory.
+        distance_lower = max(np.log(.005), float(seed[0]) - .32)
+        distance_upper = min(np.log(120.0), float(seed[0]) + .32)
         result = least_squares(
-            search_residual, seed, bounds=([np.log(0.005), -0.12], [np.log(120.0), 0.12]),
+            search_residual, seed,
+            bounds=([distance_lower, -0.12], [distance_upper, 0.12]),
             loss="soft_l1", f_scale=5.0, max_nfev=24,
         )
-        score = float(np.sqrt(np.mean(np.square(angular_residual(result.x)))))
+        score = full_arc_score(result.x)
+        if np.isfinite(score):
+            finalists.append((score, result.x.copy()))
         if np.isfinite(score) and (best is None or score < best[0]):
             best = (score, result.x)
     if best is None or best[0] > 3600.0:
         raise OrbitFitError("Z astrometrie se nepodařilo sestavit použitelný počáteční odhad dráhy.")
 
-    vector = state_for(best[1])
-    try:
-        elements = cartesian_to_elements(vector[:3], vector[3:])
-    except Exception as exc:
-        raise OrbitFitError("Počáteční astrometrická dráha nevede na použitelnou kuželosečku.") from exc
     designation = next((item[0].designation for item in parsed if item[0].designation), "Vlastní objekt")
     magnitudes = [item[0].magnitude for item in parsed if item[0].magnitude is not None]
-    return OrbitSolution(
-        designation=designation, epoch_jd=reference_epoch,
-        semi_major_axis_au=elements[0], eccentricity=elements[1], inclination_deg=elements[2],
-        node_deg=elements[3], arg_peri_deg=elements[4], mean_anomaly_deg=elements[5],
-        absolute_magnitude=float(np.median(magnitudes)) if magnitudes else 18.0,
-        provisional=True,
-        position_au=tuple(float(value) for value in vector[:3]),
-        velocity_au_per_day=tuple(float(value) for value in vector[3:]),
-    )
+
+    def solution_for(parameters: np.ndarray) -> OrbitSolution:
+        vector = state_for(parameters)
+        try:
+            elements = cartesian_to_elements(vector[:3], vector[3:])
+        except Exception as exc:
+            raise OrbitFitError(
+                "Počáteční astrometrická dráha nevede na použitelnou kuželosečku."
+            ) from exc
+        return OrbitSolution(
+            designation=designation, epoch_jd=reference_epoch,
+            semi_major_axis_au=elements[0], eccentricity=elements[1],
+            inclination_deg=elements[2], node_deg=elements[3],
+            arg_peri_deg=elements[4], mean_anomaly_deg=elements[5],
+            absolute_magnitude=float(np.median(magnitudes)) if magnitudes else 18.0,
+            provisional=True,
+            position_au=tuple(float(value) for value in vector[:3]),
+            velocity_au_per_day=tuple(float(value) for value in vector[3:]),
+        )
+
+    if return_candidates:
+        candidates: list[OrbitSolution] = []
+        # Retain distinct heliocentric energy/range families, not repeated
+        # numerical variants of the same minimum.
+        for _, parameters in sorted(finalists, key=lambda item: item[0]):
+            candidate = solution_for(parameters)
+            if all(
+                abs(candidate.semi_major_axis_au - existing.semi_major_axis_au)
+                > max(.15, .08 * abs(existing.semi_major_axis_au))
+                for existing in candidates
+            ):
+                candidates.append(candidate)
+            if len(candidates) >= 6:
+                break
+        if method == "systematic":
+            # Raw systematic-ranging states are deliberately retained as
+            # seeds for the later six-dimensional correction.  The two-
+            # parameter angular-motion model can otherwise deform or discard
+            # the correct distant branch before the real orbit fit sees it.
+            candidates.extend(
+                solution_for(parameters)
+                for parameters in sorted(raw_range_seeds, key=full_arc_score)
+            )
+        return candidates or [solution_for(best[1])]
+    return solution_for(best[1])
 
 
 def _fit_orbit_once(
@@ -613,6 +705,7 @@ def _fit_orbit_once(
     maximum_observations: int | None = 120,
     max_nfev: int | None = None,
     robust_loss: bool = False,
+    screening: bool = False,
 ) -> tuple[OrbitSolution, float, int]:
     derived_initial = initial is None
     if initial is None:
@@ -817,22 +910,26 @@ def _fit_orbit_once(
             result.x,
             method="trf", x_scale=fine_scale,
             bounds=(lower_bounds, upper_bounds), loss="linear",
-            max_nfev=8, verbose=0,
+            max_nfev=4 if screening else 8, verbose=0,
         )
     if not result.success and result.nfev < 2:
         raise OrbitFitError(result.message)
     elements = cartesian_to_elements(result.x[:3], result.x[3:6])
-    final_astrometric_residual = astrometric_residuals(result.x, full_engine)
+    reporting_engine = optimizer_engine if screening else full_engine
+    final_astrometric_residual = astrometric_residuals(result.x, reporting_engine)
     rms = float(np.sqrt(np.mean(np.square(final_astrometric_residual))))
     normalized_rms = float(np.sqrt(np.mean(np.square(
         final_astrometric_residual / astrometric_sigmas
     ))))
     astrometric_jacobian = np.asarray(result.jac[:final_astrometric_residual.size, :], dtype=float)
-    uncertainties, state_covariance = _formal_element_uncertainties(
-        result.x, elements, astrometric_jacobian,
-        final_astrometric_residual / astrometric_sigmas,
-        max(1, 6 + len(nongrav_names) - len(constraints or {})), nongrav_names,
-    )
+    if screening:
+        uncertainties, state_covariance = None, None
+    else:
+        uncertainties, state_covariance = _formal_element_uncertainties(
+            result.x, elements, astrometric_jacobian,
+            final_astrometric_residual / astrometric_sigmas,
+            max(1, 6 + len(nongrav_names) - len(constraints or {})), nongrav_names,
+        )
     solution = OrbitSolution(
         designation=initial.designation,
         epoch_jd=reference_epoch,
@@ -855,6 +952,8 @@ def _fit_orbit_once(
         display_name=initial.display_name,
         nongravitational_parameters=nongrav_from_vector(result.x) or None,
     )
+    if screening:
+        return solution, rms, len(usable)
     # Calculate reportable O-C values for every valid observation, not only for
     # the (at most 120) points retained by the interactive optimizer.
     report_times = [item[1] for item in reportable]
@@ -907,6 +1006,21 @@ def _normalized_observation_residual(observation: Observation) -> float:
         observation.residual_ra_arcsec / sigma_ra,
         observation.residual_dec_arcsec / sigma_dec,
     ))
+
+
+def _is_automatic_rejection_candidate(
+    observation: Observation, fit_rms_arcsec: float,
+) -> bool:
+    """Require both statistical and visibly significant astrometric error."""
+    if observation.residual_ra_arcsec is None or observation.residual_dec_arcsec is None:
+        return False
+    physical_residual = float(np.hypot(
+        observation.residual_ra_arcsec, observation.residual_dec_arcsec,
+    ))
+    return bool(
+        _normalized_observation_residual(observation) > 3.0
+        and physical_residual > max(2.0, float(fit_rms_arcsec) * 6.0)
+    )
 
 
 def _automatic_orbit_score(solution: OrbitSolution) -> float:
@@ -985,15 +1099,96 @@ def fit_orbit(
     nongravitational: dict[str, float] | None = None,
 ) -> tuple[OrbitSolution, float, int]:
     """Fit an orbit with conservative automatic rejection of astrometric blunders."""
-    # Always establish the residuals against a solution containing every
-    # currently enabled measurement.  A chronologically isolated follow-up
-    # batch is not evidence of bad astrometry: on a short arc it can select a
-    # different but perfectly valid range solution (as the E62 follow-up of
-    # A11HAVq does).  Only actual post-fit residuals may trigger rejection.
-    result = _fit_orbit_once(
-        observations, initial, constraints, truncate_years, nongravitational,
-        maximum_observations=120,
+    active_times: list[datetime] = []
+    for observation in observations:
+        if observation.excluded_from_fit or not observation.time:
+            continue
+        try:
+            active_times.append(parse_observation_time(observation.time))
+        except ValueError:
+            pass
+    short_arc = bool(
+        len(active_times) >= 2
+        and (max(active_times) - min(active_times)).total_seconds() <= 30.0 * 86400.0
     )
+    active_count = len(active_times)
+    multibranch = bool(
+        initial is None and short_arc and active_count > 120
+        and not constraints and not nongravitational
+    )
+    if multibranch:
+        initial_candidates = initial_orbit_from_observations(
+            observations, return_candidates=True,
+        )
+        assert isinstance(initial_candidates, list)
+        screened: list[tuple[float, OrbitSolution]] = []
+        # Six locally optimised hypotheses followed by the twelve raw ranges
+        # with the best complete-arc score cover the useful systematic region
+        # without making every hypothesis pay for a full DE440 correction.
+        for candidate in initial_candidates[:18]:
+            try:
+                trial = _fit_orbit_once(
+                    observations, candidate, constraints, truncate_years,
+                    nongravitational, maximum_observations=36,
+                    max_nfev=14, robust_loss=True, screening=True,
+                )
+                if np.isfinite(trial[1]):
+                    # Screening ranks the basin only.  Preserve its original
+                    # range seed for the full correction; the intentionally
+                    # abbreviated screening fit can otherwise shift a weak
+                    # short-arc solution across a basin boundary.
+                    screened.append((trial[1], candidate))
+            except (OrbitFitError, ValueError, RuntimeError, FloatingPointError):
+                continue
+        if not screened:
+            raise OrbitFitError(
+                "Systematické rangování nenašlo použitelnou větev dráhy."
+            )
+        finalists: list[tuple[
+            tuple[OrbitSolution, float, int],
+            list[tuple[float | None, float | None, bool | None]],
+        ]] = []
+        for _, candidate in sorted(screened, key=lambda item: item[0])[:3]:
+            try:
+                final_result = _fit_orbit_once(
+                    observations, candidate, constraints, truncate_years,
+                    nongravitational, maximum_observations=None,
+                    max_nfev=40, robust_loss=True,
+                )
+                finalists.append((final_result, [
+                    (
+                        observation.residual_ra_arcsec,
+                        observation.residual_dec_arcsec,
+                        observation.used_in_fit,
+                    )
+                    for observation in observations
+                ]))
+            except (OrbitFitError, ValueError, RuntimeError, FloatingPointError):
+                continue
+        if not finalists:
+            raise OrbitFitError(
+                "Úplná korekce kandidátních drah selhala."
+            )
+        result, selected_report = min(
+            finalists, key=lambda item: item[0][1]
+        )
+        # Each finalist computes its own O-C table.  Restore the table that
+        # belongs to the winning solution rather than accidentally leaving
+        # values from whichever candidate happened to run last.
+        for observation, report_values in zip(observations, selected_report):
+            (
+                observation.residual_ra_arcsec,
+                observation.residual_dec_arcsec,
+                observation.used_in_fit,
+            ) = report_values
+    else:
+        # Always establish residuals before any automatic rejection.  A
+        # chronologically isolated follow-up batch is not itself evidence of
+        # bad astrometry; only actual post-fit residuals may exclude it.
+        result = _fit_orbit_once(
+            observations, initial, constraints, truncate_years,
+            nongravitational, maximum_observations=120,
+        )
     if not constraints and not nongravitational:
         result = _prefer_parabolic_short_arc(observations, result, truncate_years)
     # For an ordinary six-parameter orbit the representative subset keeps the
@@ -1005,6 +1200,16 @@ def fit_orbit(
             observations, result[0], constraints, truncate_years, nongravitational,
             maximum_observations=None, max_nfev=12, robust_loss=True,
         )
+    elif not multibranch and not constraints and short_arc and active_count > 120:
+        # A representative subset is a fast seed, not a sufficient final
+        # answer for a dense PCCP/NEOCP discovery arc.  Competing range
+        # solutions can differ by only hundredths of an arcsecond on a subset
+        # yet imply entirely different periods and perihelia.  All rows decide
+        # the branch and make the reported observation count honest.
+        result = _fit_orbit_once(
+            observations, result[0], constraints, truncate_years, nongravitational,
+            maximum_observations=None, max_nfev=36, robust_loss=True,
+        )
     # Traditional post-fit rejection remains useful for isolated blunders
     # which do not form a separated final batch.  Remove at most one pass so a
     # weak preliminary orbit cannot cascade into wholesale data rejection.
@@ -1012,9 +1217,7 @@ def fit_orbit(
         candidates = [
             item for item in observations
             if not item.excluded_from_fit
-            and item.residual_ra_arcsec is not None
-            and item.residual_dec_arcsec is not None
-            and _normalized_observation_residual(item) > 3.0
+            and _is_automatic_rejection_candidate(item, result[1])
         ]
         active_count = sum(
             not item.excluded_from_fit
@@ -1035,7 +1238,10 @@ def fit_orbit(
                 observation.raw["automatic_exclusion"] = True
             result = _fit_orbit_once(
                 observations, result[0], constraints, truncate_years, nongravitational,
-                maximum_observations=None if nongravitational else 120,
+                maximum_observations=(
+                    None if nongravitational or (short_arc and not constraints)
+                    else 120
+                ),
                 max_nfev=12,
             )
             if not nongravitational:

@@ -35,6 +35,7 @@ from orbit_app.orbit_evolution import (
 from orbit_app.planetary import PLANETS
 from orbit_app.orbit_fit import (
     _automatic_orbit_score, _InterpolatedPlanetEphemeris,
+    _is_automatic_rejection_candidate,
     _observation_offsets_gcrs, _observation_sigma_arcsec,
     _perihelion_offset_days_from_state,
     _prefer_parabolic_short_arc,
@@ -586,6 +587,18 @@ class OrbitFitSelectionTests(unittest.TestCase):
         self.assertEqual(mocked.call_count, 3)
         self.assertTrue(observations[0].excluded_from_fit)
         self.assertTrue(observations[0].raw["automatic_exclusion"])
+
+    def test_automatic_rejection_needs_a_physical_two_arcsecond_error(self):
+        tiny_sigma = Observation(
+            residual_ra_arcsec=.4, residual_dec_arcsec=.3,
+            raw={"rmsRA": .05, "rmsDec": .05},
+        )
+        obvious_blunder = Observation(
+            residual_ra_arcsec=3.0, residual_dec_arcsec=1.0,
+            raw={"rmsRA": .2, "rmsDec": .2},
+        )
+        self.assertFalse(_is_automatic_rejection_candidate(tiny_sigma, .25))
+        self.assertTrue(_is_automatic_rejection_candidate(obvious_blunder, .25))
 
     def test_interpolated_ephemeris_includes_the_moon(self):
         start = 2451545.0

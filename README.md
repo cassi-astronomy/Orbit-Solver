@@ -24,8 +24,9 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
 - podpora družicových pozorování a topocentrické paralaxy podle kódu stanice MPC;
 - vlastní šestiparametrový fit kartézského stavu s planetárními perturbacemi;
 - rychlý gravitační fit velkých souborů z časově i početně reprezentativního
-  vzorku; při výpočtu A1/A2/A3 slouží vzorek pouze k počátečnímu přiblížení a
-  závěrečný fit i kovariance používají všechna aktivní pozorování;
+  vzorku; u hustého krátkého oblouku a při výpočtu A1/A2/A3 slouží vzorek pouze
+  k počátečnímu přiblížení a závěrečný fit i kovariance používají všechna
+  aktivní pozorování;
 - výpočet z celého oblouku nebo pouze z posledních 2, 5 či 10 let;
 - ruční zařazení a vyřazení jednotlivých pozorování;
 - barevná rezidua O−C, automatické vyřazení reziduí nad 2″ a funkce `Worst obs`;
@@ -157,10 +158,12 @@ QT_QPA_PLATFORM=xcb python3 run.py
    odhad, protože katalogová dráha ještě nemusí existovat.
 4. Podle potřeby omezte časový rozsah, vyřaďte chybná měření a zvolte
    **Spočítat vlastní dráhu**.
-   Automatický fit používá nejistoty z ADES, kontroluje odlehlé měření po
+   Automatický fit používá nejistoty z ADES, kontroluje odlehlá měření po
    celých pozorovacích sériích a vyřazené řádky viditelně odškrtne v tabulce.
-   U krátkého oblouku porovná také volnou a téměř parabolickou větev, aby pár
-   chybných pozdních měření nestáhl řešení do jiné lokální dráhy.
+   U hustého krátkého oblouku nejprve rychle prosije několik odlišných
+   vzdálenostních větví, nejlepší dopočítá ze všech pozorování a až potom smí
+   vyřazovat skutečně velká rezidua. Porovná také volnou a téměř parabolickou
+   větev, aby pár chybných pozdních měření nestáhl řešení do jiné lokální dráhy.
    Pokud je oblouk příliš krátký nebo běžný počáteční odhad selže, použijte
    **Předběžná dráha z krátkého oblouku**. Doporučené systematické hledání
    prohledává vzdálenost a radiální rychlost a od šesti měření provede také
