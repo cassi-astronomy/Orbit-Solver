@@ -1567,10 +1567,11 @@ class SolarSystemPanel(QWidget):
         )
         notice.setObjectName("muted")
         controls.addWidget(notice); controls.addStretch()
-        self.show_orbit_curtain = QCheckBox("Výšková clona dráhy")
+        self.show_orbit_curtain = QCheckBox("Projekční plocha k ekliptice (3D)")
         self.show_orbit_curtain.setChecked(False)
         self.show_orbit_curtain.setToolTip(
-            "Zobrazí průhlednou plochu mezi dráhou tělesa a rovinou ekliptiky."
+            "Zobrazí průsvitnou projekční plochu mezi dráhou tělesa a jejím "
+            "kolmým průmětem do roviny ekliptiky."
         )
         self.show_orbit_curtain.toggled.connect(
             lambda _: self.set_time(self.playback.time.dateTime().toPython())
@@ -1885,6 +1886,13 @@ class SolarSystemPanel(QWidget):
                     for arc in np.split(segment_xyz, node_breaks):
                         if len(arc) < 2:
                             continue
+                        # Limit the surface geometry so a centuries-long
+                        # integrated trajectory remains responsive.
+                        surface_stride = max(1, int(np.ceil(len(arc) / 700)))
+                        sampled_arc = arc[::surface_stride]
+                        if not np.array_equal(sampled_arc[-1], arc[-1]):
+                            sampled_arc = np.vstack((sampled_arc, arc[-1]))
+                        arc = sampled_arc
                         base = arc.copy()
                         base[:, 2] = 0.0
                         arc_x, arc_y, _ = project_ecliptic_camera(
@@ -1893,12 +1901,44 @@ class SolarSystemPanel(QWidget):
                         base_x, base_y, _ = project_ecliptic_camera(
                             base, azimuth, elevation
                         )
+                        # A muted blue above and violet below the ecliptic
+                        # reveal both nodes while remaining distinct from the
+                        # cyan/magenta past/future trajectory colours.
+                        surface_color = (
+                            "#579bd1" if float(np.mean(arc[:, 2])) >= 0.0
+                            else "#9a65bd"
+                        )
+                        height_scale = max(
+                            float(np.max(np.abs(arc[:, 2]))), 1e-12
+                        )
                         ax.fill(
                             np.concatenate((arc_x, base_x[::-1])),
                             np.concatenate((arc_y, base_y[::-1])),
-                            facecolor="#7da6c6", edgecolor="none",
-                            alpha=.085, zorder=.3,
+                            facecolor=surface_color, edgecolor="none",
+                            alpha=.16, zorder=.28,
                         )
+                        # The footprint plus a handful of very fine vertical
+                        # connectors act as depth cues without recreating the
+                        # dense striped curtain the user wanted to avoid.
+                        ax.plot(
+                            base_x, base_y, color="#7895b6", lw=.55,
+                            alpha=.28, ls=(0, (2, 5)), zorder=.29,
+                        )
+                        rib_count = min(10, len(arc))
+                        rib_indices = np.unique(np.linspace(
+                            0, len(arc) - 1, rib_count, dtype=int
+                        ))
+                        ribs = [
+                            ((base_x[index], base_y[index]),
+                             (arc_x[index], arc_y[index]))
+                            for index in rib_indices
+                            if abs(float(arc[index, 2])) > height_scale * .04
+                        ]
+                        if ribs:
+                            ax.add_collection(LineCollection(
+                                ribs, colors="#9bb6d0", linewidths=.42,
+                                alpha=.20, zorder=.31,
+                            ))
             for segment in orbit_segments:
                 if len(segment) > 1:
                     screen_x, screen_y, _ = project_ecliptic_camera(

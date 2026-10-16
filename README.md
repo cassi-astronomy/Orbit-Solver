@@ -49,7 +49,8 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
 
 - interaktivní heliocentrický pohled na Sluneční soustavu s otáčením a plynulým
   logaritmickým přiblížením;
-- volitelná průhledná výšková clona mezi drahou a rovinou ekliptiky;
+- volitelná průsvitná projekční plocha dráhy k rovině ekliptiky pro názorné
+  zobrazení sklonu, výšky nad/pod ekliptikou a uzlů dráhy;
 - rovníková mapa oblohy, středová azimutální projekce a obzorový graf viditelnosti;
 - hvězdy do 6. magnitudy, obrazce a latinské zkratky 88 souhvězdí, rovník a ekliptika;
 - volné posouvání mapy, sledování objektu a samostatné zvětšené okno;
