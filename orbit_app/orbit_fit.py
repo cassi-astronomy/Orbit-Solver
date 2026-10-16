@@ -7,7 +7,7 @@ import numpy as np
 from scipy.interpolate import CubicSpline
 from scipy.optimize import least_squares
 
-from .domain import Observation, OrbitSolution
+from .domain import Observation, OrbitSolution, is_comet_designation
 from .mpc_orbit import cartesian_to_elements
 from .observatories import (
     dynamical_jd, earth_heliocentric_ecliptic, geodetic_offsets_gcrs,
@@ -15,6 +15,7 @@ from .observatories import (
 )
 from .orbit_engine import MU_SUN, NBodyIntegrator, StateVector
 from .planetary import PLANETS
+from .photometry import estimate_absolute_magnitude, hg_phase_correction
 
 C_AU_PER_DAY = 173.1446326846693
 _PLANET_NAMES = (
@@ -25,6 +26,47 @@ _PLANET_NAMES = (
 
 class OrbitFitError(RuntimeError):
     pass
+
+
+def _calibrate_fitted_photometry(
+    observations: list[Observation], solution: OrbitSolution,
+) -> None:
+    """Reduce observed magnitudes to H/cometary M using the fitted geometry."""
+    measured: list[tuple[datetime, float]] = []
+    for observation in observations:
+        if observation.magnitude is None or not observation.time:
+            continue
+        try:
+            magnitude = float(observation.magnitude)
+            instant = parse_observation_time(observation.time)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(magnitude):
+            measured.append((instant, magnitude))
+    if not measured:
+        return
+    # Thousands of photometric rows add no robustness to a median but would
+    # needlessly repeat an expensive long-period propagation.
+    if len(measured) > 240:
+        indices = np.linspace(0, len(measured) - 1, 240).round().astype(int)
+        measured = [measured[index] for index in np.unique(indices)]
+    try:
+        # Local import avoids coupling the numerical fitter to preview startup.
+        from .preview_orbit import apparent_geometry
+        epochs = dynamical_jd([item[0] for item in measured])
+        geometry = apparent_geometry(solution, epochs)
+        phase = (
+            hg_phase_correction(geometry["phase"], solution.slope_g)
+            if solution.phase_correction else None
+        )
+        solution.absolute_magnitude = estimate_absolute_magnitude(
+            np.asarray([item[1] for item in measured], dtype=float),
+            geometry["delta"], geometry["r"],
+            solution.photometric_exponent, phase,
+        )
+    except (ValueError, FloatingPointError, RuntimeError):
+        # Photometry must never invalidate an otherwise sound astrometric fit.
+        return
 
 
 class _InterpolatedPlanetEphemeris:
@@ -650,6 +692,7 @@ def initial_orbit_from_observations(
 
     designation = next((item[0].designation for item in parsed if item[0].designation), "Vlastní objekt")
     magnitudes = [item[0].magnitude for item in parsed if item[0].magnitude is not None]
+    cometary = is_comet_designation(designation)
 
     def solution_for(parameters: np.ndarray) -> OrbitSolution:
         vector = state_for(parameters)
@@ -665,6 +708,8 @@ def initial_orbit_from_observations(
             inclination_deg=elements[2], node_deg=elements[3],
             arg_peri_deg=elements[4], mean_anomaly_deg=elements[5],
             absolute_magnitude=float(np.median(magnitudes)) if magnitudes else 18.0,
+            photometric_exponent=4.0 if cometary else 2.0,
+            phase_correction=not cometary,
             provisional=True,
             position_au=tuple(float(value) for value in vector[:3]),
             velocity_au_per_day=tuple(float(value) for value in vector[3:]),
@@ -1255,4 +1300,5 @@ def fit_orbit(
             )
             if not nongravitational:
                 result = _prefer_parabolic_short_arc(observations, result, truncate_years)
+    _calibrate_fitted_photometry(observations, result[0])
     return result

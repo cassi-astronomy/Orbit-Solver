@@ -35,6 +35,7 @@ from orbit_app.orbit_evolution import (
 from orbit_app.planetary import PLANETS
 from orbit_app.orbit_fit import (
     _automatic_orbit_score, _InterpolatedPlanetEphemeris,
+    _calibrate_fitted_photometry,
     _is_automatic_rejection_candidate,
     _observation_offsets_gcrs, _observation_sigma_arcsec,
     _perihelion_offset_days_from_state,
@@ -545,6 +546,23 @@ class PreviewGeometryTests(unittest.TestCase):
 
 
 class OrbitFitSelectionTests(unittest.TestCase):
+    def test_fitted_photometry_reduces_apparent_magnitude_to_absolute(self):
+        solution = OrbitSolution(
+            "PCCP", 2461300.5, 5.0, .3, 17, 227, 72, 4.5,
+            position_au=(5.0, 0.0, 0.0), velocity_au_per_day=(0.0, .005, 0.0),
+        )
+        observation = Observation(
+            time="2026-10-12T00:00:00Z", magnitude=19.0,
+        )
+        geometry = {
+            "delta": np.array([4.0]), "r": np.array([5.0]),
+            "phase": np.array([0.0]),
+        }
+        with patch("orbit_app.preview_orbit.apparent_geometry", return_value=geometry):
+            _calibrate_fitted_photometry([observation], solution)
+        expected = 19.0 - 5.0 * math.log10(4.0) - 5.0 * math.log10(5.0)
+        self.assertAlmostEqual(solution.absolute_magnitude, expected)
+
     def test_nongravitational_fit_uses_subset_as_seed_then_all_observations(self):
         solution = OrbitSolution(
             "C/2023 A3", 2460400.5, -4000.0, 1.0001, 139.0,
