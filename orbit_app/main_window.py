@@ -184,11 +184,13 @@ def equatorial_ra_ticks(
 
 
 def datetime_from_jd(jd: float) -> datetime | None:
-    """Convert a Julian date without relying on the platform Unix timestamp.
+    """Convert a Julian calendar date without relying on Unix timestamps.
 
-    Windows rejects timestamps outside its narrower native range.  Python's
-    datetime still has a finite year range (1..9999), so genuinely extreme or
-    non-finite dates are reported as unavailable instead of crashing the UI.
+    This deliberately preserves the calendar representation of dynamical
+    epochs (TT/TDB) used in element reports.  UTC timestamps in ephemeris
+    tables are retained separately from the converted TDB integration epochs.
+    Python's datetime has a finite year range, so extreme values are reported
+    as unavailable instead of crashing the UI.
     """
     if not np.isfinite(jd):
         return None
@@ -1066,23 +1068,11 @@ class OrbitEvolutionWorker(QObject):
 def _ephemeris_coordinates(
     solution: OrbitSolution, jd: np.ndarray, observer_offsets: np.ndarray | None,
 ) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
-    """Return apparent coordinates without touching any Qt widget state."""
-    geom = apparent_geometry(solution, jd)
+    """Return light-time-corrected astrometric coordinates without Qt state."""
+    geom = apparent_geometry(solution, jd, observer_offsets)
     ra = np.asarray(geom["ra"], dtype=float)
     dec = np.asarray(geom["dec"], dtype=float)
     delta = np.asarray(geom["delta"], dtype=float)
-    if observer_offsets is not None:
-        earth = np.stack([PLANETS.position("earth", float(epoch)) for epoch in jd])
-        geo_ecliptic = geom["xyz"] - earth
-        eps = np.radians(23.4392911)
-        equatorial = np.column_stack((
-            geo_ecliptic[:, 0],
-            geo_ecliptic[:, 1] * np.cos(eps) - geo_ecliptic[:, 2] * np.sin(eps),
-            geo_ecliptic[:, 1] * np.sin(eps) + geo_ecliptic[:, 2] * np.cos(eps),
-        )) - observer_offsets
-        delta = np.linalg.norm(equatorial, axis=1)
-        ra = np.degrees(np.arctan2(equatorial[:, 1], equatorial[:, 0])) % 360.0
-        dec = np.degrees(np.arcsin(np.clip(equatorial[:, 2] / delta, -1.0, 1.0)))
     return geom, ra, dec, delta
 
 
@@ -3404,7 +3394,7 @@ class EphemerisPanel(QWidget):
         self.uncertainty_status.setObjectName("muted")
         self.table = QTableWidget(0, 10)
         self.headers = (
-            "Čas UTC", "RA (h m s)", "Dec (° ′ ″)", "Azimut", "Výška",
+            "Čas UTC", "RA astrom. J2000 (h m s)", "Dec astrom. J2000 (° ′ ″)", "Azimut", "Výška",
             "Výška Slunce", "Nejistota 1σ [″]", "Δ [AU]", "r [AU]", "Mag",
         )
         self.table.setHorizontalHeaderLabels(self.headers)

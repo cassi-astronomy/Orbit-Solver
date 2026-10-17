@@ -51,7 +51,10 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
 - přepočet oskulačních elementů vůči Slunci nebo zvolené planetě;
 - kopírovatelný textový výstup a MPC 1-line elements;
 - geocentrická nebo topocentrická efemerida pro zvolenou MPC stanici;
-- RA/Dec v desetinném i sexagesimálním formátu;
+- numerická N-body propagace z kartézského stavu i u čistě gravitační dráhy,
+  časový argument TDB a iterovaná korekce na dobu letu světla;
+- astrometrické RA/Dec v soustavě ICRS/J2000 v desetinném i sexagesimálním
+  formátu; převod na obzorové souřadnice zahrnuje precesi, nutaci a aberaci;
 - azimut, výška objektu, výška Slunce, vzdálenosti a elongace;
 - formální poziční nejistota 1σ v obloukových sekundách;
 - kopírování obdélníkového výběru z tabulky.
@@ -208,6 +211,12 @@ aplikací nutné porovnat s MPC, JPL Horizons nebo jiným nezávislým softwarem
   orientační, i když planetocentrický rámec a bodová gravitace Jupiteru fungují.
 - Poziční nejistoty jsou formálně propagovány z kovariance fitovaného stavu;
   nezahrnují všechny možné systematické chyby měření ani modelu.
+- RA/Dec v tabulce efemeridy jsou záměrně astrometrické ICRS/J2000 souřadnice
+  opravené o dobu letu světla, tedy protějšek astrometrického výsledku
+  `observe()` ve Skyfieldu. Nejde o zdánlivé RA/Dec k aktuálnímu ekvinokciu;
+  pro přímé navádění dalekohledu je nutný převod na zdánlivé souřadnice nebo
+  na zobrazené topocentrické hodnoty azimutu a výšky. Atmosférická refrakce se
+  bez místního tlaku a teploty neodhaduje.
 - Jediná předběžná dráha z velmi krátkého oblouku není jednoznačné řešení.
   Slouží jako počáteční odhad pro diferenciální korekci; efemerida se v tomto
   režimu přednastaví po 10 minutách na následujících 48 hodin a její skutečná

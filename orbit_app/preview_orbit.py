@@ -7,11 +7,13 @@ from threading import Lock
 import numpy as np
 
 from .domain import OrbitSolution
+from .observatories import dynamical_jd
 from .orbit_engine import NBodyIntegrator, StateVector
 from .planetary import PLANETS
 
 GAUSSIAN_K = 0.01720209895  # rad/day
 J2000_JD = 2451545.0
+C_AU_PER_DAY = 173.1446326846693
 
 # Numerical propagation of an old non-gravitational comet to the present can
 # take seconds.  All preview panels share the same OrbitSolution instance, so
@@ -71,9 +73,15 @@ def _cached_nbody_states(solution: OrbitSolution, epochs: np.ndarray) -> np.ndar
 
 
 def datetime_to_jd(value: datetime) -> float:
+    """Return the TDB Julian date used by the dynamical model.
+
+    UI datetimes are UTC.  A raw Unix-derived Julian date is therefore not a
+    suitable argument for DE440 or the numerical integrator; around the
+    present epoch UTC and TDB differ by roughly 69 seconds.
+    """
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
-    return value.timestamp() / 86400.0 + 2440587.5
+    return float(dynamical_jd([value])[0])
 
 
 def solve_kepler(mean_anomaly: np.ndarray, eccentricity: float) -> np.ndarray:
@@ -135,19 +143,20 @@ def _rotate_orbital_plane(solution: OrbitSolution, x_orbit: np.ndarray, y_orbit:
 def heliocentric_xyz(solution: OrbitSolution, jd: np.ndarray) -> np.ndarray:
     """Preview propagation in the J2000 ecliptic frame.
 
-    Ordinary solutions use the fast osculating conic.  Fitted cometary
-    non-gravitational solutions use the full force model so A1/A2/A3/DT remain
-    represented in ephemerides, sky tracks and photometry.
+    Every solution carrying a Cartesian state uses the same numerical force
+    model as the fit.  The osculating conic is only a fallback for catalogue
+    records that contain elements but no usable state vector.
     """
     a = solution.semi_major_axis_au
     e = solution.eccentricity
     epochs = np.asarray(jd, dtype=float)
     if (
-        solution.nongravitational_parameters and solution.position_au is not None
+        solution.position_au is not None
         and solution.velocity_au_per_day is not None and epochs.size
     ):
-        # A fitted non-gravitational solution must be propagated with the same
-        # force model; a Keplerian preview would rapidly discard A1/A2/A3/DT.
+        # A Keplerian preview would discard planetary perturbations and, when
+        # present, A1/A2/A3/DT.  Cache the full integration because all preview
+        # panels normally ask for overlapping epochs.
         order = np.argsort(epochs)
         sorted_epochs = epochs[order]
         states = _cached_nbody_states(solution, sorted_epochs)
@@ -201,10 +210,39 @@ def earth_xyz(jd: np.ndarray) -> np.ndarray:
     return np.stack([PLANETS.position("earth", float(epoch)) for epoch in epochs])
 
 
-def apparent_geometry(solution: OrbitSolution, jd: np.ndarray) -> dict[str, np.ndarray]:
-    target = heliocentric_xyz(solution, jd)
-    earth = earth_xyz(jd)
-    geo_ecl = target - earth
+def apparent_geometry(
+    solution: OrbitSolution, jd: np.ndarray,
+    observer_offsets_equatorial: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    """Return light-time-corrected astrometric J2000 geometry.
+
+    ``jd`` is TDB at reception.  Earth is evaluated at reception and the
+    target at the iterated emission time.  The returned RA/Dec are deliberately
+    astrometric ICRS/J2000 directions, not apparent-of-date coordinates; the
+    latter additionally depend on aberration, precession/nutation and light
+    deflection and are applied by Astropy when converting to Alt/Az.
+    """
+    epochs = np.atleast_1d(np.asarray(jd, dtype=float))
+    earth = earth_xyz(epochs)
+    observer = earth.copy()
+    if observer_offsets_equatorial is not None:
+        offsets = np.asarray(observer_offsets_equatorial, dtype=float)
+        if offsets.shape != earth.shape:
+            raise ValueError("Pole poloh pozorovatele neodpovídá epochám efemeridy.")
+        eps = np.radians(23.4392911)
+        observer += np.column_stack((
+            offsets[:, 0],
+            offsets[:, 1] * np.cos(eps) + offsets[:, 2] * np.sin(eps),
+            -offsets[:, 1] * np.sin(eps) + offsets[:, 2] * np.cos(eps),
+        ))
+    target = heliocentric_xyz(solution, epochs)
+    light_time = np.linalg.norm(target - observer, axis=1) / C_AU_PER_DAY
+    # Two fixed-point iterations leave a sub-millisecond light-time error for
+    # ordinary Solar-System velocities while avoiding a costly root solver.
+    for _ in range(2):
+        target = heliocentric_xyz(solution, epochs - light_time)
+        light_time = np.linalg.norm(target - observer, axis=1) / C_AU_PER_DAY
+    geo_ecl = target - observer
     eps = np.radians(23.4392911)
     x = geo_ecl[:, 0]
     y = geo_ecl[:, 1] * np.cos(eps) - geo_ecl[:, 2] * np.sin(eps)
@@ -215,14 +253,14 @@ def apparent_geometry(solution: OrbitSolution, jd: np.ndarray) -> dict[str, np.n
     dec = np.degrees(np.arcsin(np.clip(z / delta, -1.0, 1.0)))
     cos_phase = np.sum(target * geo_ecl, axis=1) / np.maximum(r * delta, 1e-12)
     phase = np.degrees(np.arccos(np.clip(cos_phase, -1.0, 1.0)))
-    sun_geo = -earth
+    sun_geo = -observer
     cos_elongation = np.sum(geo_ecl * sun_geo, axis=1) / np.maximum(
         delta * np.linalg.norm(sun_geo, axis=1), 1e-12
     )
     elongation = np.degrees(np.arccos(np.clip(cos_elongation, -1.0, 1.0)))
     return {
         "ra": ra, "dec": dec, "delta": delta, "r": r, "phase": phase,
-        "elongation": elongation, "xyz": target,
+        "elongation": elongation, "xyz": target, "light_time_days": light_time,
     }
 
 

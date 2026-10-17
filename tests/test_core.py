@@ -46,7 +46,10 @@ from orbit_app.orbit_fit import (
     fit_orbit, fit_selection_count, parse_observation_time,
 )
 from orbit_app.photometry import estimate_absolute_magnitude, power_law_magnitude
-from orbit_app.preview_orbit import apparent_geometry, demo_solution, heliocentric_xyz, orbital_curve_xyz, solve_kepler
+from orbit_app.preview_orbit import (
+    apparent_geometry, datetime_to_jd, demo_solution, heliocentric_xyz,
+    orbital_curve_xyz, solve_kepler,
+)
 
 
 class PhotometryTests(unittest.TestCase):
@@ -528,6 +531,39 @@ class PreviewGeometryTests(unittest.TestCase):
         for values in result.values():
             self.assertTrue(np.all(np.isfinite(values)))
         self.assertTrue(np.all((result["ra"] >= 0) & (result["ra"] < 360)))
+
+    def test_ui_utc_is_converted_to_tdb_for_dynamics(self):
+        utc_jd = 2460966.5
+        converted = datetime_to_jd(datetime(2025, 10, 18, tzinfo=timezone.utc))
+        self.assertGreater(converted, utc_jd + 60.0 / 86400.0)
+        self.assertLess(converted, utc_jd + 80.0 / 86400.0)
+
+    def test_cartesian_solution_uses_nbody_even_without_comet_parameters(self):
+        solution = OrbitSolution(
+            "test", 2460000.5, 2.0, .2, 3.0, 4.0, 5.0, 6.0,
+            position_au=(1.0, 0.0, 0.0),
+            velocity_au_per_day=(0.0, .01, 0.0),
+        )
+        propagated = np.array([[2.0, 3.0, 4.0, 0.0, 0.0, 0.0]])
+        with patch("orbit_app.preview_orbit._cached_nbody_states", return_value=propagated) as mocked:
+            result = heliocentric_xyz(solution, np.array([2460001.5]))
+        self.assertTrue(np.array_equal(result, propagated[:, :3]))
+        mocked.assert_called_once()
+
+    def test_astrometric_geometry_iterates_target_light_time(self):
+        epoch = 2460000.5
+
+        def moving_target(_solution, epochs):
+            values = np.asarray(epochs, dtype=float)
+            return np.column_stack((10.0 + .02 * (values - epoch), values * 0.0, values * 0.0))
+
+        with (
+            patch("orbit_app.preview_orbit.heliocentric_xyz", side_effect=moving_target),
+            patch("orbit_app.preview_orbit.earth_xyz", return_value=np.zeros((1, 3))),
+        ):
+            result = apparent_geometry(demo_solution(), np.array([epoch]))
+        self.assertLess(float(result["xyz"][0, 0]), 10.0)
+        self.assertAlmostEqual(float(result["light_time_days"][0]), 10.0 / 173.1446, delta=1e-4)
 
     def test_osculating_curve_has_no_wrap_chords(self):
         curve, valid = orbital_curve_xyz(demo_solution(), 30.0)
