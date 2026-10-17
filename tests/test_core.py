@@ -592,6 +592,38 @@ class OrbitFitSelectionTests(unittest.TestCase):
         self.assertEqual(fit_once.call_args_list[0].kwargs["maximum_observations"], 120)
         self.assertIn("posledního pozorovaného návratu", solution.fit_model_note)
 
+    def test_long_arc_dt_is_seeded_after_a_parameters(self):
+        observations = [
+            Observation(
+                time=f"1835-10-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
+            )
+            for day in range(1, 7)
+        ] + [
+            Observation(
+                time=f"1986-03-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
+            )
+            for day in range(1, 11)
+        ]
+        solution = OrbitSolution(
+            "1P", 2446470.5, 17.8, .967, 162.3, 58.4, 111.3, 0.0,
+            position_au=(.586, 0.0, 0.0), velocity_au_per_day=(0.0, .03, 0.0),
+        )
+        calls = []
+
+        def fake_fit(*args, **kwargs):
+            calls.append(dict(args[4] or {}))
+            if len(calls) == 1:
+                solution.nongravitational_parameters = {"A1": 2e-8}
+            return solution, 1.0, 10
+
+        with (
+            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit),
+            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
+        ):
+            fit_orbit(observations, solution, nongravitational={"A1": 0.0, "DT": 30.0})
+        self.assertEqual(calls[0], {"A1": 0.0})
+        self.assertEqual(calls[1], {"A1": 2e-8, "DT": 30.0})
+
     def test_multi_apparition_table_includes_next_future_return(self):
         solution = OrbitSolution(
             "1P", 2446470.5, 17.8, .967, 162.3, 58.4, 111.3, 0.0,

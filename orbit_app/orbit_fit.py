@@ -899,11 +899,17 @@ def _fit_orbit_once(
             for name in nongrav_names
         ]),
     ))
-    initial_vector = np.concatenate((
-        propagate(
+    try:
+        initial_state_at_reference = propagate(
             source_parameters, source_state, np.array([reference_epoch]), exact_full_engine,
-        )[0],
-        source_parameters[6:],
+        )[0]
+    except (RuntimeError, ValueError, FloatingPointError, OverflowError) as exc:
+        raise OrbitFitError(
+            "Počáteční kombinaci A1/A2/A3/DT se nepodařilo stabilně integrovat. "
+            "Zkuste začít s hodnotami parametrů blízkými nule."
+        ) from exc
+    initial_vector = np.concatenate((
+        initial_state_at_reference, source_parameters[6:],
     ))
     earth_at_observations = earth_heliocentric_ecliptic(epochs)
 
@@ -912,10 +918,14 @@ def _fit_orbit_once(
     ) -> np.ndarray:
         state = StateVector(reference_epoch, vector[:3], vector[3:6])
         propagated = propagate(vector, state, epochs, engine)
+        if not np.all(np.isfinite(propagated)):
+            raise FloatingPointError("Integrace vrátila nekonečný stav.")
         light_time = np.linalg.norm(
             propagated[:, :3] - earth_at_observations, axis=1
         ) / C_AU_PER_DAY
         emitted = propagate(vector, state, epochs - light_time, engine)
+        if not np.all(np.isfinite(emitted)):
+            raise FloatingPointError("Integrace po opravě o dobu letu selhala.")
         computed_ra, computed_dec = _equatorial_direction(
             emitted, epochs, observer_offsets, earth_at_observations,
         )
@@ -927,7 +937,15 @@ def _fit_orbit_once(
     def residuals_with_engine(
         vector: np.ndarray, engine: NBodyIntegrator,
     ) -> np.ndarray:
-        astrometry = astrometric_residuals(vector, engine) / astrometric_sigmas
+        try:
+            astrometry = astrometric_residuals(vector, engine) / astrometric_sigmas
+        except (RuntimeError, ValueError, FloatingPointError, OverflowError):
+            # Numerical least-squares deliberately probes both sides of every
+            # parameter. With free A1/A2/A3/DT one such trial can imply a
+            # collision with the Sun or absurd outgassing, forcing solve_ivp
+            # below machine step size. That trial is a bad point in parameter
+            # space, not a reason to abort the otherwise valid fit.
+            astrometry = np.full(observed_ra.size * 2, 1e12, dtype=float)
         if not constraints:
             return astrometry
         try:
@@ -1009,7 +1027,13 @@ def _fit_orbit_once(
         raise OrbitFitError(result.message)
     elements = cartesian_to_elements(result.x[:3], result.x[3:6])
     reporting_engine = optimizer_engine if screening else full_engine
-    final_astrometric_residual = astrometric_residuals(result.x, reporting_engine)
+    try:
+        final_astrometric_residual = astrometric_residuals(result.x, reporting_engine)
+    except (RuntimeError, ValueError, FloatingPointError, OverflowError) as exc:
+        raise OrbitFitError(
+            "Fit skončil v numericky nestabilní kombinaci A1/A2/A3/DT. "
+            "Zkuste vypnout DT nebo některý slabě určený negravitační parametr."
+        ) from exc
     rms = float(np.sqrt(np.mean(np.square(final_astrometric_residual))))
     normalized_rms = float(np.sqrt(np.mean(np.square(
         final_astrometric_residual / astrometric_sigmas
@@ -1055,12 +1079,20 @@ def _fit_orbit_once(
     report_ra = np.array([item[2] for item in reportable])
     report_dec = np.array([item[3] for item in reportable])
     report_state = StateVector(reference_epoch, result.x[:3], result.x[3:6])
-    report_positions = propagate(result.x, report_state, report_epochs, full_engine)
-    report_earth = earth_heliocentric_ecliptic(report_epochs)
-    report_light_time = np.linalg.norm(report_positions[:, :3] - report_earth, axis=1) / C_AU_PER_DAY
-    report_emitted = propagate(
-        result.x, report_state, report_epochs - report_light_time, full_engine
-    )
+    try:
+        report_positions = propagate(result.x, report_state, report_epochs, full_engine)
+        report_earth = earth_heliocentric_ecliptic(report_epochs)
+        report_light_time = np.linalg.norm(
+            report_positions[:, :3] - report_earth, axis=1,
+        ) / C_AU_PER_DAY
+        report_emitted = propagate(
+            result.x, report_state, report_epochs - report_light_time, full_engine
+        )
+    except (RuntimeError, ValueError, FloatingPointError, OverflowError) as exc:
+        raise OrbitFitError(
+            "Kontrolní integrace O−C skončila v nestabilní kombinaci "
+            "A1/A2/A3/DT; zkuste vypnout nejslaběji určený parametr."
+        ) from exc
     computed_ra, computed_dec = _equatorial_direction(
         report_emitted, report_epochs, report_offsets, report_earth,
     )
@@ -1395,9 +1427,16 @@ def fit_orbit(
             # First lock onto the best-observed modern apparition.  Correcting
             # all six state components across a century immediately forces
             # every numerical Jacobian evaluation to repeat that full span.
+            seed_nongrav = (
+                {
+                    name: value for name, value in (nongravitational or {}).items()
+                    if name != "DT"
+                }
+                if "DT" in (nongravitational or {}) else nongravitational
+            )
             seed = _fit_orbit_once(
                 recent_apparition, initial, constraints, truncate_years,
-                nongravitational, maximum_observations=120,
+                seed_nongrav, maximum_observations=120,
                 max_nfev=4, robust_loss=True,
             )
             # The dedicated A1/A2/A3 pass below performs the one expensive
@@ -1416,8 +1455,18 @@ def fit_orbit(
     # complete time/station distribution, so a nongravitational solution uses
     # the subset only as a seed and is finally corrected on every enabled row.
     if nongravitational:
+        # Preserve A1/A2/A3 found by the recent-apparition seed. In particular,
+        # DT has no derivative while all acceleration components are zero; a
+        # staged A-fit followed by A+DT is much better conditioned than asking
+        # the optimiser to discover all four parameters simultaneously.
+        final_nongrav = dict(nongravitational)
+        final_nongrav.update({
+            name: value
+            for name, value in (result[0].nongravitational_parameters or {}).items()
+            if name in final_nongrav
+        })
         result = _fit_orbit_once(
-            observations, result[0], constraints, truncate_years, nongravitational,
+            observations, result[0], constraints, truncate_years, final_nongrav,
             maximum_observations=480 if long_arc else None,
             max_nfev=4 if long_arc else 12, robust_loss=True,
         )
