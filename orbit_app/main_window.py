@@ -3445,7 +3445,7 @@ class ElementsPanel(QWidget):
         epoch_controls.addWidget(self.element_center)
         epoch_controls.addStretch()
         self.epoch_note = QLabel(
-            "Převod používá N-body integraci s planetami a případnými A1–A3. "
+            "Převod používá N-body integraci s planetami a případnými A1–A3/DT. "
             f"Aktivní planetární efemerida: {PLANETS.model_name}."
         )
         self.epoch_note.setObjectName("muted"); self.epoch_note.setWordWrap(True)
@@ -3586,7 +3586,7 @@ class ElementsPanel(QWidget):
         ]
         if s.nongravitational_parameters:
             lines.append("Nongravitational parameters (Marsden water-ice model):")
-            for name in ("A1", "A2", "A3"):
+            for name in ("A1", "A2", "A3", "DT"):
                 if name in s.nongravitational_parameters:
                     value = s.nongravitational_parameters[name]
                     uncertainty = (s.element_uncertainties or {}).get(name)
@@ -3594,7 +3594,9 @@ class ElementsPanel(QWidget):
                         f" +/- {uncertainty:.3e}" if uncertainty is not None
                         and np.isfinite(uncertainty) else ""
                     )
-                    lines.append(f"{name}   {value:+.6e}{suffix} AU/day^2")
+                    unit = "days" if name == "DT" else "AU/day^2"
+                    value_text = f"{value:+.6f}" if name == "DT" else f"{value:+.6e}"
+                    lines.append(f"{name}   {value_text}{suffix} {unit}")
         if s.dynamical_1a:
             dynamics = s.dynamical_1a
             lines.extend(("", "Původní a budoucí barycentrická dráha:"))
@@ -3973,18 +3975,37 @@ class OrbitConstraintsDialog(QDialog):
                 ("A1", "A1 radiální [10⁻⁸ AU/den²]"),
                 ("A2", "A2 příčný [10⁻⁸ AU/den²]"),
                 ("A3", "A3 normálový [10⁻⁸ AU/den²]"),
+                ("DT", "DT zpoždění aktivity [dny]"),
             ):
                 enabled = QCheckBox("fitovat")
                 editor = QDoubleSpinBox()
-                editor.setDecimals(6); editor.setRange(-10_000.0, 10_000.0)
-                editor.setSingleStep(.1)
-                editor.setValue(float(current_ng.get(name, 0.0)) / 1e-8)
+                editor.setDecimals(6)
+                editor.setRange(
+                    -1_000.0 if name == "DT" else -10_000.0,
+                    1_000.0 if name == "DT" else 10_000.0,
+                )
+                editor.setSingleStep(.5 if name == "DT" else .1)
+                scale = 1.0 if name == "DT" else 1e-8
+                editor.setValue(float(current_ng.get(name, 0.0)) / scale)
                 enabled.setChecked(name in (nongravitational or {}))
                 row = QWidget(); row_layout = QHBoxLayout(row)
                 row_layout.setContentsMargins(0, 0, 0, 0)
                 row_layout.addWidget(enabled); row_layout.addWidget(editor, 1)
                 form.addRow(label, row)
                 self.ng_controls[name] = (enabled, editor)
+            dt_enabled, dt_editor = self.ng_controls["DT"]
+            a_checks = [self.ng_controls[name][0] for name in ("A1", "A2", "A3")]
+
+            def sync_dt_availability() -> None:
+                available = any(control.isChecked() for control in a_checks)
+                dt_enabled.setEnabled(available)
+                dt_editor.setEnabled(available)
+                if not available:
+                    dt_enabled.setChecked(False)
+
+            for control in a_checks:
+                control.toggled.connect(sync_dt_availability)
+            sync_dt_availability()
             dynamics_heading = QLabel("Dlouhodobá dynamika komety")
             dynamics_heading.setStyleSheet("font-weight: 650; margin-top: 10px;")
             form.addRow(dynamics_heading)
@@ -3999,7 +4020,8 @@ class OrbitConstraintsDialog(QDialog):
             comparison_note = QLabel(
                 "Pro přímé porovnání s publikovanou dráhou zapněte stejnou sadu "
                 "parametrů. Například řešení JPL s A1+A2 nelze přesně porovnávat "
-                "s fitem A1+A2+A3; volný A3 může kvůli korelacím posunout i A1 a A2."
+                "s fitem A1+A2+A3+DT; volné A3 a DT mohou kvůli korelacím "
+                "posunout i A1 a A2."
             )
             comparison_note.setWordWrap(True)
             comparison_note.setObjectName("muted")
@@ -4012,8 +4034,9 @@ class OrbitConstraintsDialog(QDialog):
                 "MPC neposkytlo počáteční dráhu, proto bude nejprve určena z astrometrie; "
                 "fixace elementů se zpřístupní po prvním úspěšném fitu. "
             )
-            + "A1–A3 se fitují jako volné parametry a mají smysl především pro "
-              "dostatečně dlouhý oblouk komety."
+            + "A1–A3 a volitelný časový posun DT se fitují jako volné parametry. "
+              "DT má smysl především u více návratů; kladná hodnota znamená "
+              "maximum aktivity po perihelu."
         )
         note.setWordWrap(True); note.setObjectName("muted")
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -4046,11 +4069,14 @@ class OrbitConstraintsDialog(QDialog):
         return {name: editor.value() for name, (enabled, editor) in self.controls.items() if enabled.isChecked()}
 
     def selected_nongravitational(self) -> dict[str, float]:
-        return {
-            name: editor.value() * 1e-8
+        selected = {
+            name: editor.value() * (1.0 if name == "DT" else 1e-8)
             for name, (enabled, editor) in self.ng_controls.items()
             if enabled.isChecked()
         }
+        if "DT" in selected and not any(name in selected for name in ("A1", "A2", "A3")):
+            selected.pop("DT")
+        return selected
 
     def calculate_original_future(self) -> bool:
         return self.is_comet and self.original_future.isChecked()

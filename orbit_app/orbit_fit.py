@@ -244,9 +244,10 @@ def _formal_element_uncertainties(
             "perihelion_jd": peri_sigma,
         })
         for index, name in enumerate(nongrav_names, start=6):
-            # A parameters are scaled by 1e-8 inside the optimiser.
+            # A parameters are scaled by 1e-8 inside the optimiser; DT is days.
+            scale = 1.0 if name == "DT" else 1e-8
             uncertainties[name] = float(
-                np.sqrt(max(0.0, parameter_covariance[index, index])) * 1e-8
+                np.sqrt(max(0.0, parameter_covariance[index, index])) * scale
             )
         return uncertainties, state_covariance
     except (ValueError, FloatingPointError, np.linalg.LinAlgError, ZeroDivisionError):
@@ -814,14 +815,18 @@ def _fit_orbit_once(
     observed_dec = np.array([item[3] for item in usable])
     astrometric_sigmas = _observation_sigmas(usable)
     nongrav_names = tuple(
-        name for name in ("A1", "A2", "A3") if name in (nongravitational or {})
+        name for name in ("A1", "A2", "A3", "DT")
+        if name in (nongravitational or {})
     )
-    initial_nongrav = dict(initial.nongravitational_parameters or {})
+    initial_nongrav = {
+        name: float((initial.nongravitational_parameters or {}).get(name, 0.0))
+        for name in nongrav_names
+    }
     initial_nongrav.update(nongravitational or {})
 
     def nongrav_from_vector(vector: np.ndarray) -> dict[str, float]:
         return {
-            name: float(vector[6 + index]) * 1e-8
+            name: float(vector[6 + index]) * (1.0 if name == "DT" else 1e-8)
             for index, name in enumerate(nongrav_names)
         }
 
@@ -889,7 +894,10 @@ def _fit_orbit_once(
     # This shortens every integration and improves numerical conditioning.
     source_parameters = np.concatenate((
         source_state.packed(),
-        np.array([initial_nongrav.get(name, 0.0) / 1e-8 for name in nongrav_names]),
+        np.array([
+            initial_nongrav.get(name, 0.0) / (1.0 if name == "DT" else 1e-8)
+            for name in nongrav_names
+        ]),
     ))
     initial_vector = np.concatenate((
         propagate(
@@ -946,12 +954,14 @@ def _fit_orbit_once(
         np.array([1e-3, 1e-3, 1e-3, 1e-5, 1e-5, 1e-5]),
         np.ones(len(nongrav_names)),
     ))
-    lower_bounds = np.concatenate((
-        np.full(6, -np.inf), np.full(len(nongrav_names), -1e4),
-    ))
-    upper_bounds = np.concatenate((
-        np.full(6, np.inf), np.full(len(nongrav_names), 1e4),
-    ))
+    nongrav_lower = np.array([
+        -1000.0 if name == "DT" else -1e4 for name in nongrav_names
+    ])
+    nongrav_upper = np.array([
+        1000.0 if name == "DT" else 1e4 for name in nongrav_names
+    ])
+    lower_bounds = np.concatenate((np.full(6, -np.inf), nongrav_lower))
+    upper_bounds = np.concatenate((np.full(6, np.inf), nongrav_upper))
 
     if derived_initial:
         # The angles-only initializer deliberately favours a broad basin over

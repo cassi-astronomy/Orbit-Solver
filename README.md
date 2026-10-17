@@ -24,9 +24,8 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
 - podpora družicových pozorování a topocentrické paralaxy podle kódu stanice MPC;
 - vlastní šestiparametrový fit kartézského stavu s planetárními perturbacemi;
 - rychlý gravitační fit velkých souborů z časově i početně reprezentativního
-  vzorku; u krátkého objevitelského oblouku a při výpočtu A1/A2/A3 slouží vzorek pouze
-  k počátečnímu přiblížení a závěrečný fit i kovariance používají všechna
-  aktivní pozorování;
+  vzorku; u krátkého objevitelského oblouku se finální větev ověří na všech
+  měřeních a dlouhé negravitační řešení používá větší reprezentativní vzorek;
 - výpočet z celého oblouku nebo pouze z posledních 2, 5 či 10 let;
 - ruční zařazení a vyřazení jednotlivých pozorování;
 - barevná rezidua O−C, automatické vyřazení reziduí nad 2″ a funkce `Worst obs`;
@@ -37,7 +36,8 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
   při zapnutém negravitačním modelu slouží poslední návrat jako počáteční
   korekce pro společný fit celého oblouku;
 - volitelné fixování oskulačních elementů;
-- volitelný fit negravitačních parametrů komet A1, A2 a A3;
+- volitelný fit negravitačních parametrů komet A1, A2, A3 a časového posunu
+  aktivity DT; kladné DT posouvá maximum aktivity za perihel;
 - nejistoty elementů a základní diagnostika fitu.
 
 ### Elementy a efemerida
@@ -197,8 +197,10 @@ aplikací nutné porovnat s MPC, JPL Horizons nebo jiným nezávislým softwarem
   na méně přesný model.
 - Samostatný Měsíc je zahrnut; Pluto, relativistické členy a perturbace hmotných
   planetek zatím v dynamickém modelu zahrnuty nejsou.
-- Konstantní A1/A2/A3 při integraci komety přes mnoho návratů jsou modelový
+- Konstantní A1/A2/A3/DT při integraci komety přes mnoho návratů jsou modelový
   předpoklad; skutečná negravitační aktivita komety se může mezi návraty měnit.
+  DT je vhodné uvolnit až pro dlouhý oblouk, protože na jednom krátkém zjevení
+  bývá silně korelované hlavně s A2.
 - Velmi těsné průlety u povrchu Jupiteru zatím nezahrnují jeho zploštění ani
   Galileovy měsíce. Rekonstrukce rozpadu Shoemaker–Levy 9 proto zůstává
   orientační, i když planetocentrický rámec a bodová gravitace Jupiteru fungují.

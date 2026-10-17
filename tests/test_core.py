@@ -24,7 +24,8 @@ from orbit_app.observatories import (
     station_offsets_gcrs,
 )
 from orbit_app.orbit_engine import (
-    MU_SUN, NBodyIntegrator, StateVector, marsden_water_ice_law,
+    MU_SUN, NBodyIntegrator, StateVector, delayed_heliocentric_radius,
+    marsden_water_ice_law,
     nongravitational_acceleration,
 )
 from orbit_app.orbit_evolution import (
@@ -994,6 +995,27 @@ class NativeIntegratorTests(unittest.TestCase):
             {"A1": 1e-8, "A2": 2e-8, "A3": -3e-8},
         )
         np.testing.assert_allclose(acceleration, [1e-8, 2e-8, -3e-8], rtol=2e-5)
+
+    def test_dt_uses_earlier_osculating_distance(self):
+        position = np.array([0.5, 0.0, 0.0])
+        velocity = np.array([0.0, math.sqrt(MU_SUN * 3.0), 0.0])
+        shifted_radius = delayed_heliocentric_radius(position, velocity, 30.0)
+        self.assertGreater(shifted_radius, 0.5)
+        symmetric = nongravitational_acceleration(
+            position, velocity, {"A1": 1e-8},
+        )
+        delayed = nongravitational_acceleration(
+            position, velocity, {"A1": 1e-8, "DT": 30.0},
+        )
+        self.assertLess(float(np.linalg.norm(delayed)), float(np.linalg.norm(symmetric)))
+
+    def test_dt_preserves_radius_of_circular_orbit(self):
+        radius = delayed_heliocentric_radius(
+            np.array([1.0, 0.0, 0.0]),
+            np.array([0.0, math.sqrt(MU_SUN), 0.0]),
+            120.0,
+        )
+        self.assertAlmostEqual(radius, 1.0, places=10)
 
     def test_zero_length_propagation_returns_initial_state(self):
         state = StateVector(2451545.0, np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.01, 0.0]))

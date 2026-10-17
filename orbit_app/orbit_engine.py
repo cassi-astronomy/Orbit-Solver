@@ -19,11 +19,75 @@ def marsden_water_ice_law(radius_au: float | np.ndarray) -> float | np.ndarray:
     return float(result) if result.ndim == 0 else result
 
 
+def _stumpff(z: float) -> tuple[float, float]:
+    """Return universal-variable Stumpff C(z), S(z)."""
+    if abs(z) < 1e-7:
+        return (
+            0.5 - z / 24.0 + z * z / 720.0,
+            1.0 / 6.0 - z / 120.0 + z * z / 5040.0,
+        )
+    if z > 0.0:
+        root = np.sqrt(z)
+        return (float((1.0 - np.cos(root)) / z),
+                float((root - np.sin(root)) / root**3))
+    root = min(float(np.sqrt(-z)), 50.0)
+    return (float((np.cosh(root) - 1.0) / (-z)),
+            float((np.sinh(root) - root) / root**3))
+
+
+def delayed_heliocentric_radius(
+    position: np.ndarray, velocity: np.ndarray, delay_days: float,
+) -> float:
+    """Two-body estimate of r(t-DT) for the asymmetric Marsden model.
+
+    The RTN acceleration direction remains tied to the instantaneous state;
+    only the water-ice activity law is evaluated at the osculating heliocentric
+    distance ``DT`` days earlier. Positive DT therefore moves peak activity
+    after perihelion, matching the JPL/Find_Orb convention.
+    """
+    r0_vector = np.asarray(position, dtype=float)
+    v0_vector = np.asarray(velocity, dtype=float)
+    r0 = float(np.linalg.norm(r0_vector))
+    dt = -float(delay_days)
+    if r0 <= 0.0 or abs(dt) < 1e-12:
+        return r0
+    speed2 = float(np.dot(v0_vector, v0_vector))
+    radial_speed = float(np.dot(r0_vector, v0_vector)) / r0
+    sqrt_mu = float(np.sqrt(MU_SUN))
+    alpha = 2.0 / r0 - speed2 / MU_SUN
+    anomaly = sqrt_mu * dt * (abs(alpha) if abs(alpha) > 1e-8 else 1.0 / r0)
+    for _ in range(16):
+        z = alpha * anomaly * anomaly
+        c_value, s_value = _stumpff(z)
+        function = (
+            r0 * radial_speed / sqrt_mu * anomaly**2 * c_value
+            + (1.0 - alpha * r0) * anomaly**3 * s_value
+            + r0 * anomaly - sqrt_mu * dt
+        )
+        derivative = (
+            r0 * radial_speed / sqrt_mu * anomaly * (1.0 - z * s_value)
+            + (1.0 - alpha * r0) * anomaly**2 * c_value + r0
+        )
+        if not np.isfinite(function) or not np.isfinite(derivative) or abs(derivative) < 1e-14:
+            return r0
+        correction = function / derivative
+        anomaly -= correction
+        if abs(correction) < 1e-12:
+            break
+    z = alpha * anomaly * anomaly
+    c_value, s_value = _stumpff(z)
+    f_value = 1.0 - anomaly * anomaly / r0 * c_value
+    g_value = dt - anomaly**3 / sqrt_mu * s_value
+    shifted = f_value * r0_vector + g_value * v0_vector
+    radius = float(np.linalg.norm(shifted))
+    return radius if np.isfinite(radius) and radius > 0.0 else r0
+
+
 def nongravitational_acceleration(
     position: np.ndarray, velocity: np.ndarray,
     parameters: dict[str, float] | None,
 ) -> np.ndarray:
-    """Marsden A1/A2/A3 acceleration in the instantaneous RTN frame."""
+    """Marsden A1/A2/A3/DT acceleration in the instantaneous RTN frame."""
     if not parameters or not any(float(parameters.get(name, 0.0)) for name in ("A1", "A2", "A3")):
         return np.zeros(3, dtype=float)
     position = np.asarray(position, dtype=float)
@@ -41,7 +105,10 @@ def nongravitational_acceleration(
         float(parameters.get("A2", 0.0)) * transverse +
         float(parameters.get("A3", 0.0)) * normal
     )
-    return float(marsden_water_ice_law(radius)) * direction
+    activity_radius = delayed_heliocentric_radius(
+        position, velocity, float(parameters.get("DT", 0.0)),
+    )
+    return float(marsden_water_ice_law(activity_radius)) * direction
 
 
 @dataclass(frozen=True, slots=True)

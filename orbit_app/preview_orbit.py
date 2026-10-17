@@ -136,7 +136,7 @@ def heliocentric_xyz(solution: OrbitSolution, jd: np.ndarray) -> np.ndarray:
     """Preview propagation in the J2000 ecliptic frame.
 
     Ordinary solutions use the fast osculating conic.  Fitted cometary
-    non-gravitational solutions use the full force model so A1/A2/A3 remain
+    non-gravitational solutions use the full force model so A1/A2/A3/DT remain
     represented in ephemerides, sky tracks and photometry.
     """
     a = solution.semi_major_axis_au
@@ -147,7 +147,7 @@ def heliocentric_xyz(solution: OrbitSolution, jd: np.ndarray) -> np.ndarray:
         and solution.velocity_au_per_day is not None and epochs.size
     ):
         # A fitted non-gravitational solution must be propagated with the same
-        # force model; a Keplerian preview would rapidly discard A1/A2/A3.
+        # force model; a Keplerian preview would rapidly discard A1/A2/A3/DT.
         order = np.argsort(epochs)
         sorted_epochs = epochs[order]
         states = _cached_nbody_states(solution, sorted_epochs)
