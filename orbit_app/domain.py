@@ -51,6 +51,7 @@ class OrbitSolution:
     state_covariance: tuple[tuple[float, ...], ...] | None = None
     element_uncertainties: dict[str, float] | None = None
     fit_observation_count: int | None = None
+    fit_available_observation_count: int | None = None
     fit_rms_arcsec: float | None = None
     fit_normalized_rms: float | None = None
     display_name: str | None = None

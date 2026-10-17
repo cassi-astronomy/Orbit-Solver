@@ -818,6 +818,7 @@ def _fit_orbit_once(
     if len(usable) < 6:
         raise OrbitFitError("Pro vlastní fit je potřeba alespoň šest platných astrometrických pozorování.")
     usable.sort(key=lambda item: item[1])
+    available_observation_count = len(usable)
     # Bound interactive run time while retaining the full time baseline.
     if maximum_observations is not None and len(usable) > maximum_observations:
         all_usable_epochs = dynamical_jd([item[1] for item in usable])
@@ -1089,6 +1090,7 @@ def _fit_orbit_once(
         ),
         element_uncertainties=uncertainties,
         fit_observation_count=len(usable),
+        fit_available_observation_count=available_observation_count,
         fit_rms_arcsec=rms,
         fit_normalized_rms=normalized_rms,
         display_name=initial.display_name,
@@ -1174,18 +1176,11 @@ def _is_automatic_rejection_candidate(
     )
 
 
-def _latest_observing_apparition(
+def _observing_apparition_groups(
     observations: list[Observation], solution: OrbitSolution | None = None,
-    gap_years: float = 30.0, minimum_size: int = 1,
-) -> list[Observation]:
-    """Return the latest sufficiently populated observing apparition.
-
-    For a bound periodic comet, observations are assigned to the nearest
-    perihelion passage using the seed orbit's period.  This works for both
-    Halley-type comets and short-period objects such as Encke; a fixed
-    decades-long gap does not.  The old gap split remains a deliberately
-    conservative fallback when no usable periodic comet orbit is available.
-    """
+    gap_years: float = 30.0,
+) -> list[list[Observation]]:
+    """Split valid astrometry into chronological observing apparitions."""
     dated: list[tuple[datetime, Observation]] = []
     for observation in observations:
         if (
@@ -1227,10 +1222,7 @@ def _latest_observing_apparition(
             groups: dict[int, list[Observation]] = {}
             for passage, (_instant, observation) in zip(passage_indices, dated):
                 groups.setdefault(int(passage), []).append(observation)
-            for passage in sorted(groups, reverse=True):
-                if len(groups[passage]) >= max(1, minimum_size):
-                    return groups[passage]
-            return groups[max(groups)]
+            return [groups[passage] for passage in sorted(groups)]
 
     minimum_gap = gap_years * 365.25 * 86400.0
     blocks: list[list[Observation]] = []
@@ -1240,6 +1232,24 @@ def _latest_observing_apparition(
             blocks.append([item[1] for item in dated[start:index]])
             start = index
     blocks.append([item[1] for item in dated[start:]])
+    return blocks
+
+
+def _latest_observing_apparition(
+    observations: list[Observation], solution: OrbitSolution | None = None,
+    gap_years: float = 30.0, minimum_size: int = 1,
+) -> list[Observation]:
+    """Return the latest sufficiently populated observing apparition.
+
+    For a bound periodic comet, observations are assigned to the nearest
+    perihelion passage using the seed orbit's period.  This works for both
+    Halley-type comets and short-period objects such as Encke; a fixed
+    decades-long gap does not.  The old gap split remains a deliberately
+    conservative fallback when no usable periodic comet orbit is available.
+    """
+    blocks = _observing_apparition_groups(observations, solution, gap_years)
+    if not blocks:
+        return []
     for block in reversed(blocks):
         if len(block) >= max(1, minimum_size):
             return block
@@ -1418,6 +1428,7 @@ def fit_orbit(
     multi_apparition = False
     multi_apparition_seed: tuple[OrbitSolution, float, int] | None = None
     seed_report: list[tuple[float | None, float | None, bool | None]] | None = None
+    apparition_groups: list[list[Observation]] = []
     if multibranch:
         initial_candidates = initial_orbit_from_observations(
             observations, return_candidates=True,
@@ -1497,14 +1508,17 @@ def fit_orbit(
             and 0.0 <= initial.eccentricity < 1.0
             and initial.semi_major_axis_au > 0.0
         )
-        recent_apparition = (
-            _latest_observing_apparition(
-                observations, initial, minimum_size=6,
-            )
+        apparition_groups = (
+            [
+                group for group in _observing_apparition_groups(observations, initial)
+                if len(group) >= 6
+            ]
             if periodic_comet else []
         )
+        recent_apparition = apparition_groups[-1] if apparition_groups else []
         multi_apparition = bool(
-            periodic_comet and 6 <= len(recent_apparition) < active_count
+            periodic_comet and len(apparition_groups) >= 2
+            and 6 <= len(recent_apparition) < active_count
         )
         if (
             multi_apparition and not nongravitational
@@ -1522,7 +1536,7 @@ def fit_orbit(
             result = _fit_orbit_once(
                 recent_apparition, initial, constraints, truncate_years,
                 None, maximum_observations=120,
-                max_nfev=4, robust_loss=True,
+                max_nfev=8, robust_loss=True,
             )
             result[0].fit_model_note = (
                 "Bez A1–A3 byl fit určen z posledního pozorovaného návratu; "
@@ -1543,8 +1557,62 @@ def fit_orbit(
             seed = _fit_orbit_once(
                 recent_apparition, initial, constraints, truncate_years,
                 seed_nongrav, maximum_observations=120,
-                max_nfev=4, robust_loss=True,
+                max_nfev=8, robust_loss=True,
             )
+            # A four-parameter comet model may need more than the quick seed
+            # pass even within the modern apparition.  Only pay for a denser
+            # polishing pass when the first result is visibly worse than the
+            # expected CCD astrometry; this specifically prevents carrying
+            # 8–18 arcsecond 1986 residuals into the historical linkage.
+            seed_normalized = seed[0].fit_normalized_rms
+            if (
+                seed[1] > 3.0
+                or seed_normalized is None
+                or not np.isfinite(seed_normalized)
+                or seed_normalized > 3.0
+            ):
+                unpolished_report = [
+                    (
+                        observation.residual_ra_arcsec,
+                        observation.residual_dec_arcsec,
+                        observation.used_in_fit,
+                    )
+                    for observation in observations
+                ]
+                polished_nongrav = dict(nongravitational or {})
+                polished_nongrav.update({
+                    name: value
+                    for name, value in (
+                        seed[0].nongravitational_parameters or {}
+                    ).items()
+                    if name in polished_nongrav
+                })
+                try:
+                    polished = _fit_orbit_once(
+                        recent_apparition, seed[0], constraints, truncate_years,
+                        polished_nongrav, maximum_observations=240,
+                        max_nfev=12, robust_loss=True,
+                    )
+                    if polished[1] < seed[1]:
+                        seed = polished
+                    else:
+                        for observation, values in zip(
+                            observations, unpolished_report,
+                        ):
+                            (
+                                observation.residual_ra_arcsec,
+                                observation.residual_dec_arcsec,
+                                observation.used_in_fit,
+                            ) = values
+                except (OrbitFitError, ValueError, RuntimeError, FloatingPointError):
+                    for observation, values in zip(
+                        observations, unpolished_report,
+                    ):
+                        (
+                            observation.residual_ra_arcsec,
+                            observation.residual_dec_arcsec,
+                            observation.used_in_fit,
+                        ) = values
             # The dedicated A1/A2/A3 pass below performs the one expensive
             # full-arc correction. Avoid doing the same century integration
             # twice merely to manufacture another intermediate seed.
@@ -1574,49 +1642,91 @@ def fit_orbit(
         # DT has no derivative while all acceleration components are zero; a
         # staged A-fit followed by A+DT is much better conditioned than asking
         # the optimiser to discover all four parameters simultaneously.
-        final_nongrav = dict(nongravitational)
-        final_nongrav.update({
-            name: value
-            for name, value in (result[0].nongravitational_parameters or {}).items()
-            if name in final_nongrav
-        })
-        try:
-            linked_result = _fit_orbit_once(
-                observations, result[0], constraints, truncate_years, final_nongrav,
+        def fitted_nongrav(seed_solution: OrbitSolution) -> dict[str, float]:
+            values = dict(nongravitational)
+            values.update({
+                name: value
+                for name, value in (
+                    seed_solution.nongravitational_parameters or {}
+                ).items()
+                if name in values
+            })
+            return values
+
+        if multi_apparition_seed is not None and seed_report is not None:
+            # Link one earlier return at a time.  Jumping directly from the
+            # 1986 state to a simultaneous 1835+1910+1986 correction leaves a
+            # numerical Jacobian thousands of sigma from its local basin and
+            # was the source of the spurious degree-sized Halley residuals.
+            last_good = multi_apparition_seed
+            last_good_report = seed_report
+            linked_count = 1
+            for first_group in range(len(apparition_groups) - 2, -1, -1):
+                stage_observations = [
+                    observation
+                    for group in apparition_groups[first_group:]
+                    for observation in group
+                ]
+                try:
+                    candidate = _fit_orbit_once(
+                        stage_observations, last_good[0], constraints,
+                        truncate_years, fitted_nongrav(last_good[0]),
+                        maximum_observations=min(
+                            480, 120 * (len(apparition_groups) - first_group),
+                        ),
+                        max_nfev=8, robust_loss=True,
+                    )
+                    normalized = candidate[0].fit_normalized_rms
+                    if (
+                        not np.isfinite(candidate[1])
+                        or candidate[1] > 60.0
+                        or normalized is None
+                        or not np.isfinite(normalized)
+                        or normalized > 8.0
+                    ):
+                        raise OrbitFitError(
+                            "Připojení staršího návratu neprošlo kontrolou kvality."
+                        )
+                except (OrbitFitError, ValueError, RuntimeError, FloatingPointError):
+                    result = last_good
+                    for observation, report_values in zip(
+                        observations, last_good_report,
+                    ):
+                        (
+                            observation.residual_ra_arcsec,
+                            observation.residual_dec_arcsec,
+                            observation.used_in_fit,
+                        ) = report_values
+                    result[0].fit_model_note = (
+                        f"Společná korekce pro {linked_count} z "
+                        f"{len(apparition_groups)} pozorovaných návratů prošla; "
+                        "další starší návrat neprošel kontrolou kvality a je "
+                        "zobrazen pouze jako planetárně integrovaná předpověď."
+                    )
+                    break
+                last_good = candidate
+                linked_count += 1
+                last_good_report = [
+                    (
+                        observation.residual_ra_arcsec,
+                        observation.residual_dec_arcsec,
+                        observation.used_in_fit,
+                    )
+                    for observation in observations
+                ]
+                result = candidate
+            else:
+                result[0].fit_model_note = (
+                    f"Společný N-body fit propojil všech "
+                    f"{len(apparition_groups)} pozorovaných návratů postupnou "
+                    "diferenciální korekcí."
+                )
+        else:
+            result = _fit_orbit_once(
+                observations, result[0], constraints, truncate_years,
+                fitted_nongrav(result[0]),
                 maximum_observations=480 if long_arc else None,
-                max_nfev=4 if long_arc else 12, robust_loss=True,
-            )
-            linked_normalized = linked_result[0].fit_normalized_rms
-            linked_is_bad = bool(
-                multi_apparition_seed is not None
-                and (
-                    not np.isfinite(linked_result[1])
-                    or linked_result[1] > 600.0
-                    or linked_normalized is None
-                    or not np.isfinite(linked_normalized)
-                    or linked_normalized > 25.0
-                )
-            )
-            if linked_is_bad:
-                raise OrbitFitError(
-                    "Společný víceapariční fit se neudržel u astrometrie."
-                )
-            result = linked_result
-        except (OrbitFitError, ValueError, RuntimeError, FloatingPointError):
-            if multi_apparition_seed is None or seed_report is None:
-                raise
-            result = multi_apparition_seed
-            for observation, report_values in zip(observations, seed_report):
-                (
-                    observation.residual_ra_arcsec,
-                    observation.residual_dec_arcsec,
-                    observation.used_in_fit,
-                ) = report_values
-            result[0].fit_model_note = (
-                "Společná korekce všech pozorovaných návratů neprošla "
-                "kontrolou kvality. Zobrazený fit proto vychází z posledního "
-                "dostatečně pozorovaného návratu; ostatní návraty jsou "
-                "planetárně integrovaná předpověď."
+                max_nfev=8 if long_arc else 12, robust_loss=True,
             )
     elif not multibranch and not constraints and short_arc and active_count > 120:
         # A representative subset is a fast seed, not a sufficient final

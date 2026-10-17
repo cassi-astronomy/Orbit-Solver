@@ -1142,9 +1142,17 @@ class OrbitEvolutionPanel(QWidget):
         if self.solution.position_au is None or self.solution.velocity_au_per_day is None:
             text = "Zdroj integrace: žádný použitelný kartézský stav ještě není načten."
         elif self.solution.fit_observation_count is not None:
+            available = self.solution.fit_available_observation_count
+            count_text = (
+                f"{self.solution.fit_observation_count} reprezentativních z "
+                f"{available} dostupných"
+                if available is not None
+                and available > self.solution.fit_observation_count
+                else f"{self.solution.fit_observation_count} použitých"
+            )
             text = (
                 "Zdroj integrace: vlastní fit z "
-                f"{self.solution.fit_observation_count} použitých pozorování."
+                f"{count_text} pozorování."
             )
         else:
             text = "Zdroj integrace: výchozí kartézská dráha MPC."
@@ -3629,10 +3637,18 @@ class ElementsPanel(QWidget):
                 f"; normalized RMS {s.fit_normalized_rms:.3f} sigma"
                 if s.fit_normalized_rms is not None else ""
             )
+            count_text = str(s.fit_observation_count)
+            if (
+                s.fit_available_observation_count is not None
+                and s.fit_available_observation_count > s.fit_observation_count
+            ):
+                count_text += (
+                    f" representative of {s.fit_available_observation_count} available"
+                )
             lines.append(
-                f"{s.fit_observation_count} observations; RMS residual "
+                f"{count_text} observations; RMS residual "
                 f"{s.fit_rms_arcsec:.3f} arcsec{normalized}" if s.fit_rms_arcsec is not None
-                else f"{s.fit_observation_count} observations"
+                else f"{count_text} observations"
             )
         if s.fit_model_note:
             lines.append(f"Poznámka k fitu: {s.fit_model_note}")

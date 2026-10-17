@@ -684,6 +684,39 @@ class OrbitFitSelectionTests(unittest.TestCase):
         self.assertEqual(calls[0], {"A1": 0.0})
         self.assertEqual(calls[1], {"A1": 2e-8, "DT": 30.0})
 
+    def test_three_comet_returns_are_linked_progressively(self):
+        observations = [
+            Observation(
+                time=f"{year}-{month:02d}-{day:02d}T00:00:00Z",
+                ra_deg=1.0, dec_deg=2.0,
+            )
+            for year, month, count in ((1835, 10, 6), (1910, 4, 8), (1986, 3, 10))
+            for day in range(1, count + 1)
+        ]
+        solution = OrbitSolution(
+            "1P", 2446470.5, 17.8, .967, 162.3, 58.4, 111.3, 0.0,
+            position_au=(.586, 0.0, 0.0), velocity_au_per_day=(0.0, .03, 0.0),
+            fit_normalized_rms=.8,
+        )
+        row_counts = []
+
+        def fake_fit(rows, *_args, **_kwargs):
+            row_counts.append(len(rows))
+            solution.nongravitational_parameters = {"A1": 1e-8}
+            solution.fit_normalized_rms = .8
+            return solution, 1.0, len(rows)
+
+        with (
+            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit),
+            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
+        ):
+            result = fit_orbit(
+                observations, solution,
+                nongravitational={"A1": 0.0, "DT": 0.0},
+            )
+        self.assertEqual(row_counts, [10, 18, 24])
+        self.assertIn("všech 3", result[0].fit_model_note or "")
+
     def test_multi_apparition_table_includes_next_future_return(self):
         solution = OrbitSolution(
             "1P", 2446470.5, 17.8, .967, 162.3, 58.4, 111.3, 0.0,
@@ -930,7 +963,7 @@ class OrbitFitSelectionTests(unittest.TestCase):
         self.assertIs(result[0], seed)
         self.assertIsNone(observations[0].residual_ra_arcsec)
         self.assertAlmostEqual(observations[-1].residual_ra_arcsec or 0.0, .2)
-        self.assertIn("neprošla kontrolou kvality", seed.fit_model_note or "")
+        self.assertIn("neprošel kontrolou kvality", seed.fit_model_note or "")
 
     def test_parabolic_perihelion_offset_is_finite_at_singularity(self):
         q = 3.2
