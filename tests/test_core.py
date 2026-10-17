@@ -30,16 +30,16 @@ from orbit_app.orbit_engine import (
 from orbit_app.orbit_evolution import (
     EvolutionResult, EvolutionReturn, EvolutionSnapshot, PLANET_MU, PlanetEncounter,
     centered_snapshot, evolution_span, format_evolution_mpc_report,
-    format_evolution_report,
+    format_evolution_report, perihelion_returns_between,
 )
 from orbit_app.planetary import PLANETS
 from orbit_app.orbit_fit import (
     _automatic_orbit_score, _InterpolatedPlanetEphemeris,
-    _calibrate_fitted_photometry,
+    _attach_multi_apparition_elements, _calibrate_fitted_photometry,
     _is_automatic_rejection_candidate,
     _observation_offsets_gcrs, _observation_sigma_arcsec,
     _perihelion_offset_days_from_state,
-    _prefer_parabolic_short_arc,
+    _latest_observing_apparition, _prefer_parabolic_short_arc,
     _representative_indices, _truncate_rows_to_recent_years,
     fit_orbit, fit_selection_count, parse_observation_time,
 )
@@ -546,6 +546,73 @@ class PreviewGeometryTests(unittest.TestCase):
 
 
 class OrbitFitSelectionTests(unittest.TestCase):
+    def test_missing_astrometric_uncertainty_uses_epoch_weight(self):
+        historical = Observation(time="1835-10-01T00:00:00Z")
+        photographic = Observation(time="1935-10-01T00:00:00Z")
+        modern = Observation(time="2026-10-01T00:00:00Z")
+        self.assertEqual(_observation_sigma_arcsec(historical), (20.0, 20.0))
+        self.assertEqual(_observation_sigma_arcsec(photographic), (6.0, 6.0))
+        self.assertEqual(_observation_sigma_arcsec(modern), (1.0, 1.0))
+
+    def test_latest_apparition_is_split_at_long_observing_gap(self):
+        observations = [
+            Observation(time="1835-10-01T00:00:00Z"),
+            Observation(time="1910-04-01T00:00:00Z"),
+            Observation(time="1985-10-01T00:00:00Z"),
+            Observation(time="2003-01-01T00:00:00Z"),
+        ]
+        latest = _latest_observing_apparition(observations)
+        self.assertEqual([item.time[:4] for item in latest], ["1985", "2003"])
+
+    def test_gravity_only_multi_apparition_fit_uses_latest_return(self):
+        observations = [
+            Observation(
+                time=f"1835-10-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
+            )
+            for day in range(1, 7)
+        ] + [
+            Observation(
+                time=f"1986-03-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
+            )
+            for day in range(1, 11)
+        ]
+        solution = OrbitSolution(
+            "1P", 2446470.5, 17.8, .967, 162.3, 58.4, 111.3, 0.0,
+            position_au=(.586, 0.0, 0.0), velocity_au_per_day=(0.0, .03, 0.0),
+        )
+        candidate = (solution, 1.0, 10)
+        with (
+            patch("orbit_app.orbit_fit._fit_orbit_once", return_value=candidate) as fit_once,
+            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
+        ):
+            fit_orbit(observations, solution)
+        self.assertEqual(fit_once.call_count, 1)
+        self.assertEqual(len(fit_once.call_args_list[0].args[0]), 10)
+        self.assertEqual(fit_once.call_args_list[0].kwargs["maximum_observations"], 120)
+        self.assertIn("posledního pozorovaného návratu", solution.fit_model_note)
+
+    def test_multi_apparition_table_includes_next_future_return(self):
+        solution = OrbitSolution(
+            "1P", 2446470.5, 17.8, .967, 162.3, 58.4, 111.3, 0.0,
+            position_au=(.586, 0.0, 0.0), velocity_au_per_day=(0.0, .03, 0.0),
+        )
+        observations = [
+            Observation(time="1835-10-01T00:00:00Z"),
+            Observation(time="2003-01-01T00:00:00Z"),
+        ]
+        past = EvolutionReturn(-1, 2392000.0, (0.0,) * 6, 17.9, .967, 162.3,
+                               58.4, 111.3, .59, 75.7, 1 / 17.9)
+        future = EvolutionReturn(1, 2474000.0, (0.0,) * 6, 18.0, .968, 162.2,
+                                 58.3, 111.4, .58, 76.4, 1 / 18.0)
+        with patch(
+            "orbit_app.orbit_evolution.perihelion_returns_between",
+            return_value=(past, future),
+        ):
+            _attach_multi_apparition_elements(observations, solution)
+        self.assertEqual(len(solution.apparition_elements or ()), 2)
+        self.assertFalse(solution.apparition_elements[0]["future"])
+        self.assertTrue(solution.apparition_elements[1]["future"])
+
     def test_fitted_photometry_reduces_apparent_magnitude_to_absolute(self):
         solution = OrbitSolution(
             "PCCP", 2461300.5, 5.0, .3, 17, 227, 72, 4.5,

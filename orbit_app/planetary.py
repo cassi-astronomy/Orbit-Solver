@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 import numpy as np
+from scipy.interpolate import CubicSpline
 
 J2000_JD = 2451545.0
 
@@ -90,6 +91,9 @@ class AnalyticPlanetEphemeris:
             sin_w * sin_i * x_prime + cos_w * sin_i * y_prime,
         ])
 
+    def positions(self, bodies: tuple[str, ...], jd: float) -> tuple[np.ndarray, ...]:
+        return tuple(self.position(body, jd) for body in bodies)
+
 AU_KM = 149_597_870.7
 DE440_FILENAME = "de440.bsp"
 DE440_URL = (
@@ -117,6 +121,16 @@ def _equatorial_to_ecliptic(vector: np.ndarray) -> np.ndarray:
         value[0],
         value[1] * np.cos(epsilon) + value[2] * np.sin(epsilon),
         -value[1] * np.sin(epsilon) + value[2] * np.cos(epsilon),
+    ))
+
+
+def _equatorial_to_ecliptic_series(vectors: np.ndarray) -> np.ndarray:
+    values = np.asarray(vectors, dtype=float)
+    epsilon = np.radians(23.4392911)
+    return np.column_stack((
+        values[:, 0],
+        values[:, 1] * np.cos(epsilon) + values[:, 2] * np.sin(epsilon),
+        -values[:, 1] * np.sin(epsilon) + values[:, 2] * np.cos(epsilon),
     ))
 
 
@@ -163,6 +177,70 @@ class JplSpkPlanetEphemeris:
         sun = self._ssb_position(0, 10, jd)
         return _equatorial_to_ecliptic((barycentric - sun) / AU_KM)
 
+    def positions(self, bodies: tuple[str, ...], jd: float) -> tuple[np.ndarray, ...]:
+        """Return one integrator step while sharing repeated SPK segments."""
+        epoch = float(jd)
+        if not (DE440_COVERAGE[0] <= epoch <= DE440_COVERAGE[1]):
+            raise ValueError(
+                "Požadovaná epocha leží mimo rozsah JPL DE440 "
+                "(1549-12-31 až 2650-01-25)."
+            )
+        names = tuple(name.lower() for name in bodies)
+        sun = self._ssb_position(0, 10, epoch)
+        earth_moon_barycenter = (
+            self._ssb_position(0, 3, epoch)
+            if "earth" in names or "moon" in names else None
+        )
+        output: list[np.ndarray] = []
+        for name in names:
+            if name == "earth":
+                assert earth_moon_barycenter is not None
+                barycentric = earth_moon_barycenter + self._ssb_position(3, 399, epoch)
+            elif name == "moon":
+                assert earth_moon_barycenter is not None
+                barycentric = earth_moon_barycenter + self._ssb_position(3, 301, epoch)
+            else:
+                target = self._BARYCENTER_IDS.get(name)
+                if target is None:
+                    raise KeyError(f"Těleso {name!r} není v poskytovateli DE440 podporováno.")
+                barycentric = self._ssb_position(0, target, epoch)
+                if name == "mercury":
+                    barycentric += self._ssb_position(1, 199, epoch)
+                elif name == "venus":
+                    barycentric += self._ssb_position(2, 299, epoch)
+            output.append(_equatorial_to_ecliptic((barycentric - sun) / AU_KM))
+        return tuple(output)
+
+    def position_series(self, body: str, epochs: np.ndarray) -> np.ndarray:
+        """Vectorized SPK evaluation used to prepare a long-arc spline."""
+        jd = np.asarray(epochs, dtype=float)
+        if np.any(jd < DE440_COVERAGE[0]) or np.any(jd > DE440_COVERAGE[1]):
+            raise ValueError(
+                "Požadovaná epocha leží mimo rozsah JPL DE440 "
+                "(1549-12-31 až 2650-01-25)."
+            )
+
+        def series(center: int, target: int) -> np.ndarray:
+            values = np.asarray(self.kernel[center, target].compute(jd), dtype=float)
+            return values.T if values.ndim == 2 else values[None, :]
+
+        name = body.lower()
+        sun = series(0, 10)
+        if name == "earth":
+            barycentric = series(0, 3) + series(3, 399)
+        elif name == "moon":
+            barycentric = series(0, 3) + series(3, 301)
+        else:
+            target = self._BARYCENTER_IDS.get(name)
+            if target is None:
+                raise KeyError(f"Těleso {body!r} není v poskytovateli DE440 podporováno.")
+            barycentric = series(0, target)
+            if name == "mercury":
+                barycentric += series(1, 199)
+            elif name == "venus":
+                barycentric += series(2, 299)
+        return _equatorial_to_ecliptic_series((barycentric - sun) / AU_KM)
+
     def close(self) -> None:
         self.kernel.close()
 
@@ -198,6 +276,17 @@ class PlanetEphemerisProvider:
         provider = self.jpl or self.analytic
         return provider.position(body, jd)
 
+    def positions(self, bodies: tuple[str, ...], jd: float) -> tuple[np.ndarray, ...]:
+        provider = self.jpl or self.analytic
+        return provider.positions(bodies, jd)
+
+    def position_series(self, body: str, epochs: np.ndarray) -> np.ndarray:
+        provider = self.jpl or self.analytic
+        method = getattr(provider, "position_series", None)
+        if callable(method):
+            return method(body, epochs)
+        return np.stack([provider.position(body, float(epoch)) for epoch in epochs])
+
     @property
     def model_name(self) -> str:
         return "JPL DE440" if self.jpl is not None else "analytický model"
@@ -212,4 +301,31 @@ class PlanetEphemerisProvider:
 
 
 PLANETS = PlanetEphemerisProvider()
+
+
+class SplinePlanetEphemeris:
+    """Vectorized, one-time planetary cache for repeated long integrations."""
+
+    def __init__(
+        self, source: PlanetEphemerisProvider, bodies: tuple[str, ...],
+        start_jd: float, end_jd: float, step_days: float = 1.0,
+    ) -> None:
+        count = max(5, int(np.ceil((end_jd - start_jd) / step_days)) + 1)
+        self.source = source
+        self.epochs = np.linspace(float(start_jd), float(end_jd), count)
+        self.splines = {
+            body: CubicSpline(
+                self.epochs, source.position_series(body, self.epochs), axis=0,
+            )
+            for body in bodies
+        }
+
+    def position(self, body: str, jd: float) -> np.ndarray:
+        epoch = float(jd)
+        if epoch < self.epochs[0] or epoch > self.epochs[-1]:
+            return np.asarray(self.source.position(body, epoch), dtype=float)
+        return np.asarray(self.splines[body.lower()](epoch), dtype=float)
+
+    def positions(self, bodies: tuple[str, ...], jd: float) -> tuple[np.ndarray, ...]:
+        return tuple(self.position(body, jd) for body in bodies)
 

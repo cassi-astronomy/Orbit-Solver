@@ -56,6 +56,8 @@ class OrbitSolution:
     display_name: str | None = None
     nongravitational_parameters: dict[str, float] | None = None
     dynamical_1a: dict[str, float | str] | None = None
+    apparition_elements: tuple[dict[str, Any], ...] | None = None
+    fit_model_note: str | None = None
     data_source: str = "MPC"
 
 

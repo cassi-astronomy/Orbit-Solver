@@ -15,6 +15,7 @@ from astropy.time import Time
 from astropy.utils import iers
 from astropy.utils.exceptions import AstropyWarning
 import astropy.units as u
+from erfa import ErfaWarning
 
 from .planetary import PLANETS
 
@@ -180,24 +181,39 @@ def station_offsets_gcrs(stations: list[str], times: list[datetime]) -> np.ndarr
     if len(stations) != len(times):
         raise ValueError("Počet stanic neodpovídá počtu časů pozorování.")
     result = np.zeros((len(times), 3), dtype=float)
-    grouped: dict[str, list[int]] = {}
+    active_indices: list[int] = []
+    terrestrial_xyz: list[tuple[float, float, float]] = []
     for index, station in enumerate(stations):
         code = (station or "500").strip()
-        if code != "500":
-            grouped.setdefault(code, []).append(index)
-
-    for code, indices in grouped.items():
+        if code == "500":
+            continue
         location = observatory_location(code)
         if location is None:
             continue
-        obstime = Time([times[index] for index in indices], scale="utc")
+        x, y, z = location.to_geocentric()
+        active_indices.append(index)
+        terrestrial_xyz.append((
+            float(x.to_value(u.m)), float(y.to_value(u.m)), float(z.to_value(u.m)),
+        ))
+
+    if active_indices:
+        # Transform every station/time pair in one vectorised Astropy call.
+        # Grouping by observatory looked tidy, but a large historical comet
+        # archive can contain hundreds of station codes and made this report
+        # step substantially slower than the orbit correction itself.
+        xyz = np.asarray(terrestrial_xyz, dtype=float)
+        locations = EarthLocation.from_geocentric(
+            xyz[:, 0] * u.m, xyz[:, 1] * u.m, xyz[:, 2] * u.m,
+        )
         with warnings.catch_warnings():
             # Future dates can be just beyond the bundled IERS table.  Astropy
             # then uses UT1-UTC=0 and mean polar motion, which is still far more
             # accurate than omitting the topocentric correction altogether.
             warnings.simplefilter("ignore", AstropyWarning)
-            xyz = location.get_gcrs(obstime=obstime).cartesian.xyz.to_value(u.au).T
-        result[np.asarray(indices)] = xyz
+            warnings.simplefilter("ignore", ErfaWarning)
+            obstime = Time([times[index] for index in active_indices], scale="utc")
+            gcrs = locations.get_gcrs(obstime=obstime).cartesian.xyz.to_value(u.au).T
+        result[np.asarray(active_indices)] = gcrs
     return result
 
 
@@ -213,9 +229,10 @@ def geodetic_offsets_gcrs(
     locations = EarthLocation.from_geodetic(
         longitude * u.deg, latitude * u.deg, height * u.m
     )
-    obstime = Time(times, scale="utc")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", AstropyWarning)
+        warnings.simplefilter("ignore", ErfaWarning)
+        obstime = Time(times, scale="utc")
         return np.asarray(
             locations.get_gcrs(obstime=obstime).cartesian.xyz.to_value(u.au).T,
             dtype=float,
@@ -224,7 +241,12 @@ def geodetic_offsets_gcrs(
 
 def dynamical_jd(times: list[datetime]) -> np.ndarray:
     """Convert UTC observation instants to the TDB time argument used by dynamics."""
-    return np.asarray(Time(times, scale="utc").tdb.jd, dtype=float)
+    with warnings.catch_warnings():
+        # ERFA warns for pre-UTC visual observations. Astropy deliberately
+        # applies its documented historical approximation, which is adequate
+        # beside their multi-arcsecond astrometric uncertainty.
+        warnings.simplefilter("ignore", ErfaWarning)
+        return np.asarray(Time(times, scale="utc").tdb.jd, dtype=float)
 
 
 def earth_heliocentric_ecliptic(jd_tdb: np.ndarray) -> np.ndarray:

@@ -3632,6 +3632,41 @@ class ElementsPanel(QWidget):
                 f"{s.fit_rms_arcsec:.3f} arcsec{normalized}" if s.fit_rms_arcsec is not None
                 else f"{s.fit_observation_count} observations"
             )
+        if s.fit_model_note:
+            lines.append(f"Poznámka k fitu: {s.fit_model_note}")
+        if (
+            s.apparition_elements
+            and str(self.element_center.currentData() or "sun") == "sun"
+        ):
+            lines.extend((
+                "", "Oskulační elementy jednotlivých návratů:",
+                "Perihelium (UTC)      q [AU]       e           a [AU]      "
+                "P [roky]    i [deg]    Node [deg]  Peri. [deg]",
+            ))
+            for item in s.apparition_elements:
+                instant = datetime_from_jd(float(item["epoch_jd"]))
+                date_text = (
+                    instant.strftime("%Y-%m-%d %H:%M") if instant is not None
+                    else f"JD {float(item['epoch_jd']):.3f}"
+                )
+                period_value = item.get("period_years")
+                period_text = (
+                    "       —" if period_value is None
+                    else f"{float(period_value):8.3f}"
+                )
+                marker = "  budoucí" if bool(item.get("future")) else ""
+                lines.append(
+                    f"{date_text:19s}  {float(item['q']):10.6f}  "
+                    f"{float(item['e']):10.7f}  {float(item['a']):11.6f}  "
+                    f"{period_text}  {float(item['i']):9.5f}  "
+                    f"{float(item['node']):10.5f}  {float(item['arg_peri']):11.5f}"
+                    f"{marker}"
+                )
+            if not s.nongravitational_parameters and is_comet_designation(s.designation):
+                lines.append(
+                    "Pozor: návraty jsou propojeny čistě gravitačním modelem; "
+                    "bez A1/A2/A3 mohou mít aktivní komety systematicky posunuté perihelové časy."
+                )
         if s.position_au and s.velocity_au_per_day:
             lines.extend((
                 "", "Kartézský stav (AU, AU/den):",

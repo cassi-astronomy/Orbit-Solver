@@ -14,7 +14,7 @@ from .observatories import (
     station_offsets_gcrs,
 )
 from .orbit_engine import MU_SUN, NBodyIntegrator, StateVector
-from .planetary import PLANETS
+from .planetary import PLANETS, SplinePlanetEphemeris
 from .photometry import estimate_absolute_magnitude, hg_phase_correction
 
 C_AU_PER_DAY = 173.1446326846693
@@ -90,6 +90,9 @@ class _InterpolatedPlanetEphemeris:
         if epoch < self.epochs[0] or epoch > self.epochs[-1]:
             return np.asarray(self.source.position(body, epoch), dtype=float)
         return np.asarray(self.splines[body.lower()](epoch), dtype=float)
+
+    def positions(self, bodies: tuple[str, ...], jd: float) -> tuple[np.ndarray, ...]:
+        return tuple(self.position(body, jd) for body in bodies)
 
 
 def _equatorial_to_ecliptic(vectors: np.ndarray) -> np.ndarray:
@@ -321,15 +324,39 @@ def _observation_offsets_gcrs(
 
 
 def _observation_sigma_arcsec(observation: Observation) -> tuple[float, float]:
-    """Return ADES astrometric 1-sigma values, with a conservative fallback."""
+    """Return ADES 1-sigma values or a conservative epoch-based fallback.
+
+    A large part of the historical archive was converted to ADES from legacy
+    records and carries no meaningful per-row uncertainty.  One arcsecond is
+    far too optimistic for visual/micrometric nineteenth-century astrometry.
+    Conversely, a modern CCD record is not assumed to be good merely because
+    it is modern: robust residual handling below can still downweight/reject it.
+    """
     lowered = {str(key).casefold(): value for key, value in observation.raw.items()}
+
+    try:
+        year = parse_observation_time(observation.time).year
+    except (TypeError, ValueError):
+        year = 2000
+    if year < 1850:
+        fallback = 20.0
+    elif year < 1900:
+        fallback = 12.0
+    elif year < 1950:
+        fallback = 6.0
+    elif year < 1990:
+        fallback = 3.0
+    elif year < 2010:
+        fallback = 1.5
+    else:
+        fallback = 1.0
 
     def value_for(key: str) -> float:
         try:
-            value = float(lowered.get(key, 1.0))
-            return value if np.isfinite(value) and value > 0.0 else 1.0
+            value = float(lowered.get(key, fallback))
+            return value if np.isfinite(value) and value > 0.0 else fallback
         except (TypeError, ValueError):
-            return 1.0
+            return fallback
 
     return value_for("rmsra"), value_for("rmsdec")
 
@@ -798,10 +825,6 @@ def _fit_orbit_once(
             for index, name in enumerate(nongrav_names)
         }
 
-    exact_full_engine = NBodyIntegrator(
-        PLANETS, relative_tolerance=3e-11, absolute_tolerance=2e-13,
-        nongravitational_parameters=initial_nongrav,
-    )
     arc_days = float(np.ptp(epochs))
     # On a discovery arc of a few days, repeatedly looking up all eight
     # planets while scipy estimates a numerical Jacobian dominates the run
@@ -811,24 +834,39 @@ def _fit_orbit_once(
     # the full DE ephemeris, so this shortcut does not become the reported
     # orbit.
     use_fast_differential_correction = arc_days <= 30.0 and not nongrav_names
-    use_interpolated_ephemeris = arc_days <= 730.0
-    full_ephemeris = (
-        _InterpolatedPlanetEphemeris(
+    if arc_days <= 730.0:
+        full_ephemeris = _InterpolatedPlanetEphemeris(
             PLANETS, float(np.min(epochs)) - 2.0, float(np.max(epochs)) + 2.0,
         )
-        if use_interpolated_ephemeris else PLANETS
+    else:
+        cache_start = min(float(np.min(epochs)), float(initial.epoch_jd)) - 2.0
+        cache_end = max(float(np.max(epochs)), float(initial.epoch_jd)) + 2.0
+        full_ephemeris = SplinePlanetEphemeris(
+            PLANETS, _PLANET_NAMES, cache_start, cache_end,
+        )
+    exact_full_engine = NBodyIntegrator(
+        full_ephemeris, relative_tolerance=3e-11, absolute_tolerance=2e-13,
+        nongravitational_parameters=initial_nongrav,
     )
     full_engine = NBodyIntegrator(
         full_ephemeris, relative_tolerance=3e-11, absolute_tolerance=2e-13,
         nongravitational_parameters=initial_nongrav,
     )
-    optimizer_engine = (
-        NBodyIntegrator(
+    if use_fast_differential_correction:
+        optimizer_engine = NBodyIntegrator(
             PLANETS, perturbers=(), relative_tolerance=3e-11,
             absolute_tolerance=2e-13,
         )
-        if use_fast_differential_correction else full_engine
-    )
+    elif arc_days > 730.0:
+        # Century-scale numerical Jacobians need dozens of integrations.  A
+        # relaxed pass finds the correction cheaply; the strict DE440 model
+        # below polishes and reports the final state.
+        optimizer_engine = NBodyIntegrator(
+            full_ephemeris, relative_tolerance=1e-8, absolute_tolerance=1e-10,
+            nongravitational_parameters=initial_nongrav,
+        )
+    else:
+        optimizer_engine = full_engine
 
     def propagate(
         vector: np.ndarray, state: StateVector, output_epochs: np.ndarray,
@@ -1062,10 +1100,81 @@ def _is_automatic_rejection_candidate(
     physical_residual = float(np.hypot(
         observation.residual_ra_arcsec, observation.residual_dec_arcsec,
     ))
+    sigma_ra, sigma_dec = _observation_sigma_arcsec(observation)
     return bool(
         _normalized_observation_residual(observation) > 3.0
-        and physical_residual > max(2.0, float(fit_rms_arcsec) * 6.0)
+        and physical_residual > max(2.0, 3.0 * max(sigma_ra, sigma_dec))
     )
+
+
+def _latest_observing_apparition(
+    observations: list[Observation], gap_years: float = 30.0,
+) -> list[Observation]:
+    """Return the latest observing block separated by a multi-year gap."""
+    dated: list[tuple[datetime, Observation]] = []
+    for observation in observations:
+        if observation.excluded_from_fit or not observation.time:
+            continue
+        try:
+            dated.append((parse_observation_time(observation.time), observation))
+        except ValueError:
+            continue
+    dated.sort(key=lambda item: item[0])
+    if not dated:
+        return []
+    boundary = 0
+    minimum_gap = gap_years * 365.25 * 86400.0
+    for index in range(1, len(dated)):
+        if (dated[index][0] - dated[index - 1][0]).total_seconds() >= minimum_gap:
+            boundary = index
+    return [item[1] for item in dated[boundary:]]
+
+
+def _attach_multi_apparition_elements(
+    observations: list[Observation], solution: OrbitSolution,
+) -> None:
+    """Attach observed and next-return osculating elements to a periodic comet."""
+    if not is_comet_designation(solution.designation):
+        return
+    if solution.eccentricity >= 1.0 or solution.semi_major_axis_au <= 0.0:
+        return
+    times: list[datetime] = []
+    for observation in observations:
+        if not observation.time:
+            continue
+        try:
+            times.append(parse_observation_time(observation.time))
+        except ValueError:
+            continue
+    if len(times) < 2:
+        return
+    epochs = dynamical_jd(times)
+    period_days = 2.0 * np.pi * solution.semi_major_axis_au ** 1.5 / np.sqrt(MU_SUN)
+    # Only create the automatic table when astrometry reaches across a
+    # substantial fraction of an orbit.  The normal Evolution tab remains the
+    # explicit tool for a single apparition.
+    if float(np.ptp(epochs)) < .45 * period_days:
+        return
+    try:
+        from .orbit_evolution import perihelion_returns_between
+        start = float(np.min(epochs) - min(3.0 * 365.25, .08 * period_days))
+        end = float(np.max(epochs) + 1.10 * period_days)
+        returns = perihelion_returns_between(solution, start, end)
+    except (ValueError, RuntimeError, FloatingPointError):
+        return
+    latest_observation = float(np.max(epochs))
+    solution.apparition_elements = tuple({
+        "index": item.index,
+        "epoch_jd": item.epoch_jd,
+        "q": item.perihelion_au,
+        "e": item.eccentricity,
+        "a": item.semi_major_axis_au,
+        "period_years": item.period_years,
+        "i": item.inclination_deg,
+        "node": item.node_deg,
+        "arg_peri": item.arg_peri_deg,
+        "future": item.epoch_jd > latest_observation,
+    } for item in returns)
 
 
 def _automatic_orbit_score(solution: OrbitSolution) -> float:
@@ -1156,6 +1265,11 @@ def fit_orbit(
         len(active_times) >= 2
         and (max(active_times) - min(active_times)).total_seconds() <= 30.0 * 86400.0
     )
+    arc_days = (
+        (max(active_times) - min(active_times)).total_seconds() / 86400.0
+        if len(active_times) >= 2 else 0.0
+    )
+    long_arc = arc_days >= 20.0 * 365.25
     active_count = len(active_times)
     # Range is intrinsically weakly constrained on a discovery arc.  This is
     # true for a 20-observation PCCP object just as much as for a 400-row one,
@@ -1239,10 +1353,52 @@ def fit_orbit(
         # Always establish residuals before any automatic rejection.  A
         # chronologically isolated follow-up batch is not itself evidence of
         # bad astrometry; only actual post-fit residuals may exclude it.
-        result = _fit_orbit_once(
-            observations, initial, constraints, truncate_years,
-            nongravitational, maximum_observations=120,
+        recent_apparition = (
+            _latest_observing_apparition(observations)
+            if long_arc and initial is not None else []
         )
+        if (
+            long_arc and initial is not None and not nongravitational
+            and 6 <= len(recent_apparition) < active_count
+        ):
+            # A single gravity-only correction cannot faithfully join active
+            # comet apparitions separated by decades: it otherwise invents a
+            # compromise state with huge systematic O-C values. Fit the latest
+            # apparition and use planetary integration only to predict the
+            # other returns. Enabling A1/A2/A3 below opts into a genuinely
+            # linked multi-apparition solution.
+            for observation in observations:
+                observation.used_in_fit = False
+                observation.residual_ra_arcsec = None
+                observation.residual_dec_arcsec = None
+            result = _fit_orbit_once(
+                recent_apparition, initial, constraints, truncate_years,
+                None, maximum_observations=120,
+                max_nfev=4, robust_loss=True,
+            )
+            result[0].fit_model_note = (
+                "Bez A1–A3 byl fit určen z posledního pozorovaného návratu; "
+                "starší a budoucí návraty jsou čistě gravitační integrace, "
+                "nikoli společný fit všech zjevení."
+            )
+        elif 6 <= len(recent_apparition) < active_count:
+            # First lock onto the best-observed modern apparition.  Correcting
+            # all six state components across a century immediately forces
+            # every numerical Jacobian evaluation to repeat that full span.
+            seed = _fit_orbit_once(
+                recent_apparition, initial, constraints, truncate_years,
+                nongravitational, maximum_observations=120,
+                max_nfev=4, robust_loss=True,
+            )
+            # The dedicated A1/A2/A3 pass below performs the one expensive
+            # full-arc correction. Avoid doing the same century integration
+            # twice merely to manufacture another intermediate seed.
+            result = seed
+        else:
+            result = _fit_orbit_once(
+                observations, initial, constraints, truncate_years,
+                nongravitational, maximum_observations=120,
+            )
     if not constraints and not nongravitational:
         result = _prefer_parabolic_short_arc(observations, result, truncate_years)
     # For an ordinary six-parameter orbit the representative subset keeps the
@@ -1252,7 +1408,8 @@ def fit_orbit(
     if nongravitational:
         result = _fit_orbit_once(
             observations, result[0], constraints, truncate_years, nongravitational,
-            maximum_observations=None, max_nfev=12, robust_loss=True,
+            maximum_observations=480 if long_arc else None,
+            max_nfev=4 if long_arc else 12, robust_loss=True,
         )
     elif not multibranch and not constraints and short_arc and active_count > 120:
         # A representative subset is a fast seed, not a sufficient final
@@ -1290,15 +1447,21 @@ def fit_orbit(
             for observation in outliers:
                 observation.excluded_from_fit = True
                 observation.raw["automatic_exclusion"] = True
-            result = _fit_orbit_once(
-                observations, result[0], constraints, truncate_years, nongravitational,
-                maximum_observations=(
-                    None if nongravitational or (short_arc and not constraints)
-                    else 120
-                ),
-                max_nfev=12,
-            )
-            if not nongravitational:
-                result = _prefer_parabolic_short_arc(observations, result, truncate_years)
+            # A second century-scale differential correction costs another
+            # complete numerical Jacobian. Keep the robust long-arc solution
+            # and merely flag its clear outliers; the next explicit user fit
+            # starts without them. Shorter arcs are cheap enough to refit now.
+            if not long_arc:
+                result = _fit_orbit_once(
+                    observations, result[0], constraints, truncate_years, nongravitational,
+                    maximum_observations=(
+                        None if nongravitational or (short_arc and not constraints)
+                        else 120
+                    ),
+                    max_nfev=12,
+                )
+                if not nongravitational:
+                    result = _prefer_parabolic_short_arc(observations, result, truncate_years)
     _calibrate_fitted_photometry(observations, result[0])
+    _attach_multi_apparition_elements(observations, result[0])
     return result

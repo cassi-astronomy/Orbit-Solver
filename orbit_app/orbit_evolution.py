@@ -9,7 +9,7 @@ import numpy as np
 from .domain import OrbitSolution, is_comet_designation
 from .mpc_orbit import cartesian_to_elements
 from .orbit_engine import DEFAULT_PERTURBERS, MU_SUN, NBodyIntegrator, StateVector
-from .planetary import PLANETS
+from .planetary import PLANETS, SplinePlanetEphemeris
 
 
 JULIAN_YEAR_DAYS = 365.25
@@ -399,6 +399,50 @@ def _return_from_state(index: int, epoch: float, state: np.ndarray) -> Evolution
         perihelion_au=float(a * (1.0 - e)),
         period_years=None if period is None else float(period),
         reciprocal_a=float(1.0 / a) if a != 0.0 else float("nan"),
+    )
+
+
+def perihelion_returns_between(
+    solution: OrbitSolution, start_jd: float, end_jd: float,
+    *, maximum_samples: int = 40001,
+) -> tuple[EvolutionReturn, ...]:
+    """Integrate once and extract osculating elements at every perihelion."""
+    if end_jd <= start_jd:
+        raise ValueError("Konec přehledu návratů musí následovat po začátku.")
+    initial = _solution_state(solution)
+    if solution.eccentricity < 1.0 and solution.semi_major_axis_au > 0.0:
+        period_days = 2.0 * np.pi * solution.semi_major_axis_au ** 1.5 / np.sqrt(MU_SUN)
+        desired_step = float(np.clip(period_days / 500.0, .25, 5.0))
+    else:
+        desired_step = 2.0
+    count = min(
+        maximum_samples,
+        max(401, int(np.ceil((end_jd - start_jd) / desired_step)) + 1),
+    )
+    epochs = np.linspace(start_jd, end_jd, count)
+    ephemeris = SplinePlanetEphemeris(
+        PLANETS, tuple(item.name for item in DEFAULT_PERTURBERS),
+        start_jd - 2.0, end_jd + 2.0,
+    )
+    engine = NBodyIntegrator(
+        ephemeris, relative_tolerance=2e-10, absolute_tolerance=2e-12,
+        nongravitational_parameters=solution.nongravitational_parameters,
+    )
+    states = engine.propagate(initial, epochs)
+    radius = np.linalg.norm(states[:, :3], axis=1)
+    minima = np.flatnonzero(
+        (radius[1:-1] < radius[:-2]) & (radius[1:-1] <= radius[2:])
+    ) + 1
+    refined_epochs = np.asarray([
+        _parabolic_vertex_time(epochs, radius, int(index)) for index in minima
+    ], dtype=float)
+    if refined_epochs.size == 0:
+        return ()
+    refined_states = engine.propagate(initial, refined_epochs)
+    zero = int(np.argmin(np.abs(refined_epochs - solution.epoch_jd)))
+    return tuple(
+        _return_from_state(index - zero, float(epoch), state)
+        for index, (epoch, state) in enumerate(zip(refined_epochs, refined_states))
     )
 
 

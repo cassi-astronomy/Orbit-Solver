@@ -106,8 +106,14 @@ class NBodyIntegrator:
         if radius == 0:
             raise ValueError("Těleso nemůže být ve středu Slunce.")
         acceleration = -MU_SUN * position / radius**3
-        for body in self.perturbers:
-            planet = np.asarray(self.ephemeris.position(body.name, jd), dtype=float)
+        names = tuple(body.name for body in self.perturbers)
+        batch_method = getattr(self.ephemeris, "positions", None)
+        if callable(batch_method):
+            planet_positions = batch_method(names, jd)
+        else:
+            planet_positions = tuple(self.ephemeris.position(name, jd) for name in names)
+        for body, planet_value in zip(self.perturbers, planet_positions):
+            planet = np.asarray(planet_value, dtype=float)
             relative = planet - position
             relative_radius = np.linalg.norm(relative)
             planet_radius = np.linalg.norm(planet)

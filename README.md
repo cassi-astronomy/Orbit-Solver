@@ -30,6 +30,12 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
 - výpočet z celého oblouku nebo pouze z posledních 2, 5 či 10 let;
 - ruční zařazení a vyřazení jednotlivých pozorování;
 - barevná rezidua O−C, automatické vyřazení reziduí nad 2″ a funkce `Worst obs`;
+- individuální nejistoty ADES a konzervativní epochové váhy pro starší záznamy
+  bez sigmy; moderní chybná CCD měření nadále zachytává robustní fit podle O−C;
+- bezpečný víceapariční režim periodických komet: bez A1–A3 se fituje poslední
+  pozorovaný návrat a ostatní se označí jako čistě gravitační integrace;
+  při zapnutém negravitačním modelu slouží poslední návrat jako počáteční
+  korekce pro společný fit celého oblouku;
 - volitelné fixování oskulačních elementů;
 - volitelný fit negravitačních parametrů komet A1, A2 a A3;
 - nejistoty elementů a základní diagnostika fitu.
@@ -37,6 +43,8 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
 ### Elementy a efemerida
 
 - přehled orbitálních elementů včetně nejistot;
+- u periodické komety s dlouhým obloukem automatická tabulka integrovaných
+  oskulačních elementů pozorovaných návratů a prvního následujícího návratu;
 - převod elementů na uživatelem zvolenou epochu;
 - přepočet oskulačních elementů vůči Slunci nebo zvolené planetě;
 - kopírovatelný textový výstup a MPC 1-line elements;
