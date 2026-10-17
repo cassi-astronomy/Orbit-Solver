@@ -199,6 +199,41 @@ def datetime_from_jd(jd: float) -> datetime | None:
         return None
 
 
+_LINKAGE_STATUS_LABELS = {
+    "linked": "společně fitován",
+    "seed_only": "jen samostatný fit",
+    "failed": "navázání selhalo",
+    "not_attempted": "navázání nezkoušeno",
+    "integrated_only": "jen integrovaná předpověď",
+}
+
+
+def apparition_linkage_summary(solution: OrbitSolution) -> str | None:
+    records = solution.apparition_linkage or ()
+    if len(records) < 2:
+        return None
+    linked = sum(record.get("status") == "linked" for record in records)
+    years = ", ".join(
+        str(record.get("return_year") or "?")
+        for record in records if record.get("status") == "linked"
+    )
+    if linked == len(records):
+        return f"NAVÁZÁNO {linked}/{len(records)} návratů ({years})"
+    if linked >= 2:
+        return f"ČÁSTEČNĚ NAVÁZÁNO {linked}/{len(records)} návratů ({years})"
+    return f"NENAVÁZÁNO — společný fit 1/{len(records)} návratů"
+
+
+def apparition_observation_count_text(solution: OrbitSolution) -> str:
+    used = solution.fit_observation_count
+    available = solution.fit_available_observation_count
+    if used is None:
+        return ""
+    if available is not None and available > used:
+        return f"{used} reprezentativních z {available} v propojeném oblouku"
+    return f"{used} použitých"
+
+
 def perihelion_jd_from_solution(solution: OrbitSolution, mu: float = MU_SUN) -> float:
     """Return the nearest osculating perihelion epoch represented by the state."""
     mean_motion = np.sqrt(mu / abs(solution.semi_major_axis_au) ** 3)
@@ -1154,6 +1189,9 @@ class OrbitEvolutionPanel(QWidget):
                 "Zdroj integrace: vlastní fit z "
                 f"{count_text} pozorování."
             )
+            linkage = apparition_linkage_summary(self.solution)
+            if linkage:
+                text += f" {linkage}."
         else:
             text = "Zdroj integrace: výchozí kartézská dráha MPC."
         self.source_note.setText(text)
@@ -3650,6 +3688,30 @@ class ElementsPanel(QWidget):
                 f"{s.fit_rms_arcsec:.3f} arcsec{normalized}" if s.fit_rms_arcsec is not None
                 else f"{count_text} observations"
             )
+        linkage_summary = apparition_linkage_summary(s)
+        if linkage_summary:
+            lines.extend(("", "Navázání pozorovaných návratů:", linkage_summary))
+            lines.append(
+                "Návrat   Pozorovací oblouk  Dostupná  Ve fitu  RMS [\"]  RMS [σ]  Stav"
+            )
+            for record in s.apparition_linkage or ():
+                start = record.get("year_start")
+                end = record.get("year_end")
+                arc = str(start) if start == end else f"{start}–{end}"
+                rms = record.get("rms_arcsec")
+                normalized = record.get("normalized_rms")
+                rms_text = "—" if rms is None else f"{float(rms):.2f}"
+                normalized_text = "—" if normalized is None else f"{float(normalized):.2f}"
+                status = str(record.get("status") or "")
+                lines.append(
+                    f"{str(record.get('return_year') or '?'):>6s}   {arc:<16s}  "
+                    f"{int(record.get('available') or 0):8d}  "
+                    f"{int(record.get('fitted') or 0):7d}  {rms_text:>7s}  "
+                    f"{normalized_text:>7s}  {_LINKAGE_STATUS_LABELS.get(status, status)}"
+                )
+                reason = str(record.get("reason") or "").strip()
+                if reason:
+                    lines.append(f"         ↳ {reason}")
         if s.fit_model_note:
             lines.append(f"Poznámka k fitu: {s.fit_model_note}")
         if (
@@ -5064,7 +5126,7 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _own_orbit_loaded(self, result: object) -> None:
-        solution, rms, used = result
+        solution, rms, _used = result
         # The worker fills O-C values directly into the shared observation objects.
         self.observation_model.set_rows(self.current_observations)
         self._refresh_residual_actions()
@@ -5086,7 +5148,14 @@ class MainWindow(QMainWindow):
         self.object_title.setText(
             self.current_display_name or solution.display_name or solution.designation
         )
-        self.object_label.setText(f"Vlastní fit z {used} pozorování{interval}")
+        count_text = apparition_observation_count_text(solution)
+        linkage_text = apparition_linkage_summary(solution)
+        label_parts = ["Vlastní fit"]
+        if linkage_text:
+            label_parts.append(linkage_text)
+        if count_text:
+            label_parts.append(count_text)
+        self.object_label.setText(" • ".join(label_parts) + interval)
         weighted_note = f", vážené RMS {normalized:.2f}σ" if normalized is not None else ""
         dynamics_note = ""
         if solution.dynamical_1a:
@@ -5095,10 +5164,28 @@ class MainWindow(QMainWindow):
                 if "error" in solution.dynamical_1a
                 else "; original/future 1/a dopočítáno"
             )
+        linkage_note = f"; {linkage_text.lower()}" if linkage_text else ""
         self.statusBar().showMessage(
             f"Vlastní dráha dokončena; RMS {rms:.2f} obloukové sekundy"
-            f"{weighted_note}{dynamics_note}.", 12000
+            f"{weighted_note}{linkage_note}{dynamics_note}.", 20000
         )
+        failed_linkage = [
+            record for record in solution.apparition_linkage or ()
+            if record.get("status") in ("failed", "not_attempted")
+        ]
+        if failed_linkage:
+            details = []
+            for record in failed_linkage:
+                year = record.get("return_year") or "?"
+                reason = record.get("reason") or "bez podrobností"
+                details.append(f"Návrat {year}: {reason}")
+            QMessageBox.warning(
+                self,
+                "Návraty komety nebyly úplně navázány",
+                "Výsledná dráha NENÍ společným řešením všech načtených návratů.\n\n"
+                + "\n".join(details)
+                + "\n\nPodrobný protokol je v záložce Elementy.",
+            )
 
     def _own_orbit_failed(self, message: str) -> None:
         QMessageBox.warning(self, "Výpočet dráhy", message)

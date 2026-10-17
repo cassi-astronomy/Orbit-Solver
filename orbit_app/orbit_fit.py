@@ -1256,6 +1256,78 @@ def _latest_observing_apparition(
     return blocks[-1]
 
 
+def _apparition_linkage_record(
+    observations: list[Observation], solution: OrbitSolution,
+    status: str = "not_attempted", reason: str = "",
+) -> dict[str, object]:
+    """Build an auditable summary for one observed comet apparition."""
+    instants: list[datetime] = []
+    for observation in observations:
+        try:
+            instants.append(parse_observation_time(observation.time))
+        except (TypeError, ValueError):
+            continue
+    years = [instant.year for instant in instants]
+    year_start = min(years) if years else None
+    year_end = max(years) if years else None
+    return_year = year_start
+    if instants and 0.0 <= solution.eccentricity < 1.0 and solution.semi_major_axis_au > 0.0:
+        period_days = 2.0 * np.pi * solution.semi_major_axis_au ** 1.5 / np.sqrt(MU_SUN)
+        if np.isfinite(period_days) and period_days > 0.0:
+            mean_motion = 2.0 * np.pi / period_days
+            signed_mean_anomaly = np.radians(
+                (solution.mean_anomaly_deg + 180.0) % 360.0 - 180.0
+            )
+            reference_perihelion = solution.epoch_jd - signed_mean_anomaly / mean_motion
+            middle_jd = float(np.median(dynamical_jd(instants)))
+            passage = round((middle_jd - reference_perihelion) / period_days)
+            try:
+                perihelion = datetime(2000, 1, 1, 12, tzinfo=timezone.utc) + timedelta(
+                    days=reference_perihelion + passage * period_days - 2451545.0
+                )
+                return_year = perihelion.year
+            except (OverflowError, ValueError):
+                pass
+    return {
+        "return_year": return_year,
+        "year_start": year_start,
+        "year_end": year_end,
+        "available": len(observations),
+        "fitted": 0,
+        "status": status,
+        "reason": reason,
+        "rms_arcsec": None,
+        "normalized_rms": None,
+    }
+
+
+def _update_apparition_linkage_metrics(
+    record: dict[str, object], observations: list[Observation],
+) -> None:
+    residuals: list[float] = []
+    normalized: list[float] = []
+    fitted = 0
+    for observation in observations:
+        if observation.used_in_fit:
+            fitted += 1
+        if observation.residual_ra_arcsec is None or observation.residual_dec_arcsec is None:
+            continue
+        residuals.extend((
+            float(observation.residual_ra_arcsec),
+            float(observation.residual_dec_arcsec),
+        ))
+        sigma_ra, sigma_dec = _observation_sigma_arcsec(observation)
+        normalized.extend((
+            float(observation.residual_ra_arcsec) / sigma_ra,
+            float(observation.residual_dec_arcsec) / sigma_dec,
+        ))
+    record["fitted"] = fitted
+    if residuals:
+        record["rms_arcsec"] = float(np.sqrt(np.mean(np.square(residuals))))
+    if normalized:
+        record["normalized_rms"] = float(np.sqrt(np.mean(np.square(normalized))))
+
+
 def _attach_multi_apparition_elements(
     observations: list[Observation], solution: OrbitSolution,
 ) -> None:
@@ -1317,6 +1389,30 @@ def _attach_multi_apparition_elements(
         "arg_peri": item.arg_peri_deg,
         "future": item.epoch_jd > latest_observation,
     } for item in returns)
+    # Replace period-extrapolated labels in the linkage audit with the actual
+    # perihelion years found by the same perturbed N-body integration.  For
+    # Halley, simply subtracting today's osculating period labels the 1910
+    # return as 1911 because Jupiter changes the period between apparitions.
+    if solution.apparition_linkage:
+        return_years: list[int] = []
+        for item in returns:
+            if item.epoch_jd > latest_observation:
+                continue
+            try:
+                instant = datetime(2000, 1, 1, 12, tzinfo=timezone.utc) + timedelta(
+                    days=float(item.epoch_jd) - 2451545.0
+                )
+                return_years.append(instant.year)
+            except (OverflowError, ValueError):
+                continue
+        unused = list(return_years)
+        for record in solution.apparition_linkage:
+            if not unused or record.get("return_year") is None:
+                continue
+            approximate = int(record["return_year"])
+            actual = min(unused, key=lambda year: abs(year - approximate))
+            record["return_year"] = actual
+            unused.remove(actual)
 
 
 def _automatic_orbit_score(solution: OrbitSolution) -> float:
@@ -1429,6 +1525,7 @@ def fit_orbit(
     multi_apparition_seed: tuple[OrbitSolution, float, int] | None = None
     seed_report: list[tuple[float | None, float | None, bool | None]] | None = None
     apparition_groups: list[list[Observation]] = []
+    apparition_linkage: list[dict[str, object]] = []
     if multibranch:
         initial_candidates = initial_orbit_from_observations(
             observations, return_candidates=True,
@@ -1515,6 +1612,10 @@ def fit_orbit(
             ]
             if periodic_comet else []
         )
+        apparition_linkage = [
+            _apparition_linkage_record(group, initial)
+            for group in apparition_groups
+        ]
         recent_apparition = apparition_groups[-1] if apparition_groups else []
         multi_apparition = bool(
             periodic_comet and len(apparition_groups) >= 2
@@ -1543,6 +1644,15 @@ def fit_orbit(
                 "starší a budoucí návraty jsou čistě gravitační integrace, "
                 "nikoli společný fit všech zjevení."
             )
+            for record in apparition_linkage:
+                record["status"] = "integrated_only"
+                record["reason"] = "A1–A3 nebyly zapnuty; návrat nebyl společně fitován."
+            if apparition_linkage:
+                apparition_linkage[-1]["status"] = "seed_only"
+                apparition_linkage[-1]["reason"] = "Samostatný fit posledního návratu."
+                _update_apparition_linkage_metrics(
+                    apparition_linkage[-1], recent_apparition,
+                )
         elif multi_apparition:
             # First lock onto the best-observed modern apparition.  Correcting
             # all six state components across a century immediately forces
@@ -1626,6 +1736,14 @@ def fit_orbit(
                 )
                 for observation in observations
             ]
+            if apparition_linkage:
+                apparition_linkage[-1]["status"] = "seed_only"
+                apparition_linkage[-1]["reason"] = (
+                    "Výchozí samostatný fit posledního návratu; čeká na navázání starších."
+                )
+                _update_apparition_linkage_metrics(
+                    apparition_linkage[-1], recent_apparition,
+                )
         else:
             result = _fit_orbit_once(
                 observations, initial, constraints, truncate_years,
@@ -1684,10 +1802,29 @@ def fit_orbit(
                         or not np.isfinite(normalized)
                         or normalized > 8.0
                     ):
-                        raise OrbitFitError(
-                            "Připojení staršího návratu neprošlo kontrolou kvality."
+                        normalized_text = (
+                            "nedostupné"
+                            if normalized is None or not np.isfinite(normalized)
+                            else f"{normalized:.2f}σ"
                         )
-                except (OrbitFitError, ValueError, RuntimeError, FloatingPointError):
+                        raise OrbitFitError(
+                            "Připojení staršího návratu neprošlo kontrolou kvality "
+                            f"(společné RMS {candidate[1]:.2f}″; "
+                            f"{normalized_text})."
+                        )
+                except (OrbitFitError, ValueError, RuntimeError, FloatingPointError) as exc:
+                    if apparition_linkage:
+                        apparition_linkage[first_group]["status"] = "failed"
+                        apparition_linkage[first_group]["reason"] = str(exc)
+                        _update_apparition_linkage_metrics(
+                            apparition_linkage[first_group],
+                            apparition_groups[first_group],
+                        )
+                        for older_index in range(first_group):
+                            apparition_linkage[older_index]["status"] = "not_attempted"
+                            apparition_linkage[older_index]["reason"] = (
+                                "Nezkoušeno, protože navázání následujícího návratu selhalo."
+                            )
                     result = last_good
                     for observation, report_values in zip(
                         observations, last_good_report,
@@ -1706,6 +1843,14 @@ def fit_orbit(
                     break
                 last_good = candidate
                 linked_count += 1
+                for group_index in range(first_group, len(apparition_groups)):
+                    apparition_linkage[group_index]["status"] = "linked"
+                    apparition_linkage[group_index]["reason"] = (
+                        "Společný N-body fit s ostatními označenými návraty."
+                    )
+                    _update_apparition_linkage_metrics(
+                        apparition_linkage[group_index], apparition_groups[group_index],
+                    )
                 last_good_report = [
                     (
                         observation.residual_ra_arcsec,
@@ -1789,5 +1934,7 @@ def fit_orbit(
                 if not nongravitational:
                     result = _prefer_parabolic_short_arc(observations, result, truncate_years)
     _calibrate_fitted_photometry(observations, result[0])
+    if apparition_linkage:
+        result[0].apparition_linkage = tuple(apparition_linkage)
     _attach_multi_apparition_elements(observations, result[0])
     return result

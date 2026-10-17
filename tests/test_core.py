@@ -10,6 +10,7 @@ from orbit_app.domain import Observation, OrbitSolution
 from orbit_app.main_window import (
     CONSTELLATION_LABELS, CONSTELLATION_LINES, ElementsPanel, MpcNetworkClient, ObservationModel,
     PlaybackBar, SkyPanel, SolarSystemPanel,
+    apparition_linkage_summary, apparition_observation_count_text,
     datetime_from_jd, equatorial_ra_ticks, format_dec_sexagesimal, format_ra_sexagesimal,
     is_comet_designation, observation_residual_score, observations_to_tsv, parse_output_epoch,
     perihelion_jd_from_solution, project_ecliptic_camera,
@@ -716,6 +717,15 @@ class OrbitFitSelectionTests(unittest.TestCase):
             )
         self.assertEqual(row_counts, [10, 18, 24])
         self.assertIn("všech 3", result[0].fit_model_note or "")
+        self.assertEqual(
+            [item["status"] for item in result[0].apparition_linkage or ()],
+            ["linked", "linked", "linked"],
+        )
+        self.assertTrue(
+            (apparition_linkage_summary(result[0]) or "").startswith(
+                "NAVÁZÁNO 3/3 návratů"
+            )
+        )
 
     def test_multi_apparition_table_includes_next_future_return(self):
         solution = OrbitSolution(
@@ -964,6 +974,23 @@ class OrbitFitSelectionTests(unittest.TestCase):
         self.assertIsNone(observations[0].residual_ra_arcsec)
         self.assertAlmostEqual(observations[-1].residual_ra_arcsec or 0.0, .2)
         self.assertIn("neprošel kontrolou kvality", seed.fit_model_note or "")
+        self.assertEqual(
+            [item["status"] for item in seed.apparition_linkage or ()],
+            ["failed", "seed_only"],
+        )
+        self.assertEqual(
+            apparition_linkage_summary(seed),
+            "NENAVÁZÁNO — společný fit 1/2 návratů",
+        )
+
+    def test_representative_count_says_which_arc_it_describes(self):
+        solution = OrbitSolution("1P", 2446470.5, 17.8, .967, 162, 58, 111, 0)
+        solution.fit_observation_count = 360
+        solution.fit_available_observation_count = 8432
+        self.assertEqual(
+            apparition_observation_count_text(solution),
+            "360 reprezentativních z 8432 v propojeném oblouku",
+        )
 
     def test_parabolic_perihelion_offset_is_finite_at_singularity(self):
         q = 3.2
