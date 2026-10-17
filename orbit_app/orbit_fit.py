@@ -389,7 +389,22 @@ def _representative_indices(epochs: np.ndarray, maximum: int = 120) -> np.ndarra
     time_indices = np.where(
         np.abs(values[right] - targets) < np.abs(values[left] - targets), right, left,
     )
-    return np.unique(np.concatenate((rank_indices, time_indices))).astype(int)
+    selected = np.unique(np.concatenate((rank_indices, time_indices))).astype(int)
+    # Clustered multi-apparition data can map most uniformly spaced time
+    # targets onto the same few edge observations.  Previously a requested
+    # 480-row sample of Halley-like data could silently shrink to roughly 260
+    # rows. Fill the unused capacity from the remaining rank distribution.
+    if selected.size < maximum:
+        remaining = np.setdiff1d(
+            np.arange(values.size, dtype=int), selected, assume_unique=True,
+        )
+        needed = min(maximum - selected.size, remaining.size)
+        if needed:
+            fill_positions = np.linspace(
+                0, remaining.size - 1, needed,
+            ).round().astype(int)
+            selected = np.unique(np.concatenate((selected, remaining[fill_positions])))
+    return selected.astype(int)
 
 
 def initial_orbit_from_observations(
@@ -1038,6 +1053,16 @@ def _fit_orbit_once(
     normalized_rms = float(np.sqrt(np.mean(np.square(
         final_astrometric_residual / astrometric_sigmas
     ))))
+    if (
+        not screening
+        and normalized_rms > 100.0
+        and rms > 3600.0
+    ):
+        raise OrbitFitError(
+            "Diferenciální korekce se vzdálila od astrometrie o celé stupně "
+            f"(RMS {rms:.0f}″; {normalized_rms:.0f}σ). Takové řešení nelze "
+            "považovat za určenou dráhu."
+        )
     astrometric_jacobian = np.asarray(result.jac[:final_astrometric_residual.size, :], dtype=float)
     if screening:
         uncertainties, state_covariance = None, None
@@ -1390,6 +1415,9 @@ def fit_orbit(
         short_arc and active_count >= 6
         and not constraints and not nongravitational
     )
+    multi_apparition = False
+    multi_apparition_seed: tuple[OrbitSolution, float, int] | None = None
+    seed_report: list[tuple[float | None, float | None, bool | None]] | None = None
     if multibranch:
         initial_candidates = initial_orbit_from_observations(
             observations, return_candidates=True,
@@ -1521,6 +1549,15 @@ def fit_orbit(
             # full-arc correction. Avoid doing the same century integration
             # twice merely to manufacture another intermediate seed.
             result = seed
+            multi_apparition_seed = seed
+            seed_report = [
+                (
+                    observation.residual_ra_arcsec,
+                    observation.residual_dec_arcsec,
+                    observation.used_in_fit,
+                )
+                for observation in observations
+            ]
         else:
             result = _fit_orbit_once(
                 observations, initial, constraints, truncate_years,
@@ -1543,11 +1580,44 @@ def fit_orbit(
             for name, value in (result[0].nongravitational_parameters or {}).items()
             if name in final_nongrav
         })
-        result = _fit_orbit_once(
-            observations, result[0], constraints, truncate_years, final_nongrav,
-            maximum_observations=480 if long_arc else None,
-            max_nfev=4 if long_arc else 12, robust_loss=True,
-        )
+        try:
+            linked_result = _fit_orbit_once(
+                observations, result[0], constraints, truncate_years, final_nongrav,
+                maximum_observations=480 if long_arc else None,
+                max_nfev=4 if long_arc else 12, robust_loss=True,
+            )
+            linked_normalized = linked_result[0].fit_normalized_rms
+            linked_is_bad = bool(
+                multi_apparition_seed is not None
+                and (
+                    not np.isfinite(linked_result[1])
+                    or linked_result[1] > 600.0
+                    or linked_normalized is None
+                    or not np.isfinite(linked_normalized)
+                    or linked_normalized > 25.0
+                )
+            )
+            if linked_is_bad:
+                raise OrbitFitError(
+                    "Společný víceapariční fit se neudržel u astrometrie."
+                )
+            result = linked_result
+        except (OrbitFitError, ValueError, RuntimeError, FloatingPointError):
+            if multi_apparition_seed is None or seed_report is None:
+                raise
+            result = multi_apparition_seed
+            for observation, report_values in zip(observations, seed_report):
+                (
+                    observation.residual_ra_arcsec,
+                    observation.residual_dec_arcsec,
+                    observation.used_in_fit,
+                ) = report_values
+            result[0].fit_model_note = (
+                "Společná korekce všech pozorovaných návratů neprošla "
+                "kontrolou kvality. Zobrazený fit proto vychází z posledního "
+                "dostatečně pozorovaného návratu; ostatní návraty jsou "
+                "planetárně integrovaná předpověď."
+            )
     elif not multibranch and not constraints and short_arc and active_count > 120:
         # A representative subset is a fast seed, not a sufficient final
         # answer for a dense PCCP/NEOCP discovery arc.  Competing range

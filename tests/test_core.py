@@ -867,6 +867,71 @@ class OrbitFitSelectionTests(unittest.TestCase):
         self.assertEqual(selected[0], epochs[0])
         self.assertEqual(selected[-1], epochs[-1])
 
+    def test_clustered_multi_apparition_sample_uses_requested_capacity(self):
+        epochs = np.concatenate((
+            np.linspace(0.0, 100.0, 500),
+            np.linspace(27375.0, 27475.0, 1500),
+            np.linspace(54750.0, 54900.0, 6432),
+        ))
+        indices = _representative_indices(epochs, 480)
+        self.assertEqual(len(indices), 480)
+        self.assertGreater(np.count_nonzero(epochs[indices] < 1000.0), 15)
+        self.assertGreater(np.count_nonzero(
+            (epochs[indices] > 27000.0) & (epochs[indices] < 28000.0)
+        ), 30)
+
+    def test_catastrophic_linked_comet_fit_falls_back_to_latest_apparition(self):
+        observations = [
+            Observation(
+                time=f"1835-10-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
+            )
+            for day in range(1, 7)
+        ] + [
+            Observation(
+                time=f"1986-03-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
+            )
+            for day in range(1, 11)
+        ]
+        seed = OrbitSolution(
+            "1P", 2446470.5, 17.8, .967, 162.3, 58.4, 111.3, 0.0,
+            position_au=(.586, 0.0, 0.0), velocity_au_per_day=(0.0, .03, 0.0),
+            fit_normalized_rms=1.0, nongravitational_parameters={"A1": 1e-8},
+        )
+        failed = OrbitSolution(
+            "1P", 2446470.5, 18.0, .96, 162.0, 58.0, 111.0, 0.0,
+            position_au=(.6, 0.0, 0.0), velocity_au_per_day=(0.0, .03, 0.0),
+            fit_normalized_rms=5000.0, nongravitational_parameters={"A1": 2e-8},
+        )
+
+        def staged_fit(rows, *_args, **_kwargs):
+            if staged_fit.calls == 0:
+                for observation in rows:
+                    observation.residual_ra_arcsec = .2
+                    observation.residual_dec_arcsec = -.1
+                    observation.used_in_fit = True
+                result = (seed, .3, len(rows))
+            else:
+                for observation in observations:
+                    observation.residual_ra_arcsec = 100000.0
+                    observation.residual_dec_arcsec = 100000.0
+                    observation.used_in_fit = True
+                result = (failed, 100000.0, len(rows))
+            staged_fit.calls += 1
+            return result
+
+        staged_fit.calls = 0
+        with (
+            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=staged_fit),
+            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
+        ):
+            result = fit_orbit(
+                observations, seed, nongravitational={"A1": 0.0},
+            )
+        self.assertIs(result[0], seed)
+        self.assertIsNone(observations[0].residual_ra_arcsec)
+        self.assertAlmostEqual(observations[-1].residual_ra_arcsec or 0.0, .2)
+        self.assertIn("neprošla kontrolou kvality", seed.fit_model_note or "")
+
     def test_parabolic_perihelion_offset_is_finite_at_singularity(self):
         q = 3.2
         state = np.array([q, 0.0, 0.0, 0.0, math.sqrt(2.0 * MU_SUN / q), 0.0])
