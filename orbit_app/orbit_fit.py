@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta, timezone
+from typing import Callable
 
 import numpy as np
 from scipy.interpolate import CubicSpline
@@ -26,6 +27,14 @@ _PLANET_NAMES = (
 
 class OrbitFitError(RuntimeError):
     pass
+
+
+class OrbitFitCancelled(Exception):
+    """Raised cooperatively when the user cancels a numerical fit."""
+
+
+ProgressCallback = Callable[[str, int, int], None]
+CancelCallback = Callable[[], bool]
 
 
 def _calibrate_fitted_photometry(
@@ -796,7 +805,13 @@ def _fit_orbit_once(
     robust_loss: bool = False,
     robust_scale: float = 3.0,
     screening: bool = False,
+    cancel_callback: CancelCallback | None = None,
 ) -> tuple[OrbitSolution, float, int]:
+    def check_cancelled() -> None:
+        if cancel_callback is not None and cancel_callback():
+            raise OrbitFitCancelled("Výpočet dráhy byl zrušen uživatelem.")
+
+    check_cancelled()
     derived_initial = initial is None
     if initial is None:
         initial = initial_orbit_from_observations(observations)
@@ -965,6 +980,7 @@ def _fit_orbit_once(
     def residuals_with_engine(
         vector: np.ndarray, engine: NBodyIntegrator,
     ) -> np.ndarray:
+        check_cancelled()
         try:
             astrometry = astrometric_residuals(vector, engine) / astrometric_sigmas
         except (RuntimeError, ValueError, FloatingPointError, OverflowError):
@@ -1027,6 +1043,7 @@ def _fit_orbit_once(
         )
         initial_vector = coarse.x
 
+    check_cancelled()
     result = least_squares(
         residuals,
         initial_vector,
@@ -1053,6 +1070,7 @@ def _fit_orbit_once(
         )
     if not result.success and result.nfev < 2:
         raise OrbitFitError(result.message)
+    check_cancelled()
     elements = cartesian_to_elements(result.x[:3], result.x[3:6])
     reporting_engine = optimizer_engine if screening else full_engine
     try:
@@ -1118,6 +1136,7 @@ def _fit_orbit_once(
     report_ra = np.array([item[2] for item in reportable])
     report_dec = np.array([item[3] for item in reportable])
     report_state = StateVector(reference_epoch, result.x[:3], result.x[3:6])
+    check_cancelled()
     try:
         report_positions = propagate(result.x, report_state, report_epochs, full_engine)
         report_earth = earth_heliocentric_ecliptic(report_epochs)
@@ -1443,6 +1462,7 @@ def _automatic_orbit_score(solution: OrbitSolution) -> float:
 def _prefer_parabolic_short_arc(
     observations: list[Observation], candidate: tuple[OrbitSolution, float, int],
     truncate_years: float | None,
+    cancel_callback: CancelCallback | None = None,
 ) -> tuple[OrbitSolution, float, int]:
     """Try Find_Orb's second, near-parabolic branch for a hyperbolic short arc."""
     solution = candidate[0]
@@ -1482,7 +1502,10 @@ def _prefer_parabolic_short_arc(
     try:
         parabolic = _fit_orbit_once(
             observations, solution, {"e": 1.0}, truncate_years, None,
+            cancel_callback=cancel_callback,
         )
+    except OrbitFitCancelled:
+        raise
     except Exception:
         restore_candidate_report()
         return candidate
@@ -1501,8 +1524,33 @@ def fit_orbit(
     constraints: dict[str, float] | None = None,
     truncate_years: float | None = None,
     nongravitational: dict[str, float] | None = None,
+    progress_callback: ProgressCallback | None = None,
+    cancel_callback: CancelCallback | None = None,
 ) -> tuple[OrbitSolution, float, int]:
     """Fit an orbit with conservative automatic rejection of astrometric blunders."""
+    progress_step = 0
+    progress_total = 0
+
+    def check_cancelled() -> None:
+        if cancel_callback is not None and cancel_callback():
+            raise OrbitFitCancelled("Výpočet dráhy byl zrušen uživatelem.")
+
+    def report_progress(label: str, total: int | None = None) -> None:
+        nonlocal progress_step, progress_total
+        check_cancelled()
+        if total is not None:
+            progress_total = max(int(total), progress_step + 1)
+        progress_step += 1
+        if progress_total > 0 and progress_step > progress_total:
+            progress_total = progress_step
+        if progress_callback is not None:
+            progress_callback(label, progress_step, progress_total)
+
+    def fit_once(*args, **kwargs):
+        kwargs.setdefault("cancel_callback", cancel_callback)
+        return _fit_orbit_once(*args, **kwargs)
+
+    report_progress("Připravuji astrometrii a počáteční dráhu…")
     active_times: list[datetime] = []
     for observation in observations:
         if (
@@ -1553,7 +1601,8 @@ def fit_orbit(
         # without making every hypothesis pay for a full DE440 correction.
         for candidate in initial_candidates[:19 if initial is not None else 18]:
             try:
-                trial = _fit_orbit_once(
+                report_progress("Prověřuji kandidátní větev krátkého oblouku…", 24)
+                trial = fit_once(
                     observations, candidate, constraints, truncate_years,
                     nongravitational, maximum_observations=36,
                     max_nfev=14, robust_loss=True, screening=True,
@@ -1576,7 +1625,8 @@ def fit_orbit(
         ]] = []
         for _, candidate in sorted(screened, key=lambda item: item[0])[:3]:
             try:
-                final_result = _fit_orbit_once(
+                report_progress("Zpřesňuji nejlepší větev na všech měřeních…")
+                final_result = fit_once(
                     observations, candidate, constraints, truncate_years,
                     nongravitational, maximum_observations=None,
                     max_nfev=40, robust_loss=True,
@@ -1633,6 +1683,14 @@ def fit_orbit(
             periodic_comet and len(apparition_groups) >= 2
             and 6 <= len(recent_apparition) < active_count
         )
+        if multi_apparition and nongravitational:
+            # Worst-case plan: recent seed and polish, then three propagated
+            # attempts, one local astrometric seed and three local attempts
+            # for every older observed apparition, followed by reporting.
+            progress_total = max(
+                progress_step + 2,
+                3 + 7 * (len(apparition_groups) - 1),
+            )
         if (
             multi_apparition and not nongravitational
         ):
@@ -1646,7 +1704,8 @@ def fit_orbit(
                 observation.used_in_fit = False
                 observation.residual_ra_arcsec = None
                 observation.residual_dec_arcsec = None
-            result = _fit_orbit_once(
+            report_progress("Fituji poslední pozorovaný návrat…", 3)
+            result = fit_once(
                 recent_apparition, initial, constraints, truncate_years,
                 None, maximum_observations=120,
                 max_nfev=8, robust_loss=True,
@@ -1676,7 +1735,8 @@ def fit_orbit(
                 }
                 if "DT" in (nongravitational or {}) else nongravitational
             )
-            seed = _fit_orbit_once(
+            report_progress("Určuji lokální dráhu posledního návratu…")
+            seed = fit_once(
                 recent_apparition, initial, constraints, truncate_years,
                 None, fixed_nongravitational=seed_nongrav,
                 maximum_observations=120,
@@ -1711,7 +1771,8 @@ def fit_orbit(
                     if name in polished_nongrav
                 })
                 try:
-                    polished = _fit_orbit_once(
+                    report_progress("Zpřesňuji lokální dráhu posledního návratu…")
+                    polished = fit_once(
                         recent_apparition, seed[0], constraints, truncate_years,
                         None, fixed_nongravitational=polished_nongrav,
                         maximum_observations=240,
@@ -1759,12 +1820,19 @@ def fit_orbit(
                     apparition_linkage[-1], recent_apparition,
                 )
         else:
-            result = _fit_orbit_once(
+            report_progress("Provádím diferenciální korekci dráhy…", 3)
+            result = fit_once(
                 observations, initial, constraints, truncate_years,
                 nongravitational, maximum_observations=120,
             )
     if not constraints and not nongravitational:
-        result = _prefer_parabolic_short_arc(observations, result, truncate_years)
+        result = (
+            _prefer_parabolic_short_arc(
+                observations, result, truncate_years, cancel_callback,
+            )
+            if cancel_callback is not None else
+            _prefer_parabolic_short_arc(observations, result, truncate_years)
+        )
     # For an ordinary six-parameter orbit the representative subset keeps the
     # interactive calculation fast. A1/A2/A3 are far more sensitive to the
     # complete time/station distribution, so a nongravitational solution uses
@@ -1835,7 +1903,14 @@ def fit_orbit(
                 try:
                     for parameters, evaluations, scale in nongrav_attempts:
                         try:
-                            trial = _fit_orbit_once(
+                            return_year = apparition_linkage[first_group].get(
+                                "return_year", "?"
+                            )
+                            report_progress(
+                                f"Navazuji návrat {return_year}: "
+                                f"společný fit {'+'.join(parameters)}…"
+                            )
+                            trial = fit_once(
                                 stage_observations, last_good[0], constraints,
                                 truncate_years, parameters,
                                 maximum_observations=min(480, 120 * stage_count),
@@ -1877,7 +1952,14 @@ def fit_orbit(
                             if name != "DT"
                         }
                         try:
-                            local_seed = _fit_orbit_once(
+                            return_year = apparition_linkage[first_group].get(
+                                "return_year", "?"
+                            )
+                            report_progress(
+                                f"Návrat {return_year}: určuji nezávislou "
+                                "lokální dráhu z astrometrie…"
+                            )
+                            local_seed = fit_once(
                                 apparition_groups[first_group], last_good[0],
                                 constraints, truncate_years, None,
                                 fixed_nongravitational=local_force,
@@ -1890,7 +1972,12 @@ def fit_orbit(
                             )
                             for parameters, evaluations, scale in nongrav_attempts:
                                 try:
-                                    trial = _fit_orbit_once(
+                                    report_progress(
+                                        f"Návrat {return_year}: společný fit z "
+                                        "lokální astrometrické větve "
+                                        f"({'+'.join(parameters)})…"
+                                    )
+                                    trial = fit_once(
                                         stage_observations, local_seed[0], constraints,
                                         truncate_years, parameters,
                                         maximum_observations=min(
@@ -2000,7 +2087,8 @@ def fit_orbit(
                     "astrometrických řešení."
                 )
         else:
-            result = _fit_orbit_once(
+            report_progress("Zpřesňuji negravitační řešení na celém oblouku…")
+            result = fit_once(
                 observations, result[0], constraints, truncate_years,
                 fitted_nongrav(result[0]),
                 maximum_observations=480 if long_arc else None,
@@ -2012,7 +2100,8 @@ def fit_orbit(
         # solutions can differ by only hundredths of an arcsecond on a subset
         # yet imply entirely different periods and perihelia.  All rows decide
         # the branch and make the reported observation count honest.
-        result = _fit_orbit_once(
+        report_progress("Zpřesňuji řešení na všech měřeních…")
+        result = fit_once(
             observations, result[0], constraints, truncate_years, nongravitational,
             maximum_observations=None, max_nfev=36, robust_loss=True,
         )
@@ -2056,7 +2145,8 @@ def fit_orbit(
                     result[0].fit_model_note, note,
                 )))
             else:
-                result = _fit_orbit_once(
+                report_progress("Přepočítávám dráhu po vyřazení odlehlých měření…")
+                result = fit_once(
                     observations, result[0], constraints, truncate_years, nongravitational,
                     maximum_observations=(
                         None if nongravitational or (short_arc and not constraints)
@@ -2065,7 +2155,17 @@ def fit_orbit(
                     max_nfev=12,
                 )
                 if not nongravitational:
-                    result = _prefer_parabolic_short_arc(observations, result, truncate_years)
+                    result = (
+                        _prefer_parabolic_short_arc(
+                            observations, result, truncate_years,
+                            cancel_callback,
+                        )
+                        if cancel_callback is not None else
+                        _prefer_parabolic_short_arc(
+                            observations, result, truncate_years,
+                        )
+                    )
+    report_progress("Dokončuji O−C, nejistoty a fotometrii…")
     _calibrate_fitted_photometry(observations, result[0])
     if apparition_linkage:
         result[0].apparition_linkage = tuple(apparition_linkage)

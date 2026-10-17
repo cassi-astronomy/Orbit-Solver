@@ -5,6 +5,7 @@ import os
 import json
 import re
 import hashlib
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -75,7 +76,7 @@ from .observatories import (
     observatory_details, station_offsets_gcrs,
 )
 from .orbit_fit import (
-    fit_orbit, fit_selection_count, initial_orbit_from_observations,
+    OrbitFitCancelled, fit_orbit, fit_selection_count, initial_orbit_from_observations,
     parse_observation_time,
 )
 from .orbit_engine import MU_SUN, NBodyIntegrator, StateVector
@@ -756,9 +757,120 @@ class MpcNetworkClient(QObject):
             reply.deleteLater()
 
 
+class OrbitFitProgressDialog(QDialog):
+    cancel_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Výpočet dráhy")
+        self.setModal(True)
+        self.setMinimumWidth(620)
+        self._started = time.monotonic()
+        self._current = 0
+        self._total = 0
+        self._running = True
+
+        self.phase = QLabel("Připravuji výpočet…")
+        self.phase.setWordWrap(True)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.timing = QLabel("Uplynulo: 0 s • zbývající čas zatím nelze odhadnout")
+        self.timing.setObjectName("muted")
+        self.note = QLabel(
+            "Odhad je orientační. Dlouhé integrační větve mohou trvat různě "
+            "dlouho; zrušení se projeví po návratu právě běžící integrace."
+        )
+        self.note.setWordWrap(True)
+        self.note.setObjectName("muted")
+        self.cancel_button = QPushButton("Zrušit výpočet")
+        self.cancel_button.clicked.connect(self._request_cancel)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(self.cancel_button)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.phase)
+        layout.addWidget(self.progress)
+        layout.addWidget(self.timing)
+        layout.addWidget(self.note)
+        layout.addLayout(buttons)
+
+        self.timer = QTimer(self)
+        self.timer.setInterval(1000)
+        self.timer.timeout.connect(self._update_timing)
+        self.timer.start()
+
+    @staticmethod
+    def _duration(seconds: float) -> str:
+        value = max(0, int(round(seconds)))
+        hours, remainder = divmod(value, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours} h {minutes:02d} min"
+        if minutes:
+            return f"{minutes} min {secs:02d} s"
+        return f"{secs} s"
+
+    @Slot(str, int, int)
+    def update_progress(self, label: str, current: int, total: int) -> None:
+        self.phase.setText(label)
+        self._current = max(0, int(current))
+        self._total = max(0, int(total))
+        if self._total > 0:
+            self.progress.setRange(0, self._total)
+            # ``current`` denotes the step which has just started.
+            self.progress.setValue(min(self._total, max(0, self._current - 1)))
+        else:
+            self.progress.setRange(0, 0)
+        self._update_timing()
+
+    @Slot()
+    def _update_timing(self) -> None:
+        elapsed = time.monotonic() - self._started
+        completed = max(0, self._current - 1)
+        if self._total > 0 and completed > 0 and completed < self._total:
+            remaining = elapsed / completed * (self._total - completed)
+            detail = f"hrubý odhad zbývá: {self._duration(remaining)}"
+            step = f"krok {self._current} z nejvýše {self._total}"
+        elif self._total > 0 and self._current >= self._total:
+            detail = "dokončuji poslední krok"
+            step = f"krok {self._total} z {self._total}"
+        else:
+            detail = "zbývající čas zatím nelze odhadnout"
+            step = "příprava"
+        self.timing.setText(
+            f"{step} • uplynulo: {self._duration(elapsed)} • {detail}"
+        )
+
+    @Slot()
+    def _request_cancel(self) -> None:
+        if not self._running:
+            return
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.setText("Ruším…")
+        self.phase.setText(
+            "Čekám na bezpečné ukončení právě probíhající integrace…"
+        )
+        self.cancel_requested.emit()
+
+    @Slot()
+    def finish(self) -> None:
+        self._running = False
+        self.timer.stop()
+        self.accept()
+
+    def reject(self) -> None:
+        if self._running:
+            self._request_cancel()
+            return
+        super().reject()
+
+
 class OrbitFitWorker(QObject):
     success = Signal(object)
     error = Signal(str)
+    progress = Signal(str, int, int)
+    cancelled = Signal()
     finished = Signal()
 
     def __init__(
@@ -775,20 +887,45 @@ class OrbitFitWorker(QObject):
         self.truncate_years = truncate_years
         self.nongravitational = nongravitational
         self.compute_original_future = compute_original_future
+        self._cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+
+    def is_cancel_requested(self) -> bool:
+        return self._cancel_requested
 
     @Slot()
     def run(self) -> None:
+        observation_snapshot = [
+            (
+                item.residual_ra_arcsec, item.residual_dec_arcsec,
+                item.used_in_fit, item.excluded_from_fit,
+                item.raw.get("automatic_exclusion"),
+            )
+            for item in self.observations
+        ]
         try:
             result = fit_orbit(
                 self.observations, self.initial, self.constraints, self.truncate_years,
                 self.nongravitational,
+                progress_callback=self.progress.emit,
+                cancel_callback=self.is_cancel_requested,
             )
             solution = result[0]
             if self.compute_original_future:
+                if self.is_cancel_requested():
+                    raise OrbitFitCancelled()
+                self.progress.emit(
+                    "Integruji původní a budoucí barycentrickou dráhu do 250 AU…",
+                    0, 0,
+                )
                 try:
                     analysis = analyze_original_future_orbit(solution)
                 except Exception as exc:
                     analysis = {"error": str(exc)}
+                if self.is_cancel_requested():
+                    raise OrbitFitCancelled()
                 solution = replace(solution, dynamical_1a=analysis)
                 result = (solution, result[1], result[2])
             if (
@@ -807,6 +944,18 @@ class OrbitFitWorker(QObject):
                 except Exception:
                     pass
             self.success.emit(result)
+        except OrbitFitCancelled:
+            for item, values in zip(self.observations, observation_snapshot):
+                (
+                    item.residual_ra_arcsec, item.residual_dec_arcsec,
+                    item.used_in_fit, item.excluded_from_fit,
+                    automatic_exclusion,
+                ) = values
+                if automatic_exclusion is None:
+                    item.raw.pop("automatic_exclusion", None)
+                else:
+                    item.raw["automatic_exclusion"] = automatic_exclusion
+            self.cancelled.emit()
         except Exception as exc:
             self.error.emit(str(exc))
         finally:
@@ -4300,6 +4449,7 @@ class MainWindow(QMainWindow):
         self._fit_after_observations_load = False
         self.fit_thread: QThread | None = None
         self.fit_worker: OrbitFitWorker | None = None
+        self.fit_progress_dialog: OrbitFitProgressDialog | None = None
         self.preliminary_thread: QThread | None = None
         self.preliminary_worker: PreliminaryOrbitWorker | None = None
         self._dirty_solution_tabs: set[int] = set()
@@ -5113,16 +5263,28 @@ class MainWindow(QMainWindow):
             self.current_observations, initial, self.fit_constraints, truncate_years,
             self.nongravitational_fit, self.compute_original_future,
         )
+        progress_dialog = OrbitFitProgressDialog(self)
+        # A queued slot on ``worker`` could not run while its thread is inside
+        # scipy.  The tiny lambda flips a thread-safe Python flag immediately
+        # in the GUI thread; the numerical residual checks it cooperatively.
+        progress_dialog.cancel_requested.connect(
+            lambda: worker.request_cancel()
+        )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.success.connect(self._own_orbit_loaded)
         worker.error.connect(self._own_orbit_failed)
+        worker.progress.connect(progress_dialog.update_progress)
+        worker.cancelled.connect(self._own_orbit_cancelled)
+        worker.finished.connect(progress_dialog.finish)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._fit_finished)
         self.fit_thread = thread
         self.fit_worker = worker
+        self.fit_progress_dialog = progress_dialog
+        progress_dialog.show()
         thread.start()
 
     def _own_orbit_loaded(self, result: object) -> None:
@@ -5191,9 +5353,16 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "Výpočet dráhy", message)
         self.statusBar().showMessage("Vlastní výpočet dráhy selhal.")
 
+    def _own_orbit_cancelled(self) -> None:
+        self.statusBar().showMessage(
+            "Výpočet dráhy byl zrušen; předchozí řešení zůstalo zachováno.",
+            10000,
+        )
+
     def _fit_finished(self) -> None:
         self.fit_thread = None
         self.fit_worker = None
+        self.fit_progress_dialog = None
         self.fit_button.setEnabled(True)
         self.preliminary_button.setEnabled(
             fit_selection_count(self.current_observations, None) >= 3

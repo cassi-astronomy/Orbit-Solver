@@ -36,7 +36,7 @@ from orbit_app.orbit_evolution import (
 )
 from orbit_app.planetary import PLANETS
 from orbit_app.orbit_fit import (
-    _automatic_orbit_score, _InterpolatedPlanetEphemeris,
+    OrbitFitCancelled, _automatic_orbit_score, _InterpolatedPlanetEphemeris,
     _attach_multi_apparition_elements, _calibrate_fitted_photometry,
     _is_automatic_rejection_candidate,
     _observation_offsets_gcrs, _observation_sigma_arcsec,
@@ -567,6 +567,10 @@ class PreviewGeometryTests(unittest.TestCase):
 
 
 class OrbitFitSelectionTests(unittest.TestCase):
+    def test_fit_can_be_cancelled_before_numerical_work_starts(self):
+        with self.assertRaises(OrbitFitCancelled):
+            fit_orbit([], None, cancel_callback=lambda: True)
+
     def test_missing_astrometric_uncertainty_uses_epoch_weight(self):
         historical = Observation(time="1835-10-01T00:00:00Z")
         photographic = Observation(time="1935-10-01T00:00:00Z")
