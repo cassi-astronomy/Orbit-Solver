@@ -191,6 +191,11 @@ def parse_mpc_orbit(body: object, designation: str) -> OrbitSolution:
     h_value = magnitude.get("H", orbit.get("H", 18.0))
     g_value = magnitude.get("G", orbit.get("G", 0.15))
     covariance_values = orbit.get("CAR", {}).get("covariance", {})
+    nongravitational = {
+        name.upper(): float(car[name])
+        for name in ("a1", "a2", "a3", "dt")
+        if name in car and np.isfinite(car[name])
+    }
     covariance = None
     if isinstance(covariance_values, dict):
         matrix = np.zeros((6, 6), dtype=float)
@@ -224,6 +229,7 @@ def parse_mpc_orbit(body: object, designation: str) -> OrbitSolution:
         velocity_au_per_day=tuple(float(value) for value in values[3:]),
         state_covariance=covariance,
         display_name=display_name,
+        nongravitational_parameters=nongravitational or None,
     )
 
 

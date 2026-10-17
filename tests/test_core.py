@@ -382,6 +382,25 @@ $$EOE
         self.assertEqual(solution.photometric_exponent, 4.0)
         self.assertFalse(solution.phase_correction)
 
+    def test_mpc_cartesian_comet_keeps_nongravitational_seed(self):
+        speed = math.sqrt(MU_SUN)
+        body = [{"mpc_orb": [{
+            "CAR": {
+                "coefficient_names": [
+                    "x", "y", "z", "vx", "vy", "vz", "A1", "A2",
+                ],
+                "coefficient_values": [
+                    1, 0, 0, 0, speed, 0, -2.51e-9, -2.47e-10,
+                ],
+            },
+            "epoch_data": {"epoch": 51544.5},
+        }]}]
+        solution = parse_mpc_orbit(body, "78P")
+        self.assertEqual(
+            solution.nongravitational_parameters,
+            {"A1": -2.51e-9, "A2": -2.47e-10},
+        )
+
     def test_numbered_interstellar_designation_is_treated_as_comet(self):
         self.assertTrue(is_comet_designation("3I"))
         self.assertTrue(is_comet_designation("3I/ATLAS"))
@@ -653,7 +672,7 @@ class OrbitFitSelectionTests(unittest.TestCase):
         self.assertEqual(fit_once.call_args_list[0].kwargs["maximum_observations"], 120)
         self.assertIn("posledního pozorovaného návratu", solution.fit_model_note)
 
-    def test_long_arc_dt_is_seeded_after_a_parameters(self):
+    def test_long_arc_seed_holds_a_parameters_then_frees_them_progressively(self):
         observations = [
             Observation(
                 time=f"1835-10-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
@@ -668,11 +687,15 @@ class OrbitFitSelectionTests(unittest.TestCase):
         solution = OrbitSolution(
             "1P", 2446470.5, 17.8, .967, 162.3, 58.4, 111.3, 0.0,
             position_au=(.586, 0.0, 0.0), velocity_au_per_day=(0.0, .03, 0.0),
+            fit_normalized_rms=.8,
         )
         calls = []
 
         def fake_fit(*args, **kwargs):
-            calls.append(dict(args[4] or {}))
+            calls.append((
+                dict(args[4] or {}),
+                dict(kwargs.get("fixed_nongravitational") or {}),
+            ))
             if len(calls) == 1:
                 solution.nongravitational_parameters = {"A1": 2e-8}
             return solution, 1.0, 10
@@ -682,8 +705,8 @@ class OrbitFitSelectionTests(unittest.TestCase):
             patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
         ):
             fit_orbit(observations, solution, nongravitational={"A1": 0.0, "DT": 30.0})
-        self.assertEqual(calls[0], {"A1": 0.0})
-        self.assertEqual(calls[1], {"A1": 2e-8, "DT": 30.0})
+        self.assertEqual(calls[0], ({}, {"A1": 0.0}))
+        self.assertEqual(calls[1], ({"A1": 2e-8}, {}))
 
     def test_three_comet_returns_are_linked_progressively(self):
         observations = [
@@ -726,6 +749,51 @@ class OrbitFitSelectionTests(unittest.TestCase):
                 "NAVÁZÁNO 3/3 návratů"
             )
         )
+
+    def test_any_periodic_comet_can_retry_linkage_from_older_local_astrometry(self):
+        observations = [
+            Observation(
+                time=f"{year}-03-{day:02d}T00:00:00Z",
+                ra_deg=10.0, dec_deg=20.0,
+            )
+            for year in (2010, 2020)
+            for day in range(1, 7)
+        ]
+        seed = OrbitSolution(
+            "321P/Test", 2458909.5, 4.6416, .45, 12.0, 30.0, 60.0, 0.0,
+            position_au=(2.5, 0.0, 0.0),
+            velocity_au_per_day=(0.0, .01, 0.0),
+            fit_normalized_rms=.8,
+            nongravitational_parameters={"A1": 1e-8},
+        )
+        bad = OrbitSolution(
+            "321P/Test", 2458909.5, 4.6416, .45, 12.0, 30.0, 60.0, 0.0,
+            position_au=(2.5, 0.0, 0.0),
+            velocity_au_per_day=(0.0, .01, 0.0),
+            fit_normalized_rms=100.0,
+            nongravitational_parameters={"A1": 1e-8},
+        )
+        row_counts = []
+
+        def fake_fit(rows, *_args, **_kwargs):
+            row_counts.append(len(rows))
+            if len(row_counts) == 2:
+                return bad, 100.0, len(rows)
+            return seed, 1.0, len(rows)
+
+        with (
+            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit),
+            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
+        ):
+            result = fit_orbit(
+                observations, seed, nongravitational={"A1": 0.0},
+            )
+        self.assertEqual(row_counts, [6, 12, 6, 12])
+        self.assertEqual(
+            [item["status"] for item in result[0].apparition_linkage or ()],
+            ["linked", "linked"],
+        )
+        self.assertIn("všech 2", result[0].fit_model_note or "")
 
     def test_multi_apparition_table_includes_next_future_return(self):
         solution = OrbitSolution(
