@@ -1150,12 +1150,23 @@ def _is_automatic_rejection_candidate(
 
 
 def _latest_observing_apparition(
-    observations: list[Observation], gap_years: float = 30.0,
+    observations: list[Observation], solution: OrbitSolution | None = None,
+    gap_years: float = 30.0, minimum_size: int = 1,
 ) -> list[Observation]:
-    """Return the latest observing block separated by a multi-year gap."""
+    """Return the latest sufficiently populated observing apparition.
+
+    For a bound periodic comet, observations are assigned to the nearest
+    perihelion passage using the seed orbit's period.  This works for both
+    Halley-type comets and short-period objects such as Encke; a fixed
+    decades-long gap does not.  The old gap split remains a deliberately
+    conservative fallback when no usable periodic comet orbit is available.
+    """
     dated: list[tuple[datetime, Observation]] = []
     for observation in observations:
-        if observation.excluded_from_fit or not observation.time:
+        if (
+            observation.excluded_from_fit or not observation.time
+            or observation.ra_deg is None or observation.dec_deg is None
+        ):
             continue
         try:
             dated.append((parse_observation_time(observation.time), observation))
@@ -1164,12 +1175,50 @@ def _latest_observing_apparition(
     dated.sort(key=lambda item: item[0])
     if not dated:
         return []
-    boundary = 0
+
+    periodic_comet = bool(
+        solution is not None
+        and is_comet_designation(solution.designation)
+        and 0.0 <= solution.eccentricity < 1.0
+        and solution.semi_major_axis_au > 0.0
+    )
+    if periodic_comet:
+        assert solution is not None
+        period_days = (
+            2.0 * np.pi * solution.semi_major_axis_au ** 1.5 / np.sqrt(MU_SUN)
+        )
+        if np.isfinite(period_days) and period_days > 0.0:
+            epochs = dynamical_jd([item[0] for item in dated])
+            mean_motion = 2.0 * np.pi / period_days
+            signed_mean_anomaly = np.radians(
+                (solution.mean_anomaly_deg + 180.0) % 360.0 - 180.0
+            )
+            reference_perihelion = (
+                solution.epoch_jd - signed_mean_anomaly / mean_motion
+            )
+            passage_indices = np.floor(
+                (epochs - reference_perihelion) / period_days + 0.5
+            ).astype(np.int64)
+            groups: dict[int, list[Observation]] = {}
+            for passage, (_instant, observation) in zip(passage_indices, dated):
+                groups.setdefault(int(passage), []).append(observation)
+            for passage in sorted(groups, reverse=True):
+                if len(groups[passage]) >= max(1, minimum_size):
+                    return groups[passage]
+            return groups[max(groups)]
+
     minimum_gap = gap_years * 365.25 * 86400.0
+    blocks: list[list[Observation]] = []
+    start = 0
     for index in range(1, len(dated)):
         if (dated[index][0] - dated[index - 1][0]).total_seconds() >= minimum_gap:
-            boundary = index
-    return [item[1] for item in dated[boundary:]]
+            blocks.append([item[1] for item in dated[start:index]])
+            start = index
+    blocks.append([item[1] for item in dated[start:]])
+    for block in reversed(blocks):
+        if len(block) >= max(1, minimum_size):
+            return block
+    return blocks[-1]
 
 
 def _attach_multi_apparition_elements(
@@ -1199,9 +1248,25 @@ def _attach_multi_apparition_elements(
         return
     try:
         from .orbit_evolution import perihelion_returns_between
-        start = float(np.min(epochs) - min(3.0 * 365.25, .08 * period_days))
+        # Include the perihelion associated with the first observations even
+        # when a recovery arc begins months or years after it.
+        start = float(np.min(epochs) - .65 * period_days)
         end = float(np.max(epochs) + 1.10 * period_days)
         returns = perihelion_returns_between(solution, start, end)
+        latest_observation = float(np.max(epochs))
+        # A close planetary encounter can lengthen the next revolution enough
+        # that 1.1 times the current osculating period is insufficient. Extend
+        # only when necessary, avoiding a second costly integration normally.
+        if not any(item.epoch_jd > latest_observation for item in returns):
+            for multiplier in (2.0, 4.0):
+                extended = perihelion_returns_between(
+                    solution, start,
+                    float(np.max(epochs) + multiplier * period_days),
+                )
+                if extended:
+                    returns = extended
+                if any(item.epoch_jd > latest_observation for item in returns):
+                    break
     except (ValueError, RuntimeError, FloatingPointError):
         return
     latest_observation = float(np.max(epochs))
@@ -1297,7 +1362,10 @@ def fit_orbit(
     """Fit an orbit with conservative automatic rejection of astrometric blunders."""
     active_times: list[datetime] = []
     for observation in observations:
-        if observation.excluded_from_fit or not observation.time:
+        if (
+            observation.excluded_from_fit or not observation.time
+            or observation.ra_deg is None or observation.dec_deg is None
+        ):
             continue
         try:
             active_times.append(parse_observation_time(observation.time))
@@ -1395,13 +1463,23 @@ def fit_orbit(
         # Always establish residuals before any automatic rejection.  A
         # chronologically isolated follow-up batch is not itself evidence of
         # bad astrometry; only actual post-fit residuals may exclude it.
+        periodic_comet = bool(
+            initial is not None
+            and is_comet_designation(initial.designation)
+            and 0.0 <= initial.eccentricity < 1.0
+            and initial.semi_major_axis_au > 0.0
+        )
         recent_apparition = (
-            _latest_observing_apparition(observations)
-            if long_arc and initial is not None else []
+            _latest_observing_apparition(
+                observations, initial, minimum_size=6,
+            )
+            if periodic_comet else []
+        )
+        multi_apparition = bool(
+            periodic_comet and 6 <= len(recent_apparition) < active_count
         )
         if (
-            long_arc and initial is not None and not nongravitational
-            and 6 <= len(recent_apparition) < active_count
+            multi_apparition and not nongravitational
         ):
             # A single gravity-only correction cannot faithfully join active
             # comet apparitions separated by decades: it otherwise invents a
@@ -1423,7 +1501,7 @@ def fit_orbit(
                 "starší a budoucí návraty jsou čistě gravitační integrace, "
                 "nikoli společný fit všech zjevení."
             )
-        elif 6 <= len(recent_apparition) < active_count:
+        elif multi_apparition:
             # First lock onto the best-observed modern apparition.  Correcting
             # all six state components across a century immediately forces
             # every numerical Jacobian evaluation to repeat that full span.
@@ -1502,7 +1580,7 @@ def fit_orbit(
         outliers = sorted(
             candidates, key=_normalized_observation_residual, reverse=True,
         )[:maximum_rejections]
-        if outliers and len(observations) - len(outliers) >= 6:
+        if outliers and active_count - len(outliers) >= 6:
             for observation in outliers:
                 observation.excluded_from_fit = True
                 observation.raw["automatic_exclusion"] = True
@@ -1510,7 +1588,16 @@ def fit_orbit(
             # complete numerical Jacobian. Keep the robust long-arc solution
             # and merely flag its clear outliers; the next explicit user fit
             # starts without them. Shorter arcs are cheap enough to refit now.
-            if not long_arc:
+            if long_arc:
+                note = (
+                    f"{len(outliers)} zjevně odlehlých měření bylo označeno "
+                    "k vyřazení; kvůli délce oblouku se projeví až při dalším "
+                    "spuštění fitu."
+                )
+                result[0].fit_model_note = " ".join(filter(None, (
+                    result[0].fit_model_note, note,
+                )))
+            else:
                 result = _fit_orbit_once(
                     observations, result[0], constraints, truncate_years, nongravitational,
                     maximum_observations=(

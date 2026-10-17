@@ -557,13 +557,73 @@ class OrbitFitSelectionTests(unittest.TestCase):
 
     def test_latest_apparition_is_split_at_long_observing_gap(self):
         observations = [
-            Observation(time="1835-10-01T00:00:00Z"),
-            Observation(time="1910-04-01T00:00:00Z"),
-            Observation(time="1985-10-01T00:00:00Z"),
-            Observation(time="2003-01-01T00:00:00Z"),
+            Observation(time="1835-10-01T00:00:00Z", ra_deg=1.0, dec_deg=2.0),
+            Observation(time="1910-04-01T00:00:00Z", ra_deg=1.0, dec_deg=2.0),
+            Observation(time="1985-10-01T00:00:00Z", ra_deg=1.0, dec_deg=2.0),
+            Observation(time="2003-01-01T00:00:00Z", ra_deg=1.0, dec_deg=2.0),
         ]
         latest = _latest_observing_apparition(observations)
         self.assertEqual([item.time[:4] for item in latest], ["1985", "2003"])
+
+    def test_short_period_comet_apparitions_follow_its_orbital_period(self):
+        observations = [
+            Observation(
+                time=f"{year}-10-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
+            )
+            for year in (2017, 2020, 2023)
+            for day in range(1, 7)
+        ]
+        encke = OrbitSolution(
+            "2P", 2460220.5, 2.22, .85, 11.3, 334.0, 187.0, 0.0,
+        )
+        latest = _latest_observing_apparition(
+            observations, encke, minimum_size=6,
+        )
+        self.assertEqual(len(latest), 6)
+        self.assertTrue(all(item.time.startswith("2023-") for item in latest))
+
+    def test_gravity_only_short_period_comet_uses_latest_return(self):
+        observations = [
+            Observation(
+                time=f"{year}-10-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
+            )
+            for year in (2017, 2020, 2023)
+            for day in range(1, 7)
+        ]
+        encke = OrbitSolution(
+            "2P", 2460220.5, 2.22, .85, 11.3, 334.0, 187.0, 0.0,
+            position_au=(.34, 0.0, 0.0), velocity_au_per_day=(0.0, .04, 0.0),
+        )
+        candidate = (encke, 1.0, 6)
+        with (
+            patch("orbit_app.orbit_fit._fit_orbit_once", return_value=candidate) as fit_once,
+            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
+        ):
+            fit_orbit(observations, encke)
+        selected = fit_once.call_args_list[0].args[0]
+        self.assertEqual(len(selected), 6)
+        self.assertTrue(all(item.time.startswith("2023-") for item in selected))
+
+    def test_long_gap_in_asteroid_astrometry_does_not_select_one_apparition(self):
+        observations = [
+            Observation(
+                time=f"1950-01-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
+            )
+            for day in range(1, 7)
+        ] + [
+            Observation(
+                time=f"2025-01-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
+            )
+            for day in range(1, 7)
+        ]
+        asteroid = OrbitSolution("12345", 2460676.5, 2.4, .2, 5.0, 10.0, 20.0, 30.0)
+        candidate = (asteroid, 1.0, len(observations))
+        with (
+            patch("orbit_app.orbit_fit._fit_orbit_once", return_value=candidate) as fit_once,
+            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
+        ):
+            fit_orbit(observations, asteroid)
+        self.assertEqual(len(fit_once.call_args_list[0].args[0]), len(observations))
 
     def test_gravity_only_multi_apparition_fit_uses_latest_return(self):
         observations = [
@@ -1048,6 +1108,14 @@ class NativeIntegratorTests(unittest.TestCase):
             120.0,
         )
         self.assertAlmostEqual(radius, 1.0, places=10)
+
+    def test_unphysical_dt_trial_fails_instead_of_returning_current_radius(self):
+        with self.assertRaises(FloatingPointError):
+            delayed_heliocentric_radius(
+                np.array([1.0, 0.0, 0.0]),
+                np.array([0.0, 1.0, 0.0]),
+                1000.0,
+            )
 
     def test_zero_length_propagation_returns_initial_state(self):
         state = StateVector(2451545.0, np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.01, 0.0]))

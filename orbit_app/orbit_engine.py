@@ -30,8 +30,14 @@ def _stumpff(z: float) -> tuple[float, float]:
         root = np.sqrt(z)
         return (float((1.0 - np.cos(root)) / z),
                 float((root - np.sin(root)) / root**3))
-    root = min(float(np.sqrt(-z)), 50.0)
-    return (float((np.cosh(root) - 1.0) / (-z)),
+    root = float(np.sqrt(-z))
+    # Beyond this point the hyperbolic functions grow so steeply that a
+    # Newton trial is not numerically useful.  Clipping only ``root`` while
+    # retaining the original z (the former behaviour) violates the Stumpff
+    # identities and can silently manufacture a plausible but wrong radius.
+    if root > 50.0:
+        raise FloatingPointError("Hyperbolická univerzální anomálie přetekla.")
+    return (float((np.cosh(root) - 1.0) / root**2),
             float((np.sinh(root) - root) / root**3))
 
 
@@ -56,7 +62,8 @@ def delayed_heliocentric_radius(
     sqrt_mu = float(np.sqrt(MU_SUN))
     alpha = 2.0 / r0 - speed2 / MU_SUN
     anomaly = sqrt_mu * dt * (abs(alpha) if abs(alpha) > 1e-8 else 1.0 / r0)
-    for _ in range(16):
+    converged = False
+    for _ in range(32):
         z = alpha * anomaly * anomaly
         c_value, s_value = _stumpff(z)
         function = (
@@ -69,18 +76,23 @@ def delayed_heliocentric_radius(
             + (1.0 - alpha * r0) * anomaly**2 * c_value + r0
         )
         if not np.isfinite(function) or not np.isfinite(derivative) or abs(derivative) < 1e-14:
-            return r0
+            raise FloatingPointError("Výpočet zpožděné aktivity nekonverguje.")
         correction = function / derivative
         anomaly -= correction
         if abs(correction) < 1e-12:
+            converged = True
             break
+    if not converged:
+        raise FloatingPointError("Výpočet zpožděné aktivity nekonverguje.")
     z = alpha * anomaly * anomaly
     c_value, s_value = _stumpff(z)
     f_value = 1.0 - anomaly * anomaly / r0 * c_value
     g_value = dt - anomaly**3 / sqrt_mu * s_value
     shifted = f_value * r0_vector + g_value * v0_vector
     radius = float(np.linalg.norm(shifted))
-    return radius if np.isfinite(radius) and radius > 0.0 else r0
+    if not np.isfinite(radius) or radius <= 0.0:
+        raise FloatingPointError("Výpočet zpožděné heliocentrické vzdálenosti selhal.")
+    return radius
 
 
 def nongravitational_acceleration(

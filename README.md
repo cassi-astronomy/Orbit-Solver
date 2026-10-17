@@ -34,7 +34,9 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
 - bezpečný víceapariční režim periodických komet: bez A1–A3 se fituje poslední
   pozorovaný návrat a ostatní se označí jako čistě gravitační integrace;
   při zapnutém negravitačním modelu slouží poslední návrat jako počáteční
-  korekce pro společný fit celého oblouku;
+  korekce pro společný fit celého oblouku; zjevení se rozpoznávají z periody
+  načtené dráhy, takže stejný postup funguje pro Halleyův typ i krátkoperiodické
+  komety jako 2P/Encke nebo 78P/Gehrels;
 - volitelné fixování oskulačních elementů;
 - volitelný fit negravitačních parametrů komet A1, A2, A3 a časového posunu
   aktivity DT; kladné DT posouvá maximum aktivity za perihel;
