@@ -441,6 +441,35 @@ def _representative_indices(epochs: np.ndarray, maximum: int = 120) -> np.ndarra
     return selected.astype(int)
 
 
+def _balanced_linkage_observations(
+    apparition_groups: list[list[Observation]], maximum_per_group: int = 120,
+) -> list[Observation]:
+    """Return a chronological sample in which no apparition dominates.
+
+    This is only a branch-finding sample.  Once a common dynamical branch is
+    found, the final correction still uses every enabled observation with its
+    normal astrometric uncertainty.
+    """
+    populated = [group for group in apparition_groups if group]
+    if not populated:
+        return []
+    sizes = [len(group) for group in populated]
+    if max(sizes) <= 2 * min(sizes) and max(sizes) <= maximum_per_group:
+        return [observation for group in populated for observation in group]
+    target = min(maximum_per_group, min(sizes))
+    balanced: list[Observation] = []
+    for group in populated:
+        if len(group) <= target:
+            balanced.extend(group)
+            continue
+        instants = [parse_observation_time(observation.time) for observation in group]
+        epochs = dynamical_jd(instants)
+        indices = _representative_indices(epochs, target)
+        balanced.extend(group[index] for index in indices)
+    balanced.sort(key=lambda observation: parse_observation_time(observation.time))
+    return balanced
+
+
 def initial_orbit_from_observations(
     observations: list[Observation], method: str = "systematic",
     perihelion_distance_au: float | None = None,
@@ -1948,11 +1977,8 @@ def fit_orbit(
             last_good_report = seed_report
             linked_count = 1
             for first_group in range(len(apparition_groups) - 2, -1, -1):
-                stage_observations = [
-                    observation
-                    for group in apparition_groups[first_group:]
-                    for observation in group
-                ]
+                stage_groups = apparition_groups[first_group:]
+                stage_observations = _balanced_linkage_observations(stage_groups)
                 stage_count = len(apparition_groups) - first_group
                 all_parameters = fitted_nongrav(last_good[0])
                 # Classical apparition linking did not repeatedly solve all
@@ -2159,11 +2185,25 @@ def fit_orbit(
                     name: value for name, value in fitted_nongrav(last_good[0]).items()
                     if name in linkage_names or name == "R_EXPONENT"
                 }
+                balanced_final = _balanced_linkage_observations(apparition_groups)
+                exact_seed = last_good[0]
+                if len(balanced_final) < sum(map(len, apparition_groups)):
+                    report_progress(
+                        "Vyvažuji astrometrii jednotlivých návratů před "
+                        "závěrečnou korekcí…"
+                    )
+                    bridge = fit_once(
+                        balanced_final, exact_seed, constraints, truncate_years,
+                        exact_linkage_parameters,
+                        maximum_observations=None,
+                        max_nfev=28, robust_loss=True, robust_scale=8.0,
+                    )
+                    exact_seed = bridge[0]
                 result = fit_once(
-                    observations, last_good[0], constraints, truncate_years,
+                    observations, exact_seed, constraints, truncate_years,
                     exact_linkage_parameters,
                     maximum_observations=480,
-                    max_nfev=16, robust_loss=True, robust_scale=25.0,
+                    max_nfev=28, robust_loss=True, robust_scale=8.0,
                 )
                 failed = failed_apparitions()
                 requested_parameters = fitted_nongrav(result[0])
@@ -2217,7 +2257,7 @@ def fit_orbit(
                         for year, rms, normalized in failed
                     )
                     result[0].fit_model_note = (
-                        "Apariční předkorekce našla kandidátní větev, ale "
+                        "Vyvážená apariční předkorekce našla kandidátní větev, ale "
                         "závěrečný přesný fit nepotvrdil všechny návraty "
                         f"({detail}). Výsledek proto NENÍ označen jako navázaný."
                     )
@@ -2227,7 +2267,8 @@ def fit_orbit(
                     result[0].fit_model_note = (
                         f"Společný N-body fit propojil všech "
                         f"{len(apparition_groups)} pozorovaných návratů postupnou "
-                        "apariční předkorekcí a závěrečným přesným řešením DE440."
+                        "vyváženou apariční předkorekcí a závěrečným přesným "
+                        "řešením všech měření s DE440."
                     )
         else:
             report_progress("Zpřesňuji negravitační řešení na celém oblouku…")

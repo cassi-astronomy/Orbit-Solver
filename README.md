@@ -37,6 +37,10 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
   korekce pro společný fit celého oblouku; starší zjevení se nejprve rychle
   navážou apariční předkorekcí A1/A2 s uvolněným stavem až v krátkém druhém
   kroku a jediná přesná korekce DE440 následuje až po nalezení celé větve;
+  při hledání větve jsou řídké historické a husté moderní návraty zastoupeny
+  vyváženě; až následná přesná korekce používá všechna měření s jejich
+  skutečnými vahami, takže stovky CCD bodů nevytlačí několik desítek starých
+  poloh do vedlejšího minima;
   zjevení se rozpoznávají z periody načtené dráhy, takže stejný postup funguje
   pro Halleyův typ i krátkoperiodické komety jako 2P/Encke nebo 78P/Gehrels;
 - volitelné fixování oskulačních elementů;

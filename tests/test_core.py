@@ -38,7 +38,8 @@ from orbit_app.orbit_evolution import (
 from orbit_app.planetary import PLANETS
 from orbit_app.orbit_fit import (
     OrbitFitCancelled, _automatic_orbit_score, _InterpolatedPlanetEphemeris,
-    _attach_multi_apparition_elements, _calibrate_fitted_photometry,
+    _attach_multi_apparition_elements, _balanced_linkage_observations,
+    _calibrate_fitted_photometry,
     _is_automatic_rejection_candidate,
     _local_light_time_states,
     _observation_offsets_gcrs, _observation_sigma_arcsec,
@@ -1134,6 +1135,23 @@ class OrbitFitSelectionTests(unittest.TestCase):
         self.assertGreater(np.count_nonzero(
             (epochs[indices] > 27000.0) & (epochs[indices] < 28000.0)
         ), 30)
+
+    def test_linkage_sample_balances_sparse_historical_and_modern_returns(self):
+        old = [
+            Observation(time=f"1892-10-{1 + index % 28:02d}T{index % 24:02d}:00:00Z")
+            for index in range(41)
+        ]
+        modern = [
+            Observation(time=(
+                datetime(2008, 10, 1, tzinfo=timezone.utc)
+                + timedelta(hours=index)
+            ).isoformat())
+            for index in range(282)
+        ]
+        selected = _balanced_linkage_observations([old, modern])
+        self.assertEqual(len(selected), 82)
+        self.assertEqual(sum(item.time.startswith("1892") for item in selected), 41)
+        self.assertEqual(sum(item.time.startswith("2008") for item in selected), 41)
 
     def test_catastrophic_linked_comet_fit_falls_back_to_latest_apparition(self):
         observations = [
