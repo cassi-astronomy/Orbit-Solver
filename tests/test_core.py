@@ -39,6 +39,7 @@ from orbit_app.orbit_fit import (
     OrbitFitCancelled, _automatic_orbit_score, _InterpolatedPlanetEphemeris,
     _attach_multi_apparition_elements, _calibrate_fitted_photometry,
     _is_automatic_rejection_candidate,
+    _local_light_time_states,
     _observation_offsets_gcrs, _observation_sigma_arcsec,
     _perihelion_offset_days_from_state,
     _latest_observing_apparition, _prefer_parabolic_short_arc,
@@ -735,6 +736,7 @@ class OrbitFitSelectionTests(unittest.TestCase):
             calls.append((
                 dict(args[4] or {}),
                 dict(kwargs.get("fixed_nongravitational") or {}),
+                kwargs.get("fit_state", True),
             ))
             if len(calls) == 1:
                 solution.nongravitational_parameters = {"A1": 2e-8}
@@ -745,8 +747,9 @@ class OrbitFitSelectionTests(unittest.TestCase):
             patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
         ):
             fit_orbit(observations, solution, nongravitational={"A1": 0.0, "DT": 30.0})
-        self.assertEqual(calls[0], ({}, {"A1": 0.0}))
-        self.assertEqual(calls[1], ({"A1": 2e-8}, {}))
+        self.assertEqual(calls[0], ({}, {"A1": 0.0}, True))
+        self.assertEqual(calls[1], ({"A1": 2e-8}, {}, False))
+        self.assertTrue(calls[-1][2])
 
     def test_three_comet_returns_are_linked_progressively(self):
         observations = [
@@ -778,7 +781,9 @@ class OrbitFitSelectionTests(unittest.TestCase):
                 observations, solution,
                 nongravitational={"A1": 0.0, "DT": 0.0},
             )
-        self.assertEqual(row_counts, [10, 18, 24])
+        # Each older return gets a cheap fixed-state A prefit followed by a
+        # short state correction; only one strict all-return polish is done.
+        self.assertEqual(row_counts, [10, 18, 18, 24, 24, 24])
         self.assertIn("všech 3", result[0].fit_model_note or "")
         self.assertEqual(
             [item["status"] for item in result[0].apparition_linkage or ()],
@@ -817,7 +822,9 @@ class OrbitFitSelectionTests(unittest.TestCase):
 
         def fake_fit(rows, *_args, **_kwargs):
             row_counts.append(len(rows))
-            if len(row_counts) == 2:
+            # The fixed-state prefit is call 2; make the subsequent state
+            # correction fail so the independent local branch is exercised.
+            if len(row_counts) == 3:
                 return bad, 100.0, len(rows)
             return seed, 1.0, len(rows)
 
@@ -828,7 +835,7 @@ class OrbitFitSelectionTests(unittest.TestCase):
             result = fit_orbit(
                 observations, seed, nongravitational={"A1": 0.0},
             )
-        self.assertEqual(row_counts, [6, 12, 6, 12])
+        self.assertEqual(row_counts, [6, 12, 12, 6, 12, 12, 12])
         self.assertEqual(
             [item["status"] for item in result[0].apparition_linkage or ()],
             ["linked", "linked"],
@@ -1179,6 +1186,17 @@ class _NoPlanets:
 
 
 class NativeIntegratorTests(unittest.TestCase):
+    def test_local_light_time_expansion_matches_short_exact_propagation(self):
+        epoch = 2460000.5
+        position = np.array([5.0, 1.0, .2])
+        velocity = np.array([-.002, .006, .001])
+        state = StateVector(epoch, position, velocity)
+        engine = NBodyIntegrator(PLANETS, perturbers=())
+        reception = state.packed()[None, :]
+        local, light_time = _local_light_time_states(reception, np.zeros((1, 3)))
+        exact = engine.propagate(state, np.array([epoch - light_time[0]]))
+        np.testing.assert_allclose(local[:, :3], exact[:, :3], atol=2e-10, rtol=0.0)
+
     def test_planet_provider_includes_lunar_perturber(self):
         earth = PLANETS.position("earth", 2451545.0)
         moon = PLANETS.position("moon", 2451545.0)

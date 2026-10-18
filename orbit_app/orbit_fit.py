@@ -379,6 +379,31 @@ def _observation_sigmas(rows: list[tuple[Observation, datetime, float, float]]) 
     ], dtype=float)
 
 
+def _local_light_time_states(
+    propagated: np.ndarray, observer_positions: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Move reception-time states to emission time without a second long integration.
+
+    Light time is at most hours for ordinary Solar-System astrometry.  A local
+    second-order expansion using solar acceleration is therefore far below the
+    measurement noise, while avoiding another decades-long N-body propagation
+    in every numerical-Jacobian evaluation.  The final reported O-C table is
+    still recomputed with an independent full integration.
+    """
+    states = np.asarray(propagated, dtype=float)
+    observers = np.asarray(observer_positions, dtype=float)
+    light_time = np.linalg.norm(states[:, :3] - observers, axis=1) / C_AU_PER_DAY
+    position = states[:, :3]
+    radius = np.linalg.norm(position, axis=1)
+    acceleration = -MU_SUN * position / np.maximum(radius[:, None] ** 3, 1e-30)
+    emitted = states.copy()
+    emitted[:, :3] = (
+        position - states[:, 3:] * light_time[:, None]
+        + .5 * acceleration * np.square(light_time)[:, None]
+    )
+    return emitted, light_time
+
+
 def _representative_indices(epochs: np.ndarray, maximum: int = 120) -> np.ndarray:
     """Sample both observation density and elapsed time over a large data set."""
     values = np.asarray(epochs, dtype=float)
@@ -805,6 +830,7 @@ def _fit_orbit_once(
     robust_loss: bool = False,
     robust_scale: float = 3.0,
     screening: bool = False,
+    fit_state: bool = True,
     cancel_callback: CancelCallback | None = None,
 ) -> tuple[OrbitSolution, float, int]:
     def check_cancelled() -> None:
@@ -851,6 +877,11 @@ def _fit_orbit_once(
         name for name in ("A1", "A2", "A3", "DT")
         if name in (nongravitational or {})
     )
+    if not fit_state and not nongrav_names:
+        raise OrbitFitError(
+            "Rychlý apariční předfit potřebuje alespoň jeden volný "
+            "negravitační parametr."
+        )
     initial_nongrav = {
         name: float((initial.nongravitational_parameters or {}).get(name, 0.0))
         for name in nongrav_names
@@ -910,7 +941,9 @@ def _fit_orbit_once(
         # relaxed pass finds the correction cheaply; the strict DE440 model
         # below polishes and reports the final state.
         optimizer_engine = NBodyIntegrator(
-            full_ephemeris, relative_tolerance=1e-8, absolute_tolerance=1e-10,
+            full_ephemeris,
+            relative_tolerance=3e-7 if screening else 1e-8,
+            absolute_tolerance=3e-9 if screening else 1e-10,
             nongravitational_parameters=initial_nongrav,
         )
     else:
@@ -963,12 +996,11 @@ def _fit_orbit_once(
         propagated = propagate(vector, state, epochs, engine)
         if not np.all(np.isfinite(propagated)):
             raise FloatingPointError("Integrace vrátila nekonečný stav.")
-        light_time = np.linalg.norm(
-            propagated[:, :3] - earth_at_observations, axis=1
-        ) / C_AU_PER_DAY
-        emitted = propagate(vector, state, epochs - light_time, engine)
+        emitted, _light_time = _local_light_time_states(
+            propagated, earth_at_observations,
+        )
         if not np.all(np.isfinite(emitted)):
-            raise FloatingPointError("Integrace po opravě o dobu letu selhala.")
+            raise FloatingPointError("Lokální oprava o dobu letu světla selhala.")
         computed_ra, computed_dec = _equatorial_direction(
             emitted, epochs, observer_offsets, earth_at_observations,
         )
@@ -1016,14 +1048,34 @@ def _fit_orbit_once(
         np.array([1e-3, 1e-3, 1e-3, 1e-5, 1e-5, 1e-5]),
         np.ones(len(nongrav_names)),
     ))
-    nongrav_lower = np.array([
-        -1000.0 if name == "DT" else -1e4 for name in nongrav_names
+    # Keep numerical derivatives away from physically absurd trial forces.
+    # The scaled A limit of 100 means 1e-6 AU/day^2, already far above the
+    # usual Marsden parameters, while still admitting a larger supplied seed.
+    nongrav_limits = np.array([
+        (
+            max(365.0, abs(initial_nongrav.get(name, 0.0)) * 2.0 + 30.0)
+            if name == "DT" else
+            max(100.0, abs(initial_nongrav.get(name, 0.0)) / 1e-8 * 10.0 + 10.0)
+        )
+        for name in nongrav_names
     ])
-    nongrav_upper = np.array([
-        1000.0 if name == "DT" else 1e4 for name in nongrav_names
-    ])
+    nongrav_lower = -nongrav_limits
+    nongrav_upper = nongrav_limits
     lower_bounds = np.concatenate((np.full(6, -np.inf), nongrav_lower))
     upper_bounds = np.concatenate((np.full(6, np.inf), nongrav_upper))
+
+    def expand_fit_vector(vector: np.ndarray) -> np.ndarray:
+        if fit_state:
+            return vector
+        return np.concatenate((initial_vector[:6], vector))
+
+    optimizer_initial = initial_vector if fit_state else initial_vector[6:]
+    optimizer_scale = fine_scale if fit_state else fine_scale[6:]
+    optimizer_lower = lower_bounds if fit_state else lower_bounds[6:]
+    optimizer_upper = upper_bounds if fit_state else upper_bounds[6:]
+
+    def optimizer_residuals(vector: np.ndarray) -> np.ndarray:
+        return residuals(expand_fit_vector(vector))
 
     if derived_initial:
         # The angles-only initializer deliberately favours a broad basin over
@@ -1031,7 +1083,7 @@ def _fit_orbit_once(
         # into the local minimum with a wide robust scale; the normal fine fit
         # below then handles individual outliers.
         coarse = least_squares(
-            residuals,
+            optimizer_residuals,
             initial_vector,
             method="trf",
             x_scale="jac",
@@ -1041,15 +1093,16 @@ def _fit_orbit_once(
             max_nfev=60,
             verbose=0,
         )
-        initial_vector = coarse.x
+        initial_vector = expand_fit_vector(coarse.x)
+        optimizer_initial = initial_vector
 
     check_cancelled()
     result = least_squares(
-        residuals,
-        initial_vector,
+        optimizer_residuals,
+        optimizer_initial,
         method="trf",
-        x_scale=("jac" if derived_initial else fine_scale),
-        bounds=(lower_bounds, upper_bounds),
+        x_scale=("jac" if derived_initial else optimizer_scale),
+        bounds=(optimizer_lower, optimizer_upper),
         loss="soft_l1" if robust_loss else "linear",
         f_scale=float(robust_scale),
         max_nfev=(
@@ -1058,23 +1111,25 @@ def _fit_orbit_once(
         ),
         verbose=0,
     )
+    result_vector = expand_fit_vector(result.x)
     if use_fast_differential_correction:
         # Polish the fast short-arc solution with the complete planetary force
         # model.  Starting in the correct basin needs only a few evaluations.
         result = least_squares(
             lambda vector: residuals_with_engine(vector, full_engine),
-            result.x,
+            result_vector,
             method="trf", x_scale=fine_scale,
             bounds=(lower_bounds, upper_bounds), loss="linear",
             max_nfev=4 if screening else 8, verbose=0,
         )
+        result_vector = result.x
     if not result.success and result.nfev < 2:
         raise OrbitFitError(result.message)
     check_cancelled()
-    elements = cartesian_to_elements(result.x[:3], result.x[3:6])
+    elements = cartesian_to_elements(result_vector[:3], result_vector[3:6])
     reporting_engine = optimizer_engine if screening else full_engine
     try:
-        final_astrometric_residual = astrometric_residuals(result.x, reporting_engine)
+        final_astrometric_residual = astrometric_residuals(result_vector, reporting_engine)
     except (RuntimeError, ValueError, FloatingPointError, OverflowError) as exc:
         raise OrbitFitError(
             "Fit skončil v numericky nestabilní kombinaci A1/A2/A3/DT. "
@@ -1095,11 +1150,11 @@ def _fit_orbit_once(
             "považovat za určenou dráhu."
         )
     astrometric_jacobian = np.asarray(result.jac[:final_astrometric_residual.size, :], dtype=float)
-    if screening:
+    if screening or not fit_state:
         uncertainties, state_covariance = None, None
     else:
         uncertainties, state_covariance = _formal_element_uncertainties(
-            result.x, elements, astrometric_jacobian,
+            result_vector, elements, astrometric_jacobian,
             final_astrometric_residual / astrometric_sigmas,
             max(1, 6 + len(nongrav_names) - len(constraints or {})), nongrav_names,
         )
@@ -1112,8 +1167,8 @@ def _fit_orbit_once(
         photometric_exponent=initial.photometric_exponent,
         phase_correction=initial.phase_correction,
         provisional=True,
-        position_au=tuple(float(value) for value in result.x[:3]),
-        velocity_au_per_day=tuple(float(value) for value in result.x[3:6]),
+        position_au=tuple(float(value) for value in result_vector[:3]),
+        velocity_au_per_day=tuple(float(value) for value in result_vector[3:6]),
         state_covariance=(
             tuple(tuple(float(value) for value in row) for row in state_covariance)
             if state_covariance is not None else None
@@ -1124,7 +1179,7 @@ def _fit_orbit_once(
         fit_rms_arcsec=rms,
         fit_normalized_rms=normalized_rms,
         display_name=initial.display_name,
-        nongravitational_parameters=force_parameters(result.x) or None,
+        nongravitational_parameters=force_parameters(result_vector) or None,
     )
     if screening:
         return solution, rms, len(usable)
@@ -1135,16 +1190,16 @@ def _fit_orbit_once(
     report_offsets = _observation_offsets_gcrs(reportable)
     report_ra = np.array([item[2] for item in reportable])
     report_dec = np.array([item[3] for item in reportable])
-    report_state = StateVector(reference_epoch, result.x[:3], result.x[3:6])
+    report_state = StateVector(reference_epoch, result_vector[:3], result_vector[3:6])
     check_cancelled()
     try:
-        report_positions = propagate(result.x, report_state, report_epochs, full_engine)
+        report_positions = propagate(result_vector, report_state, report_epochs, full_engine)
         report_earth = earth_heliocentric_ecliptic(report_epochs)
         report_light_time = np.linalg.norm(
             report_positions[:, :3] - report_earth, axis=1,
         ) / C_AU_PER_DAY
         report_emitted = propagate(
-            result.x, report_state, report_epochs - report_light_time, full_engine
+            result_vector, report_state, report_epochs - report_light_time, full_engine
         )
     except (RuntimeError, ValueError, FloatingPointError, OverflowError) as exc:
         raise OrbitFitError(
@@ -1684,12 +1739,12 @@ def fit_orbit(
             and 6 <= len(recent_apparition) < active_count
         )
         if multi_apparition and nongravitational:
-            # Worst-case plan: recent seed and polish, then three propagated
-            # attempts, one local astrometric seed and three local attempts
-            # for every older observed apparition, followed by reporting.
+            # Per older apparition: cheap A1/A2 prefit, short state correction,
+            # and (only on failure) a local-astrometry retry.  One strict fit
+            # follows after every return has selected the same branch.
             progress_total = max(
                 progress_step + 2,
-                3 + 7 * (len(apparition_groups) - 1),
+                4 + 4 * (len(apparition_groups) - 1),
             )
         if (
             multi_apparition and not nongravitational
@@ -1869,74 +1924,63 @@ def fit_orbit(
                 ]
                 stage_count = len(apparition_groups) - first_group
                 all_parameters = fitted_nongrav(last_good[0])
-                # A3 and especially DT are strongly correlated with the state
-                # on only two apparitions.  Observatory-grade comet software
-                # therefore grows the model as the arc grows instead of
-                # releasing every parameter in the first century-spanning
-                # correction.  All user-selected parameters are restored once
-                # enough returns constrain them.
-                progressive_names = (
-                    ("A1", "A2") if stage_count <= 2 else
-                    ("A1", "A2", "A3") if stage_count == 3 else
-                    ("A1", "A2", "A3", "DT")
-                )
-                progressive = {
-                    name: all_parameters[name]
-                    for name in progressive_names if name in all_parameters
+                # Classical apparition linking did not repeatedly solve all
+                # orbital elements over a century.  It first corrected a few
+                # secular/non-gravitational terms from normal places, then
+                # performed one full differential correction.  A1/A2 provide
+                # that cheap phase/period bridge here; A3 and DT are released
+                # only in the final all-apparition polish.
+                linkage_names = tuple(
+                    name for name in ("A1", "A2") if name in all_parameters
+                ) or tuple(
+                    name for name in ("A3", "DT") if name in all_parameters
+                )[:1]
+                linkage_parameters = {
+                    name: all_parameters[name] for name in linkage_names
                 }
-                nongrav_attempts: list[tuple[dict[str, float], int, float]] = []
-
-                def add_attempt(values: dict[str, float], evaluations: int, scale: float) -> None:
-                    key = tuple(sorted(values))
-                    if values and all(tuple(sorted(item[0])) != key for item in nongrav_attempts):
-                        nongrav_attempts.append((values, evaluations, scale))
-
-                add_attempt(progressive, 28, 25.0)
-                add_attempt({
-                    name: value for name, value in all_parameters.items()
-                    if name != "DT"
-                }, 36, 50.0)
-                add_attempt(all_parameters, 48, 100.0)
                 candidate = None
                 candidate_source = "propagated"
                 failures: list[str] = []
                 try:
-                    for parameters, evaluations, scale in nongrav_attempts:
-                        try:
-                            return_year = apparition_linkage[first_group].get(
-                                "return_year", "?"
-                            )
-                            report_progress(
-                                f"Navazuji návrat {return_year}: "
-                                f"společný fit {'+'.join(parameters)}…"
-                            )
-                            trial = fit_once(
-                                stage_observations, last_good[0], constraints,
-                                truncate_years, parameters,
-                                maximum_observations=min(480, 120 * stage_count),
-                                max_nfev=evaluations, robust_loss=True,
-                                robust_scale=scale,
-                            )
-                            normalized = trial[0].fit_normalized_rms
-                            if (
-                                np.isfinite(trial[1])
-                                and trial[1] <= 60.0
-                                and normalized is not None
-                                and np.isfinite(normalized)
-                                and normalized <= 8.0
-                            ):
-                                candidate = trial
-                                break
-                            normalized_text = (
-                                "nedostupné" if normalized is None
-                                or not np.isfinite(normalized) else f"{normalized:.2f}σ"
-                            )
-                            failures.append(
-                                f"{'+'.join(parameters)}: RMS {trial[1]:.2f}″; "
-                                f"{normalized_text}"
-                            )
-                        except (OrbitFitError, ValueError, RuntimeError, FloatingPointError) as exc:
-                            failures.append(f"{'+'.join(parameters)}: {exc}")
+                    return_year = apparition_linkage[first_group].get(
+                        "return_year", "?"
+                    )
+                    report_progress(
+                        f"Návrat {return_year}: rychlý apariční předfit "
+                        f"({'+'.join(linkage_parameters)})…"
+                    )
+                    prefit = fit_once(
+                        stage_observations, last_good[0], constraints,
+                        truncate_years, linkage_parameters,
+                        maximum_observations=min(160, 40 * stage_count),
+                        max_nfev=8, robust_loss=True, robust_scale=50.0,
+                        screening=True, fit_state=False,
+                    )
+                    report_progress(
+                        f"Návrat {return_year}: krátká společná korekce…"
+                    )
+                    trial = fit_once(
+                        stage_observations, prefit[0], constraints,
+                        truncate_years, linkage_parameters,
+                        maximum_observations=min(240, 60 * stage_count),
+                        max_nfev=6, robust_loss=True, robust_scale=25.0,
+                        screening=True,
+                    )
+                    normalized = trial[0].fit_normalized_rms
+                    if (
+                        np.isfinite(trial[1]) and trial[1] <= 60.0
+                        and normalized is not None and np.isfinite(normalized)
+                        and normalized <= 8.0
+                    ):
+                        candidate = trial
+                    else:
+                        normalized_text = (
+                            "nedostupné" if normalized is None
+                            or not np.isfinite(normalized) else f"{normalized:.2f}σ"
+                        )
+                        failures.append(
+                            f"rychlá větev: RMS {trial[1]:.2f}″; {normalized_text}"
+                        )
                     # A propagated solution can be only tens of arcseconds
                     # from an older apparition and still lie outside the
                     # narrow basin in which a century-scale numerical
@@ -1970,51 +2014,39 @@ def fit_orbit(
                                 "lokální astrometrická větev: "
                                 f"RMS {local_seed[1]:.2f}″"
                             )
-                            for parameters, evaluations, scale in nongrav_attempts:
-                                try:
-                                    report_progress(
-                                        f"Návrat {return_year}: společný fit z "
-                                        "lokální astrometrické větve "
-                                        f"({'+'.join(parameters)})…"
-                                    )
-                                    trial = fit_once(
-                                        stage_observations, local_seed[0], constraints,
-                                        truncate_years, parameters,
-                                        maximum_observations=min(
-                                            480, 120 * stage_count,
-                                        ),
-                                        max_nfev=max(evaluations, 48),
-                                        robust_loss=True, robust_scale=scale,
-                                    )
-                                    normalized = trial[0].fit_normalized_rms
-                                    if (
-                                        np.isfinite(trial[1])
-                                        and trial[1] <= 60.0
-                                        and normalized is not None
-                                        and np.isfinite(normalized)
-                                        and normalized <= 8.0
-                                    ):
-                                        candidate = trial
-                                        candidate_source = "local_astrometry"
-                                        break
-                                    normalized_text = (
-                                        "nedostupné" if normalized is None
-                                        or not np.isfinite(normalized)
-                                        else f"{normalized:.2f}σ"
-                                    )
-                                    failures.append(
-                                        "lokální větev "
-                                        f"{'+'.join(parameters)}: RMS "
-                                        f"{trial[1]:.2f}″; {normalized_text}"
-                                    )
-                                except (
-                                    OrbitFitError, ValueError, RuntimeError,
-                                    FloatingPointError,
-                                ) as exc:
-                                    failures.append(
-                                        "lokální větev "
-                                        f"{'+'.join(parameters)}: {exc}"
-                                    )
+                            report_progress(
+                                f"Návrat {return_year}: rychlý předfit z "
+                                "lokální astrometrické větve…"
+                            )
+                            local_prefit = fit_once(
+                                stage_observations, local_seed[0], constraints,
+                                truncate_years, linkage_parameters,
+                                maximum_observations=min(160, 40 * stage_count),
+                                max_nfev=8, robust_loss=True,
+                                robust_scale=50.0, screening=True,
+                                fit_state=False,
+                            )
+                            trial = fit_once(
+                                stage_observations, local_prefit[0], constraints,
+                                truncate_years, linkage_parameters,
+                                maximum_observations=min(240, 60 * stage_count),
+                                max_nfev=6, robust_loss=True,
+                                robust_scale=25.0, screening=True,
+                            )
+                            normalized = trial[0].fit_normalized_rms
+                            if (
+                                np.isfinite(trial[1]) and trial[1] <= 60.0
+                                and normalized is not None
+                                and np.isfinite(normalized)
+                                and normalized <= 8.0
+                            ):
+                                candidate = trial
+                                candidate_source = "local_astrometry"
+                            else:
+                                failures.append(
+                                    "lokální rychlá větev: RMS "
+                                    f"{trial[1]:.2f}″"
+                                )
                         except (
                             OrbitFitError, ValueError, RuntimeError,
                             FloatingPointError,
@@ -2080,11 +2112,28 @@ def fit_orbit(
                 ]
                 result = candidate
             else:
+                # Only now pay for the strict DE440 correction with all six
+                # state components and every requested A/DT parameter.  The
+                # preceding stages merely selected the correct revolution
+                # branch with relaxed integration tolerances.
+                report_progress(
+                    "Zpřesňuji propojenou dráhu na všech návratech…"
+                )
+                result = fit_once(
+                    observations, last_good[0], constraints, truncate_years,
+                    fitted_nongrav(last_good[0]),
+                    maximum_observations=480,
+                    max_nfev=8, robust_loss=True, robust_scale=5.0,
+                )
+                for group_index, group in enumerate(apparition_groups):
+                    apparition_linkage[group_index]["status"] = "linked"
+                    _update_apparition_linkage_metrics(
+                        apparition_linkage[group_index], group,
+                    )
                 result[0].fit_model_note = (
                     f"Společný N-body fit propojil všech "
                     f"{len(apparition_groups)} pozorovaných návratů postupnou "
-                    "vícepočáteční diferenciální korekcí z lokálních "
-                    "astrometrických řešení."
+                    "apariční předkorekcí a závěrečným přesným řešením DE440."
                 )
         else:
             report_progress("Zpřesňuji negravitační řešení na celém oblouku…")

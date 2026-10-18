@@ -313,19 +313,30 @@ class SplinePlanetEphemeris:
         count = max(5, int(np.ceil((end_jd - start_jd) / step_days)) + 1)
         self.source = source
         self.epochs = np.linspace(float(start_jd), float(end_jd), count)
-        self.splines = {
-            body: CubicSpline(
-                self.epochs, source.position_series(body, self.epochs), axis=0,
-            )
-            for body in bodies
-        }
+        self.bodies = tuple(body.lower() for body in bodies)
+        self.body_indices = {body: index for index, body in enumerate(self.bodies)}
+        # One vector-valued spline is materially faster inside solve_ivp than
+        # nine independent Python/CubicSpline calls for every force evaluation.
+        values = np.stack([
+            source.position_series(body, self.epochs) for body in self.bodies
+        ], axis=1)
+        self.spline = CubicSpline(self.epochs, values, axis=0)
 
     def position(self, body: str, jd: float) -> np.ndarray:
         epoch = float(jd)
         if epoch < self.epochs[0] or epoch > self.epochs[-1]:
             return np.asarray(self.source.position(body, epoch), dtype=float)
-        return np.asarray(self.splines[body.lower()](epoch), dtype=float)
+        return np.asarray(
+            self.spline(epoch)[self.body_indices[body.lower()]], dtype=float,
+        )
 
     def positions(self, bodies: tuple[str, ...], jd: float) -> tuple[np.ndarray, ...]:
-        return tuple(self.position(body, jd) for body in bodies)
+        epoch = float(jd)
+        if epoch < self.epochs[0] or epoch > self.epochs[-1]:
+            return tuple(
+                np.asarray(self.source.position(body, epoch), dtype=float)
+                for body in bodies
+            )
+        values = np.asarray(self.spline(epoch), dtype=float)
+        return tuple(values[self.body_indices[body.lower()]] for body in bodies)
 
