@@ -973,6 +973,58 @@ class OrbitFitSelectionTests(unittest.TestCase):
             result[0].apparition_linkage[0]["reason"],
         )
 
+    def test_linkage_can_release_full_requested_nongravitational_model(self):
+        observations = [
+            Observation(
+                time=f"{year}-03-{day:02d}T00:00:00Z",
+                ra_deg=10.0, dec_deg=20.0,
+            )
+            for year in (2012, 2019)
+            for day in range(1, 7)
+        ]
+        catalogue = OrbitSolution(
+            "78P", 2458909.5, 3.73, .46, 6.2, 210.0, 192.0, 0.0,
+            position_au=(2.0, 0.0, 0.0),
+            velocity_au_per_day=(0.0, .01, 0.0),
+            fit_normalized_rms=.8,
+            nongravitational_parameters={
+                "A1": 1e-8, "A2": 1e-9, "A3": 1e-10, "DT": 2.0,
+            },
+        )
+        fitted = replace(catalogue)
+        bad = replace(catalogue, fit_normalized_rms=100.0)
+        expanded_seen = False
+        parameter_sets = []
+
+        def fake_fit(rows, _seed, _constraints, _truncate, parameters, **kwargs):
+            nonlocal expanded_seen
+            names = set(parameters or {})
+            parameter_sets.append(names)
+            if len(parameter_sets) == 1 or not names:
+                return fitted, 1.0, len(rows)
+            if {"A3", "DT"} & names:
+                expanded_seen = True
+                return fitted, 1.0, len(rows)
+            if expanded_seen:
+                return fitted, 1.0, len(rows)
+            return bad, 100.0, len(rows)
+
+        with (
+            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit),
+            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
+        ):
+            result = fit_orbit(
+                observations, catalogue,
+                nongravitational={
+                    "A1": 0.0, "A2": 0.0, "A3": 0.0, "DT": 0.0,
+                },
+            )
+        self.assertTrue(any({"A3", "DT"} <= names for names in parameter_sets))
+        self.assertIn(
+            "celého negravitačního modelu",
+            result[0].apparition_linkage[0]["reason"],
+        )
+
     def test_final_exact_fit_cannot_claim_return_with_large_residuals(self):
         observations = [
             Observation(

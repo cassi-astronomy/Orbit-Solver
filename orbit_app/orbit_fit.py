@@ -2055,6 +2055,7 @@ def fit_orbit(
             last_good = multi_apparition_seed
             last_good_report = seed_report
             linked_count = 1
+            linked_parameter_names: set[str] = set()
             for first_group in range(len(apparition_groups) - 2, -1, -1):
                 stage_groups = apparition_groups[first_group:]
                 stage_observations = _balanced_linkage_observations(stage_groups)
@@ -2079,9 +2080,27 @@ def fit_orbit(
                     for name in ("R_EXPONENT",)
                     if name in all_parameters
                 })
+                linked_parameter_names.update(linkage_parameters)
                 candidate = None
                 candidate_source = "propagated"
+                best_failed_trial = None
                 failures: list[str] = []
+
+                def remember_failed_trial(trial_result) -> None:
+                    nonlocal best_failed_trial
+                    normalized_value = trial_result[0].fit_normalized_rms
+                    score = (
+                        float(normalized_value)
+                        if normalized_value is not None
+                        and np.isfinite(normalized_value)
+                        else np.inf,
+                        float(trial_result[1]),
+                    )
+                    if best_failed_trial is None:
+                        best_failed_trial = (score, trial_result)
+                        return
+                    if score < best_failed_trial[0]:
+                        best_failed_trial = (score, trial_result)
                 try:
                     return_year = apparition_linkage[first_group].get(
                         "return_year", "?"
@@ -2132,6 +2151,7 @@ def fit_orbit(
                     ):
                         candidate = trial
                     else:
+                        remember_failed_trial(trial)
                         normalized_text = (
                             "nedostupné" if normalized is None
                             or not np.isfinite(normalized) else f"{normalized:.2f}σ"
@@ -2221,6 +2241,7 @@ def fit_orbit(
                                 candidate = trial
                                 candidate_source = "local_astrometry"
                             else:
+                                remember_failed_trial(trial)
                                 failures.append(
                                     "lokální rychlá větev: RMS "
                                     f"{trial[1]:.2f}″"
@@ -2289,6 +2310,7 @@ def fit_orbit(
                                 candidate = catalogue_trial
                                 candidate_source = "catalogue_astrometry"
                             else:
+                                remember_failed_trial(catalogue_trial)
                                 normalized_text = (
                                     "nedostupné"
                                     if catalogue_normalized is None
@@ -2307,6 +2329,84 @@ def fit_orbit(
                             failures.append(
                                 f"katalogová astrometrická větev: {exc}"
                             )
+                    # A1/A2 are normally the most stable quantities for
+                    # selecting an integer-revolution branch.  If that reduced
+                    # model reaches the right neighbourhood but cannot satisfy
+                    # both apparitions, release the complete model explicitly
+                    # requested by the user (typically A3 and/or DT).  This is
+                    # deliberately a last resort because these terms are
+                    # strongly correlated on one apparition; both passes are
+                    # nevertheless fitted and validated against all stage
+                    # astrometry, never accepted from a catalogue value alone.
+                    if candidate is None and best_failed_trial is not None:
+                        expanded_parameters = fitted_nongrav(
+                            best_failed_trial[1][0]
+                        )
+                        extra_parameters = (
+                            set(expanded_parameters) - set(linkage_parameters)
+                        )
+                        if extra_parameters:
+                            try:
+                                report_progress(
+                                    f"Návrat {return_year}: uvolňuji úplný "
+                                    "negravitační model "
+                                    f"({'+'.join(sorted(expanded_parameters))})…"
+                                )
+                                expanded_prefit = fit_once(
+                                    stage_observations,
+                                    best_failed_trial[1][0], constraints,
+                                    truncate_years, expanded_parameters,
+                                    maximum_observations=min(
+                                        320, 80 * stage_count
+                                    ),
+                                    max_nfev=18, robust_loss=True,
+                                    robust_scale=15.0, screening=False,
+                                    fit_state=False,
+                                )
+                                expanded_trial = fit_once(
+                                    stage_observations, expanded_prefit[0],
+                                    constraints, truncate_years,
+                                    expanded_parameters,
+                                    maximum_observations=min(
+                                        400, 100 * stage_count
+                                    ),
+                                    max_nfev=40, robust_loss=True,
+                                    robust_scale=6.0, screening=False,
+                                )
+                                expanded_normalized = (
+                                    expanded_trial[0].fit_normalized_rms
+                                )
+                                if (
+                                    np.isfinite(expanded_trial[1])
+                                    and expanded_trial[1] <= 60.0
+                                    and expanded_normalized is not None
+                                    and np.isfinite(expanded_normalized)
+                                    and expanded_normalized <= 8.0
+                                ):
+                                    candidate = expanded_trial
+                                    candidate_source = "expanded_nongrav"
+                                    linked_parameter_names.update(
+                                        expanded_parameters
+                                    )
+                                else:
+                                    normalized_text = (
+                                        "nedostupné"
+                                        if expanded_normalized is None
+                                        or not np.isfinite(expanded_normalized)
+                                        else f"{expanded_normalized:.2f}σ"
+                                    )
+                                    failures.append(
+                                        "úplný negravitační model: RMS "
+                                        f"{expanded_trial[1]:.2f}″; "
+                                        f"{normalized_text}"
+                                    )
+                            except (
+                                OrbitFitError, ValueError, RuntimeError,
+                                FloatingPointError,
+                            ) as exc:
+                                failures.append(
+                                    f"úplný negravitační model: {exc}"
+                                )
                     if candidate is None:
                         detail = "; ".join(failures[-3:]) or "bez použitelného pokusu"
                         raise OrbitFitError(
@@ -2353,6 +2453,9 @@ def fit_orbit(
                         "Společný N-body fit; katalogová větev byla znovu "
                         "určena a potvrzena načtenou astrometrií."
                         if candidate_source == "catalogue_astrometry" else
+                        "Společný N-body fit byl potvrzen načtenou astrometrií "
+                        "po uvolnění celého negravitačního modelu."
+                        if candidate_source == "expanded_nongrav" else
                         "Společný N-body fit s ostatními označenými návraty."
                     )
                     _update_apparition_linkage_metrics(
@@ -2377,7 +2480,7 @@ def fit_orbit(
                 )
                 exact_linkage_parameters = {
                     name: value for name, value in fitted_nongrav(last_good[0]).items()
-                    if name in linkage_names or name == "R_EXPONENT"
+                    if name in linked_parameter_names or name == "R_EXPONENT"
                 }
                 balanced_final = _balanced_linkage_observations(apparition_groups)
                 exact_seed = last_good[0]
