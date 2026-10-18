@@ -96,7 +96,9 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
 - zobrazení numericky integrované minulé a budoucí trajektorie výrazně odlišnými
   barvami ve Sluneční soustavě; právě probíhající návrat je během animace
   zvýrazněn silnější světlou čarou, zatímco starší a budoucí revoluce zůstávají
-  tenké a tlumené; animovaná poloha sleduje i změny dráhy po planetárním setkání;
+  tenké a tlumené; významné planetární setkání je označené jako dynamická
+  „výhybka“ a v okamžiku průletu se zvýraznění přepne z příchozí na odchozí
+  větev; animovaná poloha sleduje i skutečnou změnu dráhy po setkání;
 - volitelný lokální planetocentrický pohled pro zachycené objekty; lunární
   perturbace jsou zahrnuty (z DE440, nebo přibližným modelem bez něj).
 - fragmenty komety Shoemaker–Levy 9 lze načíst jejich úplným označením, například

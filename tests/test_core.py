@@ -498,6 +498,25 @@ class PreviewGeometryTests(unittest.TestCase):
         np.testing.assert_array_equal(older, epochs < 20.0)
         self.assertFalse(np.any(newer))
 
+    def test_close_encounter_splits_one_return_into_dynamical_branches(self):
+        epochs = np.arange(0.0, 31.0)
+        returns = np.array([5.0, 15.0, 25.0])
+        encounters = np.array([14.0])
+
+        older, active, newer = trajectory_return_masks(
+            epochs, returns, 12.0, encounters,
+        )
+        np.testing.assert_array_equal(active, (epochs >= 10.0) & (epochs < 14.0))
+        np.testing.assert_array_equal(older, epochs < 10.0)
+        np.testing.assert_array_equal(newer, epochs >= 14.0)
+
+        older, active, newer = trajectory_return_masks(
+            epochs, returns, 16.0, encounters,
+        )
+        np.testing.assert_array_equal(active, (epochs >= 14.0) & (epochs < 20.0))
+        np.testing.assert_array_equal(older, epochs < 14.0)
+        np.testing.assert_array_equal(newer, epochs >= 20.0)
+
     def test_integrated_trajectory_interpolates_animation_position(self):
         epochs = np.array([100.0, 102.0])
         states = np.array([
