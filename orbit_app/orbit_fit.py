@@ -436,6 +436,67 @@ def _observation_sigmas(
     return values * factors
 
 
+def _adaptive_finite_difference_jacobian(
+    function: Callable[[np.ndarray], np.ndarray], vector: np.ndarray,
+    steps: np.ndarray, lower_bounds: np.ndarray, upper_bounds: np.ndarray,
+    astrometric_size: int,
+) -> np.ndarray:
+    """Numerical Jacobian with Find_Orb-style observable-sized perturbations.
+
+    A fixed Cartesian perturbation is a poor derivative step over several
+    revolutions: the same velocity change can move a one-week prediction by a
+    fraction of a milliarcsecond and a century prediction by degrees.  Adapt
+    each persistent step until its largest normalized astrometric effect is of
+    order unity.  This keeps the derivative above integrator/round-off noise
+    without leaving the local tangent region.
+    """
+    point = np.asarray(vector, dtype=float)
+    base = np.asarray(function(point), dtype=float)
+    jacobian = np.empty((base.size, point.size), dtype=float)
+    for column in range(point.size):
+        step = max(abs(float(steps[column])), np.finfo(float).eps)
+        difference = None
+        signed_step = step
+        for _attempt in range(10):
+            signed_step = step
+            if point[column] + signed_step > upper_bounds[column]:
+                signed_step = -step
+            if point[column] + signed_step < lower_bounds[column]:
+                signed_step = step * .5
+            trial_point = point.copy()
+            trial_point[column] += signed_step
+            trial = np.asarray(function(trial_point), dtype=float)
+            difference = trial - base
+            astrometric_change = float(np.max(np.abs(
+                difference[:astrometric_size]
+            )))
+            if np.isfinite(astrometric_change) and .05 <= astrometric_change <= 3.0:
+                break
+            if not np.isfinite(astrometric_change) or astrometric_change <= 1e-15:
+                scale = .2 if not np.isfinite(astrometric_change) else 5.0
+            else:
+                scale = float(np.clip(1.0 / astrometric_change, .2, 5.0))
+            step = max(step * scale, np.finfo(float).eps)
+        assert difference is not None
+        steps[column] = step
+        derivative = difference / signed_step
+        jacobian[:, column] = np.where(np.isfinite(derivative), derivative, 0.0)
+    return jacobian
+
+
+def _arc_extension_counts(observation_count: int) -> tuple[int, ...]:
+    """Return monotonically growing Find_Orb-style arc-extension sizes."""
+    if observation_count <= 0:
+        return ()
+    counts: list[int] = []
+    count = min(6, observation_count)
+    while count < observation_count:
+        counts.append(count)
+        count = min(observation_count, count * 2)
+    counts.append(observation_count)
+    return tuple(counts)
+
+
 def _local_light_time_states(
     propagated: np.ndarray, observer_positions: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -1213,9 +1274,31 @@ def _fit_orbit_once(
     optimizer_scale = fine_scale if fit_state else fine_scale[6:]
     optimizer_lower = lower_bounds if fit_state else lower_bounds[6:]
     optimizer_upper = upper_bounds if fit_state else upper_bounds[6:]
+    full_derivative_steps = np.concatenate((
+        np.array([1e-5, 1e-5, 1e-5, 1e-9, 1e-9, 1e-9]),
+        np.array([
+            .1 if name == "DT" else 1e-3 for name in nongrav_names
+        ]),
+    ))
+    derivative_steps = (
+        full_derivative_steps if fit_state else full_derivative_steps[6:]
+    ).copy()
 
     def optimizer_residuals(vector: np.ndarray) -> np.ndarray:
         return residuals(expand_fit_vector(vector))
+
+    def optimizer_jacobian(vector: np.ndarray) -> np.ndarray:
+        return _adaptive_finite_difference_jacobian(
+            optimizer_residuals, vector, derivative_steps,
+            optimizer_lower, optimizer_upper, observed_ra.size * 2,
+        )
+
+    # Over a multi-year arc, generic finite-difference steps can either vanish
+    # in integration noise or move the prediction far outside the local phase
+    # branch.  Find_Orb's full_improvement() explicitly sizes every perturbation
+    # by its astrometric effect; use the same principle here.  SciPy's TRF then
+    # obtains the covariance/SVD directions from this well-scaled Jacobian.
+    numerical_jacobian = optimizer_jacobian if arc_days > 365.25 else "2-point"
 
     if derived_initial:
         # The angles-only initializer deliberately favours a broad basin over
@@ -1225,6 +1308,7 @@ def _fit_orbit_once(
         coarse = least_squares(
             optimizer_residuals,
             initial_vector,
+            jac=numerical_jacobian,
             method="trf",
             x_scale="jac",
             bounds=(lower_bounds, upper_bounds),
@@ -1240,6 +1324,7 @@ def _fit_orbit_once(
     result = least_squares(
         optimizer_residuals,
         optimizer_initial,
+        jac=numerical_jacobian,
         method="trf",
         x_scale=("jac" if derived_initial else optimizer_scale),
         bounds=(optimizer_lower, optimizer_upper),
@@ -2502,6 +2587,7 @@ def fit_orbit(
                                         expanded_parameters
                                     )
                                 else:
+                                    remember_failed_trial(expanded_trial)
                                     normalized_text = (
                                         "nedostupné"
                                         if expanded_normalized is None
@@ -2520,6 +2606,97 @@ def fit_orbit(
                                 failures.append(
                                     f"úplný negravitační model: {exc}"
                                 )
+                    # Find_Orb's attempt_extensions() does not switch an
+                    # entire distant arc on at once.  It adds the observations
+                    # nearest to the current arc, corrects, and only then grows
+                    # the included span.  Reproduce that continuation here:
+                    # 6, 12, 24... points from the end of the older apparition,
+                    # balanced against each already-linked apparition.
+                    if candidate is None and best_failed_trial is not None:
+                        older_rows = sorted(
+                            (
+                                item for item in apparition_groups[first_group]
+                                if not item.excluded_from_fit
+                            ),
+                            key=lambda item: parse_observation_time(item.time),
+                        )
+                        extension_counts = _arc_extension_counts(len(older_rows))
+                        extension_seed = best_failed_trial[1][0]
+                        extension_parameters = fitted_nongrav(extension_seed)
+                        extension_trial = None
+                        try:
+                            for count in extension_counts:
+                                report_progress(
+                                    f"Návrat {return_year}: postupně připojuji "
+                                    f"{count}/{len(older_rows)} měření…"
+                                )
+                                extension_groups = [
+                                    older_rows[-count:],
+                                    *apparition_groups[first_group + 1:],
+                                ]
+                                extension_observations = (
+                                    _balanced_linkage_observations(
+                                        extension_groups,
+                                        maximum_per_group=max(6, min(120, count)),
+                                    )
+                                )
+                                extension_trial = fit_once(
+                                    extension_observations, extension_seed,
+                                    constraints, truncate_years,
+                                    extension_parameters,
+                                    maximum_observations=None,
+                                    max_nfev=24,
+                                    robust_loss=True,
+                                    robust_scale=50.0 if count <= 12 else 12.0,
+                                    screening=False,
+                                )
+                                extension_seed = extension_trial[0]
+                                extension_parameters = fitted_nongrav(
+                                    extension_seed
+                                )
+                                if (
+                                    not np.isfinite(extension_trial[1])
+                                    or extension_trial[1] > 200.0
+                                ):
+                                    raise OrbitFitError(
+                                        "postupné rozšíření se vzdálilo od "
+                                        "astrometrie"
+                                    )
+                            if extension_trial is not None:
+                                extension_normalized = (
+                                    extension_trial[0].fit_normalized_rms
+                                )
+                                if (
+                                    extension_trial[1] <= 60.0
+                                    and extension_normalized is not None
+                                    and np.isfinite(extension_normalized)
+                                    and extension_normalized <= 8.0
+                                ):
+                                    candidate = extension_trial
+                                    candidate_source = "arc_extension"
+                                    linked_parameter_names.update(
+                                        extension_parameters
+                                    )
+                                else:
+                                    remember_failed_trial(extension_trial)
+                                    normalized_text = (
+                                        "nedostupné"
+                                        if extension_normalized is None
+                                        or not np.isfinite(extension_normalized)
+                                        else f"{extension_normalized:.2f}σ"
+                                    )
+                                    failures.append(
+                                        "postupné rozšíření oblouku: RMS "
+                                        f"{extension_trial[1]:.2f}″; "
+                                        f"{normalized_text}"
+                                    )
+                        except (
+                            OrbitFitError, ValueError, RuntimeError,
+                            FloatingPointError,
+                        ) as exc:
+                            failures.append(
+                                f"postupné rozšíření oblouku: {exc}"
+                            )
                     # A robust loss is essential while choosing a branch, but
                     # once both apparitions are only a few arcseconds apart it
                     # can freeze the older one as a coherent "outlier" and
@@ -2631,6 +2808,9 @@ def fit_orbit(
                         "Společný N-body fit byl potvrzen vyváženou lineární "
                         "korekcí všech připojených aparic."
                         if candidate_source == "balanced_forcing" else
+                        "Společný N-body fit byl nalezen postupným rozšířením "
+                        "pozorovacího oblouku do starší aparice."
+                        if candidate_source == "arc_extension" else
                         "Společný N-body fit s ostatními označenými návraty."
                     )
                     _update_apparition_linkage_metrics(

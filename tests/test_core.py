@@ -38,7 +38,9 @@ from orbit_app.orbit_evolution import (
 )
 from orbit_app.planetary import PLANETS
 from orbit_app.orbit_fit import (
-    OrbitFitCancelled, _automatic_orbit_score, _InterpolatedPlanetEphemeris,
+    OrbitFitCancelled, _adaptive_finite_difference_jacobian,
+    _arc_extension_counts,
+    _automatic_orbit_score, _InterpolatedPlanetEphemeris,
     _attach_multi_apparition_elements, _balanced_linkage_observations,
     _coherent_secondary_track_candidates,
     _calibrate_fitted_photometry,
@@ -1354,6 +1356,30 @@ class OrbitFitSelectionTests(unittest.TestCase):
         )
         self.assertIsNone(uncertainties)
         self.assertIsNone(covariance)
+
+    def test_adaptive_derivatives_scale_to_observable_response(self):
+        def residual(vector):
+            return np.array([
+                1e6 * vector[0] + 1e-6 * vector[1],
+                -3.0 * vector[0] + 2e-6 * vector[1],
+            ])
+
+        steps = np.array([1.0, 1.0])
+        jacobian = _adaptive_finite_difference_jacobian(
+            residual, np.array([.2, -.3]), steps,
+            np.full(2, -np.inf), np.full(2, np.inf), 2,
+        )
+        np.testing.assert_allclose(
+            jacobian, np.array([[1e6, 1e-6], [-3.0, 2e-6]]),
+            rtol=1e-6, atol=1e-6,
+        )
+        self.assertLess(steps[0], 1e-4)
+        self.assertGreater(steps[1], 1.0)
+
+    def test_distant_apparition_is_extended_in_doubling_stages(self):
+        self.assertEqual(_arc_extension_counts(0), ())
+        self.assertEqual(_arc_extension_counts(5), (5,))
+        self.assertEqual(_arc_extension_counts(41), (6, 12, 24, 41))
 
     def test_catastrophic_linked_comet_fit_falls_back_to_latest_apparition(self):
         observations = [

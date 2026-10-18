@@ -44,7 +44,11 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
   vyváženě po návratech, stanicích a nocích; pokud robustní hledání skončí těsně
   vedle společného řešení, následuje vyvážená lineární korekce, která nedovolí
   odepsat celý starší návrat jako jeden souvislý outlier; až následná přesná
-  korekce používá všechna měření s jejich vahami;
+  korekce používá všechna měření s jejich vahami; na víceletých obloucích se
+  kroky numerických derivací průběžně přizpůsobují skutečné změně O−C, podobně
+  jako při `Full step` ve Find_Orbu, aby se neztratil úzký směr změny fáze;
+  vzdálený návrat se navíc připojuje od nejbližších měření po rostoucích
+  úsecích 6, 12, 24… místo jediného skoku přes celou aparici;
   zjevení se rozpoznávají z periody načtené dráhy, takže stejný postup funguje
   pro Halleyův typ i krátkoperiodické komety jako 2P/Encke nebo 78P/Gehrels;
 - volitelné fixování oskulačních elementů;
