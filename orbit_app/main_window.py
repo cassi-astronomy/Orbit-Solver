@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QPlainTextEdit,
     QProgressBar,
+    QScrollArea,
     QSlider,
     QSizePolicy,
     QSpinBox,
@@ -4489,7 +4490,25 @@ class OrbitConstraintsDialog(QDialog):
         note.setWordWrap(True); note.setObjectName("muted")
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject)
-        layout = QVBoxLayout(self); layout.addWidget(note); layout.addLayout(form); layout.addWidget(buttons)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.addWidget(note)
+        content_layout.addLayout(form)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(content)
+        layout = QVBoxLayout(self)
+        layout.addWidget(scroll, 1)
+        # Keep the confirmation controls outside the scrolling region so they
+        # remain reachable even on a small laptop display.
+        layout.addWidget(buttons)
+        screen = QApplication.screenAt(parent.mapToGlobal(parent.rect().center())) if parent else None
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        available_height = screen.availableGeometry().height() if screen else 900
+        self.resize(720, min(820, max(500, int(available_height * .82))))
 
     def _download_de440(self) -> None:
         if PLANETS.jpl is None:
