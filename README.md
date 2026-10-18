@@ -42,8 +42,10 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
 - volitelné fixování oskulačních elementů;
 - předem volitelná výstupní epocha; fit zůstává kvůli stabilitě uprostřed
   pozorovacího oblouku a výsledné elementy se následně převedou N-body integrací;
-- volitelný fit negravitačních parametrů komet A1, A2, A3 a časového posunu
-  aktivity DT; kladné DT posouvá maximum aktivity za perihel;
+- volitelný fit negravitačních parametrů A1, A2 a A3 pro libovolné těleso:
+  Marsdenův vodní model s volitelným časovým posunem aktivity DT pro komety,
+  nebo mocninný model `g(r) = r^-m` (výchozí `m = 2`) pro tlak záření a
+  Yarkovského A2 u planetek; označení tělesa funkci neomezuje;
 - nejistoty elementů a základní diagnostika fitu.
 
 ### Elementy a efemerida

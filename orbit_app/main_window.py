@@ -3955,7 +3955,14 @@ class ElementsPanel(QWidget):
             f"H {s.absolute_magnitude:.2f}   G {s.slope_g:.2f}",
         ]
         if s.nongravitational_parameters:
-            lines.append("Nongravitational parameters (Marsden water-ice model):")
+            if "R_EXPONENT" in s.nongravitational_parameters:
+                exponent = float(s.nongravitational_parameters["R_EXPONENT"])
+                lines.append(
+                    "Nongravitational parameters "
+                    f"(inverse-power model g(r) = r^-{exponent:g}):"
+                )
+            else:
+                lines.append("Nongravitational parameters (Marsden water-ice model):")
             for name in ("A1", "A2", "A3", "DT"):
                 if name in s.nongravitational_parameters:
                     value = s.nongravitational_parameters[name]
@@ -4375,47 +4382,78 @@ class OrbitConstraintsDialog(QDialog):
         )
         self.original_future.setChecked(comet and compute_original_future)
         self.original_future.setVisible(comet)
+        separator = QLabel("Negravitační zrychlení")
+        separator.setStyleSheet("font-weight: 650; margin-top: 10px;")
+        form.addRow(separator)
+        current_ng = dict(solution.nongravitational_parameters or {})
+        current_ng.update(nongravitational or {})
+        self.ng_model = QComboBox()
+        self.ng_model.addItem("Marsdenův vodní model (komety)", "marsden")
+        self.ng_model.addItem("Mocninný model r⁻ᵐ (planetky / Yarkovsky)", "power")
+        default_model = "power" if "R_EXPONENT" in current_ng or not comet else "marsden"
+        self.ng_model.setCurrentIndex(self.ng_model.findData(default_model))
+        form.addRow("Závislost na vzdálenosti:", self.ng_model)
+        self.ng_exponent = QDoubleSpinBox()
+        self.ng_exponent.setDecimals(3)
+        self.ng_exponent.setRange(.1, 10.0)
+        self.ng_exponent.setSingleStep(.1)
+        self.ng_exponent.setValue(float(current_ng.get("R_EXPONENT", 2.0)))
+        self.ng_exponent.setToolTip(
+            "g(r) = (1 AU / r)^m. Hodnota m = 2 je jednoduchý standardní "
+            "model pro tlak záření nebo příčnou Yarkovského složku A2."
+        )
+        form.addRow("Exponent m:", self.ng_exponent)
+        for name, label in (
+            ("A1", "A1 radiální [10⁻⁸ AU/den²]"),
+            ("A2", "A2 příčný [10⁻⁸ AU/den²]"),
+            ("A3", "A3 normálový [10⁻⁸ AU/den²]"),
+            ("DT", "DT zpoždění aktivity [dny]"),
+        ):
+            enabled = QCheckBox("fitovat")
+            editor = QDoubleSpinBox()
+            editor.setDecimals(6)
+            editor.setRange(
+                -1_000.0 if name == "DT" else -10_000.0,
+                1_000.0 if name == "DT" else 10_000.0,
+            )
+            editor.setSingleStep(.5 if name == "DT" else .1)
+            scale = 1.0 if name == "DT" else 1e-8
+            editor.setValue(float(current_ng.get(name, 0.0)) / scale)
+            enabled.setChecked(name in (nongravitational or {}))
+            row = QWidget(); row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.addWidget(enabled); row_layout.addWidget(editor, 1)
+            form.addRow(label, row)
+            self.ng_controls[name] = (enabled, editor)
+        dt_enabled, dt_editor = self.ng_controls["DT"]
+        a_checks = [self.ng_controls[name][0] for name in ("A1", "A2", "A3")]
+
+        def sync_ng_model() -> None:
+            power_model = self.ng_model.currentData() == "power"
+            self.ng_exponent.setEnabled(power_model)
+            available_dt = not power_model and any(
+                control.isChecked() for control in a_checks
+            )
+            dt_enabled.setEnabled(available_dt)
+            dt_editor.setEnabled(available_dt)
+            if not available_dt:
+                dt_enabled.setChecked(False)
+
+        for control in a_checks:
+            control.toggled.connect(sync_ng_model)
+        self.ng_model.currentIndexChanged.connect(sync_ng_model)
+        sync_ng_model()
+        nongrav_note = QLabel(
+            "A1–A3 lze fitovat bez ohledu na označení tělesa. Pro planetky je "
+            "obvyklá příčná A2 (Yarkovsky); radiální A1 může popsat tlak záření. "
+            "Marsdenův model a DT jsou určeny pro kometární odplyňování. "
+            "Detekce Yarkovského efektu vyžaduje dlouhý přesný oblouk; samotná "
+            "nenulová hodnota A2 na krátkém oblouku není průkazná."
+        )
+        nongrav_note.setWordWrap(True)
+        nongrav_note.setObjectName("muted")
+        form.addRow(nongrav_note)
         if comet:
-            separator = QLabel("Negravitační parametry komety — Marsdenův vodní model")
-            separator.setStyleSheet("font-weight: 650; margin-top: 10px;")
-            form.addRow(separator)
-            current_ng = dict(solution.nongravitational_parameters or {})
-            current_ng.update(nongravitational or {})
-            for name, label in (
-                ("A1", "A1 radiální [10⁻⁸ AU/den²]"),
-                ("A2", "A2 příčný [10⁻⁸ AU/den²]"),
-                ("A3", "A3 normálový [10⁻⁸ AU/den²]"),
-                ("DT", "DT zpoždění aktivity [dny]"),
-            ):
-                enabled = QCheckBox("fitovat")
-                editor = QDoubleSpinBox()
-                editor.setDecimals(6)
-                editor.setRange(
-                    -1_000.0 if name == "DT" else -10_000.0,
-                    1_000.0 if name == "DT" else 10_000.0,
-                )
-                editor.setSingleStep(.5 if name == "DT" else .1)
-                scale = 1.0 if name == "DT" else 1e-8
-                editor.setValue(float(current_ng.get(name, 0.0)) / scale)
-                enabled.setChecked(name in (nongravitational or {}))
-                row = QWidget(); row_layout = QHBoxLayout(row)
-                row_layout.setContentsMargins(0, 0, 0, 0)
-                row_layout.addWidget(enabled); row_layout.addWidget(editor, 1)
-                form.addRow(label, row)
-                self.ng_controls[name] = (enabled, editor)
-            dt_enabled, dt_editor = self.ng_controls["DT"]
-            a_checks = [self.ng_controls[name][0] for name in ("A1", "A2", "A3")]
-
-            def sync_dt_availability() -> None:
-                available = any(control.isChecked() for control in a_checks)
-                dt_enabled.setEnabled(available)
-                dt_editor.setEnabled(available)
-                if not available:
-                    dt_enabled.setChecked(False)
-
-            for control in a_checks:
-                control.toggled.connect(sync_dt_availability)
-            sync_dt_availability()
             dynamics_heading = QLabel("Dlouhodobá dynamika komety")
             dynamics_heading.setStyleSheet("font-weight: 650; margin-top: 10px;")
             form.addRow(dynamics_heading)
@@ -4486,6 +4524,10 @@ class OrbitConstraintsDialog(QDialog):
         }
         if "DT" in selected and not any(name in selected for name in ("A1", "A2", "A3")):
             selected.pop("DT")
+        if any(name in selected for name in ("A1", "A2", "A3")):
+            if self.ng_model.currentData() == "power":
+                selected.pop("DT", None)
+                selected["R_EXPONENT"] = self.ng_exponent.value()
         return selected
 
     def calculate_original_future(self) -> bool:
@@ -5340,8 +5382,12 @@ class MainWindow(QMainWindow):
                     "2026-10-18 nebo 2026-10-18 00:00.",
                 )
                 self.fit_output_epoch = ""
+        fitted_ng_names = [
+            name for name in ("A1", "A2", "A3", "DT")
+            if name in self.nongravitational_fit
+        ]
         count = (
-            len(self.fit_constraints) + len(self.nongravitational_fit)
+            len(self.fit_constraints) + len(fitted_ng_names)
             + int(self.compute_original_future)
             + int(bool(self.fit_output_epoch))
         )
@@ -5350,7 +5396,11 @@ class MainWindow(QMainWindow):
         )
         if count:
             fixed = [f"{name}={value:g}" for name, value in self.fit_constraints.items()]
-            fitted = [f"fit {name}" for name in self.nongravitational_fit]
+            fitted = [f"fit {name}" for name in fitted_ng_names]
+            if "R_EXPONENT" in self.nongravitational_fit:
+                fitted.append(
+                    f"mocninný model m={self.nongravitational_fit['R_EXPONENT']:g}"
+                )
             dynamics = ["original/future 1/a"] if self.compute_original_future else []
             epoch = ([f"výstupní epocha {self.fit_output_epoch}"]
                      if self.fit_output_epoch else [])

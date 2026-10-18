@@ -887,11 +887,19 @@ def _fit_orbit_once(
         for name in nongrav_names
     }
     initial_nongrav.update(nongravitational or {})
+    # Distance-law constants are fixed model metadata, not fitted dimensions.
+    # Preserve them through every differential-correction pass; otherwise an
+    # asteroid selected as r^-2 silently reverts to the Marsden comet law.
     fixed_nongrav = {
+        str(name): float(value)
+        for name, value in (nongravitational or {}).items()
+        if name not in nongrav_names
+    }
+    fixed_nongrav.update({
         str(name): float(value)
         for name, value in (fixed_nongravitational or {}).items()
         if name not in nongrav_names
-    }
+    })
 
     def nongrav_from_vector(vector: np.ndarray) -> dict[str, float]:
         return {
@@ -1961,6 +1969,11 @@ def fit_orbit(
                 linkage_parameters = {
                     name: all_parameters[name] for name in linkage_names
                 }
+                linkage_parameters.update({
+                    name: all_parameters[name]
+                    for name in ("R_EXPONENT",)
+                    if name in all_parameters
+                })
                 candidate = None
                 candidate_source = "propagated"
                 failures: list[str] = []
@@ -1970,7 +1983,7 @@ def fit_orbit(
                     )
                     report_progress(
                         f"Návrat {return_year}: rychlý apariční předfit "
-                        f"({'+'.join(linkage_parameters)})…"
+                        f"({'+'.join(linkage_names)})…"
                     )
                     prefit = fit_once(
                         stage_observations, last_good[0], constraints,
@@ -2144,7 +2157,7 @@ def fit_orbit(
                 )
                 exact_linkage_parameters = {
                     name: value for name, value in fitted_nongrav(last_good[0]).items()
-                    if name in linkage_names
+                    if name in linkage_names or name == "R_EXPONENT"
                 }
                 result = fit_once(
                     observations, last_good[0], constraints, truncate_years,

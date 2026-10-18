@@ -10,7 +10,8 @@ def is_comet_designation(value: str) -> bool:
     """Recognize provisional and permanently numbered comet designations."""
     # MPC interstellar designations (1I, 2I, 3I/ATLAS, …) behave like comet
     # designations throughout the UI, including comet photometry and optional
-    # Marsden A1/A2/A3 parameters and optional DT activity lag.
+    # Comet-like designations default to Marsden A1/A2/A3 and optional DT;
+    # asteroid designations may still use non-gravitational force models.
     return bool(re.match(r"^\s*(?:[ACDPX]/|\d+[PDI](?:/|\b))", value or "", re.I))
 
 

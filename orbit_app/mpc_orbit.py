@@ -196,6 +196,10 @@ def parse_mpc_orbit(body: object, designation: str) -> OrbitSolution:
         for name in ("a1", "a2", "a3", "dt")
         if name in car and np.isfinite(car[name])
     }
+    if nongravitational and not comet:
+        # JPL/MPC asteroid A-parameters use the simple inverse-square
+        # convention unless custom comet-law constants are supplied.
+        nongravitational["R_EXPONENT"] = 2.0
     covariance = None
     if isinstance(covariance_values, dict):
         matrix = np.zeros((6, 6), dtype=float)

@@ -406,6 +406,23 @@ $$EOE
             {"A1": -2.51e-9, "A2": -2.47e-10},
         )
 
+    def test_mpc_cartesian_asteroid_uses_inverse_square_nongrav_model(self):
+        speed = math.sqrt(MU_SUN)
+        body = [{"mpc_orb": [{
+            "CAR": {
+                "coefficient_names": [
+                    "x", "y", "z", "vx", "vy", "vz", "A2",
+                ],
+                "coefficient_values": [1, 0, 0, 0, speed, 0, -2.47e-10],
+            },
+            "epoch_data": {"epoch": 51544.5},
+        }]}]
+        solution = parse_mpc_orbit(body, "2020 AB")
+        self.assertEqual(
+            solution.nongravitational_parameters,
+            {"A2": -2.47e-10, "R_EXPONENT": 2.0},
+        )
+
     def test_numbered_interstellar_designation_is_treated_as_comet(self):
         self.assertTrue(is_comet_designation("3I"))
         self.assertTrue(is_comet_designation("3I/ATLAS"))
@@ -1418,6 +1435,13 @@ class NativeIntegratorTests(unittest.TestCase):
             {"A1": 1e-8, "A2": 2e-8, "A3": -3e-8},
         )
         np.testing.assert_allclose(acceleration, [1e-8, 2e-8, -3e-8], rtol=2e-5)
+
+    def test_asteroid_power_law_scales_yarkovsky_a2(self):
+        acceleration = nongravitational_acceleration(
+            np.array([2.0, 0.0, 0.0]), np.array([0.0, .01, 0.0]),
+            {"A2": 4e-8, "R_EXPONENT": 2.0},
+        )
+        np.testing.assert_allclose(acceleration, [0.0, 1e-8, 0.0], rtol=1e-12)
 
     def test_dt_uses_earlier_osculating_distance(self):
         position = np.array([0.5, 0.0, 0.0])

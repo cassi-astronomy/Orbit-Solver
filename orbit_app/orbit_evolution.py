@@ -613,7 +613,8 @@ def calculate_orbit_evolution(
         returns=returns, encounters=tuple(encounters), start_jd=start_jd, end_jd=end_jd,
         sample_step_days=sample_step,
         model_note=(
-            "Orientační výpočet: planetární perturbace a A1/A2/A3/DT jsou zahrnuty, "
+            "Orientační výpočet: planetární perturbace a zvolený model "
+            "A1/A2/A3 jsou zahrnuty, "
             f"polohy planet používají model {PLANETS.model_name}."
         ),
         snapshots=snapshots,

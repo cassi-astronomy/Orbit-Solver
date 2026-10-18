@@ -99,7 +99,12 @@ def nongravitational_acceleration(
     position: np.ndarray, velocity: np.ndarray,
     parameters: dict[str, float] | None,
 ) -> np.ndarray:
-    """Marsden A1/A2/A3/DT acceleration in the instantaneous RTN frame."""
+    """A1/A2/A3 acceleration in RTN using the selected distance law.
+
+    The default is the Marsden water-ice law. ``R_EXPONENT`` selects the
+    asteroid convention g(r) = r**(-R_EXPONENT); exponent 2 is the usual
+    simple model for radiation pressure (A1) or Yarkovsky drift (A2).
+    """
     if not parameters or not any(float(parameters.get(name, 0.0)) for name in ("A1", "A2", "A3")):
         return np.zeros(3, dtype=float)
     position = np.asarray(position, dtype=float)
@@ -117,10 +122,17 @@ def nongravitational_acceleration(
         float(parameters.get("A2", 0.0)) * transverse +
         float(parameters.get("A3", 0.0)) * normal
     )
-    activity_radius = delayed_heliocentric_radius(
-        position, velocity, float(parameters.get("DT", 0.0)),
-    )
-    return float(marsden_water_ice_law(activity_radius)) * direction
+    if "R_EXPONENT" in parameters:
+        exponent = float(parameters["R_EXPONENT"])
+        if not np.isfinite(exponent) or exponent <= 0.0:
+            raise FloatingPointError("Exponent negravitačního modelu musí být kladný.")
+        distance_factor = radius ** -exponent
+    else:
+        activity_radius = delayed_heliocentric_radius(
+            position, velocity, float(parameters.get("DT", 0.0)),
+        )
+        distance_factor = float(marsden_water_ice_law(activity_radius))
+    return distance_factor * direction
 
 
 @dataclass(frozen=True, slots=True)
