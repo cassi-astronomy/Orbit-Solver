@@ -94,8 +94,9 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
   projeví v okamžiku setkání a setkání jsou v grafu vyznačena;
 - chronologický export jako čitelný tabulkový TXT nebo MPC 1-line elements;
 - zobrazení numericky integrované minulé a budoucí trajektorie výrazně odlišnými
-  barvami ve Sluneční soustavě; animovaná poloha sleduje i změny dráhy po
-  planetárním setkání;
+  barvami ve Sluneční soustavě; právě probíhající návrat je během animace
+  zvýrazněn silnější světlou čarou, zatímco starší a budoucí revoluce zůstávají
+  tenké a tlumené; animovaná poloha sleduje i změny dráhy po planetárním setkání;
 - volitelný lokální planetocentrický pohled pro zachycené objekty; lunární
   perturbace jsou zahrnuty (z DE440, nebo přibližným modelem bez něj).
 - fragmenty komety Shoemaker–Levy 9 lze načíst jejich úplným označením, například

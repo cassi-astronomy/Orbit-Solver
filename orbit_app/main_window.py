@@ -288,6 +288,34 @@ def solar_orbit_clip_radius(
     return float(viewport_radius) * 1.5
 
 
+def trajectory_return_masks(
+    trajectory_epochs: np.ndarray, return_epochs: np.ndarray, current_jd: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Classify samples as older, current, and newer orbital revolutions."""
+    epochs = np.asarray(trajectory_epochs, dtype=float)
+    perihelia = np.sort(np.asarray(return_epochs, dtype=float))
+    if epochs.size == 0:
+        empty = np.zeros(0, dtype=bool)
+        return empty, empty, empty
+    if perihelia.size == 0:
+        return (
+            np.zeros(epochs.size, dtype=bool),
+            np.ones(epochs.size, dtype=bool),
+            np.zeros(epochs.size, dtype=bool),
+        )
+    # Aphelion is not explicitly stored, but the midpoint between adjacent
+    # perihelia is a stable visual boundary for transferring emphasis from
+    # one revolution to the next during playback.
+    boundaries = (perihelia[:-1] + perihelia[1:]) / 2.0
+    active_index = int(np.searchsorted(boundaries, float(current_jd), side="right"))
+    lower = -np.inf if active_index == 0 else float(boundaries[active_index - 1])
+    upper = np.inf if active_index == len(perihelia) - 1 else float(boundaries[active_index])
+    older = epochs < lower
+    active = (epochs >= lower) & (epochs < upper)
+    newer = epochs >= upper
+    return older, active, newer
+
+
 def format_ra_sexagesimal(ra_deg: float) -> str:
     total_seconds = round((float(ra_deg) % 360.0) * 240.0, 2) % 86400.0
     hours = int(total_seconds // 3600)
@@ -2206,8 +2234,24 @@ class SolarSystemPanel(QWidget):
                         ax.plot(screen_x, screen_y, color="#52a9ff", lw=1.55, alpha=.92)
                     else:
                         segment_epochs = plotted_epochs[segment]
-                        past = segment_epochs <= current_jd
-                        for mask, colour in ((past, "#19d3c5"), (~past, "#d879ff")):
+                        return_epochs = np.asarray([
+                            item.epoch_jd
+                            for item in (self.evolution_result.returns
+                                         if self.evolution_result else ())
+                        ], dtype=float)
+                        older, active, newer = trajectory_return_masks(
+                            segment_epochs, return_epochs, current_jd,
+                        )
+                        # Inactive revolutions form a quiet historical/future
+                        # context. Draw the currently occupied revolution last
+                        # and prominently so a multi-century track remains
+                        # readable while playback moves between returns.
+                        styles = (
+                            (older, "#1ab7ad", .72, .28, 1.1),
+                            (newer, "#a85dcc", .72, .28, 1.1),
+                            (active, "#71e6ff", 2.35, .98, 2.4),
+                        )
+                        for mask, colour, width, alpha, zorder in styles:
                             indices = np.flatnonzero(mask)
                             if len(indices) < 2:
                                 continue
@@ -2215,7 +2259,8 @@ class SolarSystemPanel(QWidget):
                             for colour_segment in np.split(indices, colour_breaks):
                                 if len(colour_segment) > 1:
                                     ax.plot(screen_x[colour_segment], screen_y[colour_segment],
-                                            color=colour, lw=1.65, alpha=.92)
+                                            color=colour, lw=width, alpha=alpha,
+                                            zorder=zorder)
         planets = (("mercury", "Merkur", .241, "#aaaeb5"), ("venus", "Venuše", .615, "#e4bd70"),
                    ("earth", "Země", 1.0, "#4ea1ff"), ("mars", "Mars", 1.881, "#e0714c"),
                    ("jupiter", "Jupiter", 11.86, "#d0a17a"), ("saturn", "Saturn", 29.46, "#d8c58b"),

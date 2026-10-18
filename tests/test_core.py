@@ -15,6 +15,7 @@ from orbit_app.main_window import (
     is_comet_designation, observation_residual_score, observations_to_tsv, parse_output_epoch,
     perihelion_jd_from_solution, project_ecliptic_camera,
     SKY_TRACK_HORIZONS, sky_track_sample_count, solar_orbit_clip_radius,
+    trajectory_return_masks,
 )
 from orbit_app.mpc import MpcClient, parse_mpc80
 from orbit_app.mpc_orbit import (
@@ -484,6 +485,19 @@ $$EOE
 
 
 class PreviewGeometryTests(unittest.TestCase):
+    def test_trajectory_emphasis_moves_between_returns(self):
+        epochs = np.arange(0.0, 31.0)
+        returns = np.array([5.0, 15.0, 25.0])
+        older, active, newer = trajectory_return_masks(epochs, returns, 12.0)
+        np.testing.assert_array_equal(active, (epochs >= 10.0) & (epochs < 20.0))
+        np.testing.assert_array_equal(older, epochs < 10.0)
+        np.testing.assert_array_equal(newer, epochs >= 20.0)
+
+        older, active, newer = trajectory_return_masks(epochs, returns, 22.0)
+        np.testing.assert_array_equal(active, epochs >= 20.0)
+        np.testing.assert_array_equal(older, epochs < 20.0)
+        self.assertFalse(np.any(newer))
+
     def test_integrated_trajectory_interpolates_animation_position(self):
         epochs = np.array([100.0, 102.0])
         states = np.array([
