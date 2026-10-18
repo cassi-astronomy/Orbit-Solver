@@ -400,6 +400,11 @@ class ObservationModel(QAbstractTableModel):
         value = None if field == "magnitude_band" else getattr(observation, field)
         if role == Qt.CheckStateRole and field == "excluded_from_fit":
             return Qt.Unchecked if observation.excluded_from_fit else Qt.Checked
+        if role == Qt.ToolTipRole and field == "excluded_from_fit":
+            return observation.raw.get(
+                "automatic_exclusion_reason",
+                "Zaškrtnuto = měření je zahrnuto do dalšího fitu.",
+            )
         if role == Qt.BackgroundRole and field in ("residual_ra_arcsec", "residual_dec_arcsec"):
             worst = observation_residual_score(observation)
             if worst is not None:
@@ -451,6 +456,8 @@ class ObservationModel(QAbstractTableModel):
             observation.used_in_fit = None
             if value == Qt.Checked:
                 observation.raw.pop("automatic_exclusion", None)
+                observation.raw.pop("coherent_secondary_track", None)
+                observation.raw.pop("automatic_exclusion_reason", None)
             self.dataChanged.emit(index, index, [Qt.CheckStateRole, Qt.DisplayRole])
             return True
         return False
@@ -946,9 +953,27 @@ class OrbitFitWorker(QObject):
                 item.residual_ra_arcsec, item.residual_dec_arcsec,
                 item.used_in_fit, item.excluded_from_fit,
                 item.raw.get("automatic_exclusion"),
+                item.raw.get("coherent_secondary_track"),
+                item.raw.get("automatic_exclusion_reason"),
             )
             for item in self.observations
         ]
+
+        def restore_observations() -> None:
+            raw_keys = (
+                "automatic_exclusion", "coherent_secondary_track",
+                "automatic_exclusion_reason",
+            )
+            for item, values in zip(self.observations, observation_snapshot):
+                (
+                    item.residual_ra_arcsec, item.residual_dec_arcsec,
+                    item.used_in_fit, item.excluded_from_fit, *raw_values,
+                ) = values
+                for key, raw_value in zip(raw_keys, raw_values):
+                    if raw_value is None:
+                        item.raw.pop(key, None)
+                    else:
+                        item.raw[key] = raw_value
         try:
             result = fit_orbit(
                 self.observations, self.initial, self.constraints, self.truncate_years,
@@ -989,18 +1014,10 @@ class OrbitFitWorker(QObject):
                     pass
             self.success.emit(result)
         except OrbitFitCancelled:
-            for item, values in zip(self.observations, observation_snapshot):
-                (
-                    item.residual_ra_arcsec, item.residual_dec_arcsec,
-                    item.used_in_fit, item.excluded_from_fit,
-                    automatic_exclusion,
-                ) = values
-                if automatic_exclusion is None:
-                    item.raw.pop("automatic_exclusion", None)
-                else:
-                    item.raw["automatic_exclusion"] = automatic_exclusion
+            restore_observations()
             self.cancelled.emit()
         except Exception as exc:
+            restore_observations()
             self.error.emit(str(exc))
         finally:
             self.finished.emit()
@@ -5365,9 +5382,15 @@ class MainWindow(QMainWindow):
         magnitude = "—" if observation.magnitude is None else f"{observation.magnitude:.2f}"
         if observation.band:
             magnitude += f" {observation.band}"
+        exclusion_reason = observation.raw.get("automatic_exclusion_reason")
+        exclusion_text = (
+            f"\nAutomaticky vyřazeno: {exclusion_reason}"
+            if exclusion_reason else ""
+        )
         self.observation_detail.setText(
             f"{observation.time}   •   {observation.station or '—'} — {station_name}\n"
             f"{location_text}   •   {geometry_text}   •   mag {magnitude}"
+            f"{exclusion_text}"
         )
 
     def configure_constraints(self) -> None:

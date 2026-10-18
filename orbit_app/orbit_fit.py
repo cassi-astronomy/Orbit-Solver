@@ -1299,6 +1299,62 @@ def _is_automatic_rejection_candidate(
     )
 
 
+def _coherent_secondary_track_candidates(
+    observations: list[Observation],
+) -> list[Observation]:
+    """Find a repeated offset track beside a well-fitted nominal track.
+
+    Fragment/secondary-nucleus astrometry is sometimes returned by the MPC
+    under the same designation as the primary object. It is not an isolated
+    blunder: several measurements from one station/night form a second,
+    internally precise O-C cluster. Requiring a simultaneous near-zero cluster
+    keeps this distinct from rejecting a whole night because an orbit is poor.
+    """
+    groups: dict[tuple[str, str], list[Observation]] = {}
+    for observation in observations:
+        if (
+            observation.excluded_from_fit
+            or observation.residual_ra_arcsec is None
+            or observation.residual_dec_arcsec is None
+            or not observation.station or not observation.time
+        ):
+            continue
+        try:
+            night = parse_observation_time(observation.time).date().isoformat()
+        except ValueError:
+            continue
+        groups.setdefault((observation.station.strip().upper(), night), []).append(
+            observation
+        )
+
+    selected: list[Observation] = []
+    for group in groups.values():
+        if len(group) < 6:
+            continue
+        vectors = np.asarray([
+            (float(item.residual_ra_arcsec), float(item.residual_dec_arcsec))
+            for item in group
+        ])
+        radii = np.linalg.norm(vectors, axis=1)
+        near = radii <= 3.0
+        far = radii >= 8.0
+        if int(np.count_nonzero(near)) < 3 or int(np.count_nonzero(far)) < 3:
+            continue
+        far_vectors = vectors[far]
+        centre = np.median(far_vectors, axis=0)
+        centre_distance = float(np.linalg.norm(centre))
+        cluster_radius = max(2.5, 0.08 * centre_distance)
+        distances = np.linalg.norm(far_vectors - centre, axis=1)
+        if centre_distance < 8.0 or float(np.median(distances)) > cluster_radius:
+            continue
+        far_indices = np.flatnonzero(far)
+        members = far_indices[distances <= max(4.0, 0.15 * centre_distance)]
+        if len(members) < 3:
+            continue
+        selected.extend(group[int(index)] for index in members)
+    return list({id(item): item for item in selected}.values())
+
+
 def _observing_apparition_groups(
     observations: list[Observation], solution: OrbitSolution | None = None,
     gap_years: float = 30.0,
@@ -1684,6 +1740,7 @@ def fit_orbit(
     seed_report: list[tuple[float | None, float | None, bool | None]] | None = None
     apparition_groups: list[list[Observation]] = []
     apparition_linkage: list[dict[str, object]] = []
+    secondary_track_exclusions = 0
     if multibranch:
         initial_candidates = initial_orbit_from_observations(
             observations, return_candidates=True,
@@ -1896,6 +1953,28 @@ def fit_orbit(
                             observation.residual_dec_arcsec,
                             observation.used_in_fit,
                         ) = values
+            secondary_track = _coherent_secondary_track_candidates(
+                recent_apparition
+            )
+            if secondary_track:
+                secondary_track_exclusions = len(secondary_track)
+                for observation in secondary_track:
+                    observation.excluded_from_fit = True
+                    observation.raw["automatic_exclusion"] = True
+                    observation.raw["coherent_secondary_track"] = True
+                    observation.raw["automatic_exclusion_reason"] = (
+                        "Souvislá vedlejší astrometrická stopa; možný fragment "
+                        "nebo sekundární jádro."
+                    )
+                report_progress(
+                    "Odděluji souvislou vedlejší astrometrickou stopu…"
+                )
+                seed = fit_once(
+                    recent_apparition, seed[0], constraints, truncate_years,
+                    None, fixed_nongravitational=seed_nongrav,
+                    maximum_observations=240,
+                    max_nfev=16, robust_loss=True,
+                )
             # The dedicated A1/A2/A3 pass below performs the one expensive
             # full-arc correction. Avoid doing the same century integration
             # twice merely to manufacture another intermediate seed.
@@ -2030,6 +2109,23 @@ def fit_orbit(
                     )
                     normalized = trial[0].fit_normalized_rms
                     if (
+                        np.isfinite(trial[1]) and trial[1] <= 30.0
+                        and normalized is not None and np.isfinite(normalized)
+                        and normalized > 8.0
+                    ):
+                        report_progress(
+                            f"Návrat {return_year}: pokračuji v konvergenci "
+                            "těsné kandidátní větve…"
+                        )
+                        trial = fit_once(
+                            stage_observations, trial[0], constraints,
+                            truncate_years, linkage_parameters,
+                            maximum_observations=min(320, 80 * stage_count),
+                            max_nfev=24, robust_loss=True,
+                            robust_scale=8.0, screening=True,
+                        )
+                        normalized = trial[0].fit_normalized_rms
+                    if (
                         np.isfinite(trial[1]) and trial[1] <= 60.0
                         and normalized is not None and np.isfinite(normalized)
                         and normalized <= 8.0
@@ -2096,6 +2192,26 @@ def fit_orbit(
                                 robust_scale=25.0, screening=True,
                             )
                             normalized = trial[0].fit_normalized_rms
+                            if (
+                                np.isfinite(trial[1]) and trial[1] <= 30.0
+                                and normalized is not None
+                                and np.isfinite(normalized)
+                                and normalized > 8.0
+                            ):
+                                report_progress(
+                                    f"Návrat {return_year}: pokračuji v "
+                                    "konvergenci lokální větve…"
+                                )
+                                trial = fit_once(
+                                    stage_observations, trial[0], constraints,
+                                    truncate_years, linkage_parameters,
+                                    maximum_observations=min(
+                                        320, 80 * stage_count
+                                    ),
+                                    max_nfev=24, robust_loss=True,
+                                    robust_scale=8.0, screening=True,
+                                )
+                                normalized = trial[0].fit_normalized_rms
                             if (
                                 np.isfinite(trial[1]) and trial[1] <= 60.0
                                 and normalized is not None
@@ -2350,6 +2466,15 @@ def fit_orbit(
                         )
                     )
     report_progress("Dokončuji O−C, nejistoty a fotometrii…")
+    if secondary_track_exclusions:
+        note = (
+            f"{secondary_track_exclusions} měření v souvislé vedlejší stopě "
+            "bylo odděleno od nominálního jádra (možný fragment nebo "
+            "sekundární jádro)."
+        )
+        result[0].fit_model_note = " ".join(filter(None, (
+            result[0].fit_model_note, note,
+        )))
     _calibrate_fitted_photometry(observations, result[0])
     if apparition_linkage:
         result[0].apparition_linkage = tuple(apparition_linkage)

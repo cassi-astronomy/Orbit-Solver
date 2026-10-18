@@ -1,5 +1,6 @@
 import math
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -39,6 +40,7 @@ from orbit_app.planetary import PLANETS
 from orbit_app.orbit_fit import (
     OrbitFitCancelled, _automatic_orbit_score, _InterpolatedPlanetEphemeris,
     _attach_multi_apparition_elements, _balanced_linkage_observations,
+    _coherent_secondary_track_candidates,
     _calibrate_fitted_photometry,
     _is_automatic_rejection_candidate,
     _local_light_time_states,
@@ -893,6 +895,44 @@ class OrbitFitSelectionTests(unittest.TestCase):
         )
         self.assertIn("všech 2", result[0].fit_model_note or "")
 
+    def test_near_linkage_branch_gets_a_longer_convergence_pass(self):
+        observations = [
+            Observation(
+                time=f"{year}-03-{day:02d}T00:00:00Z",
+                ra_deg=10.0, dec_deg=20.0,
+            )
+            for year in (2010, 2020)
+            for day in range(1, 7)
+        ]
+        good = OrbitSolution(
+            "321P/Test", 2458909.5, 4.6416, .45, 12.0, 30.0, 60.0, 0.0,
+            position_au=(2.5, 0.0, 0.0),
+            velocity_au_per_day=(0.0, .01, 0.0),
+            fit_normalized_rms=.8,
+            nongravitational_parameters={"A1": 1e-8},
+        )
+        near = replace(good, fit_normalized_rms=12.0)
+        calls = []
+
+        def fake_fit(rows, *_args, **kwargs):
+            calls.append(kwargs.get("max_nfev"))
+            if len(calls) == 3:
+                return near, 9.0, len(rows)
+            return good, 1.0, len(rows)
+
+        with (
+            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit),
+            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
+        ):
+            result = fit_orbit(
+                observations, good, nongravitational={"A1": 0.0},
+            )
+        self.assertEqual(calls[:4], [8, 8, 6, 24])
+        self.assertEqual(
+            [item["status"] for item in result[0].apparition_linkage or ()],
+            ["linked", "linked"],
+        )
+
     def test_final_exact_fit_cannot_claim_return_with_large_residuals(self):
         observations = [
             Observation(
@@ -1033,6 +1073,34 @@ class OrbitFitSelectionTests(unittest.TestCase):
         )
         self.assertFalse(_is_automatic_rejection_candidate(tiny_sigma, .25))
         self.assertTrue(_is_automatic_rejection_candidate(obvious_blunder, .25))
+
+    def test_coherent_secondary_track_requires_parallel_near_and_far_series(self):
+        observations = []
+        for minute in range(4):
+            observations.append(Observation(
+                time=f"2021-11-14T01:{45 + minute:02d}:00Z",
+                station="I41", residual_ra_arcsec=-.3 + .1 * minute,
+                residual_dec_arcsec=.2 - .1 * minute,
+            ))
+            observations.append(Observation(
+                time=f"2021-11-14T01:{45 + minute:02d}:20Z",
+                station="I41", residual_ra_arcsec=69.2 + .15 * minute,
+                residual_dec_arcsec=-5.1 + .1 * minute,
+            ))
+        selected = _coherent_secondary_track_candidates(observations)
+        self.assertEqual(len(selected), 4)
+        self.assertTrue(all(item.residual_ra_arcsec > 60 for item in selected))
+
+    def test_coherent_track_does_not_reject_a_whole_offset_night(self):
+        observations = [
+            Observation(
+                time=f"2021-11-14T01:{minute:02d}:00Z", station="I41",
+                residual_ra_arcsec=20.0 + minute * .1,
+                residual_dec_arcsec=-4.0,
+            )
+            for minute in range(6)
+        ]
+        self.assertEqual(_coherent_secondary_track_candidates(observations), [])
 
     def test_four_day_candidate_compares_range_branches_even_with_initial_orbit(self):
         start = datetime(2026, 10, 12, tzinfo=timezone.utc)
