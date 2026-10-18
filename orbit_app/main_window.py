@@ -5602,7 +5602,8 @@ class MainWindow(QMainWindow):
         )
         self.rms_metric.setToolTip(
             "První hodnota je nevážené RMS v obloukových sekundách; druhá zohledňuje "
-            "nejistoty rmsRA/rmsDec uvedené v ADES."
+            "nejistoty rmsRA/rmsDec uvedené v ADES a částečnou korelaci série "
+            "ze stejné stanice během jedné noci."
         )
         interval = f" • {self.fit_interval.currentText().lower()}"
         self.object_title.setText(

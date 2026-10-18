@@ -25,12 +25,15 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
 - vlastní šestiparametrový fit kartézského stavu s planetárními perturbacemi;
 - rychlý gravitační fit velkých souborů z časově i početně reprezentativního
   vzorku; u krátkého objevitelského oblouku se finální větev ověří na všech
-  měřeních a dlouhé negravitační řešení používá větší reprezentativní vzorek;
+  měřeních a také závěrečná korekce dlouhého negravitačního řešení používá
+  všechna povolená měření;
 - výpočet z celého oblouku nebo pouze z posledních 2, 5 či 10 let;
 - ruční zařazení a vyřazení jednotlivých pozorování;
 - barevná rezidua O−C, automatické vyřazení reziduí nad 2″ a funkce `Worst obs`;
 - individuální nejistoty ADES a konzervativní epochové váhy pro starší záznamy
-  bez sigmy; moderní chybná CCD měření nadále zachytává robustní fit podle O−C;
+  bez sigmy; série jedné stanice z jedné noci mají korelační podlahu, aby stovky
+  snímků nepředstíraly stovky nezávislých absolutních poloh; moderní chybná CCD
+  měření nadále zachytává robustní fit podle O−C;
 - bezpečný víceapariční režim periodických komet: bez A1–A3 se fituje poslední
   pozorovaný návrat a ostatní se označí jako čistě gravitační integrace;
   při zapnutém negravitačním modelu slouží poslední návrat jako počáteční
@@ -38,9 +41,10 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
   navážou apariční předkorekcí A1/A2 s uvolněným stavem až v krátkém druhém
   kroku a jediná přesná korekce DE440 následuje až po nalezení celé větve;
   při hledání větve jsou řídké historické a husté moderní návraty zastoupeny
-  vyváženě; až následná přesná korekce používá všechna měření s jejich
-  skutečnými vahami, takže stovky CCD bodů nevytlačí několik desítek starých
-  poloh do vedlejšího minima;
+  vyváženě po návratech, stanicích a nocích; pokud robustní hledání skončí těsně
+  vedle společného řešení, následuje vyvážená lineární korekce, která nedovolí
+  odepsat celý starší návrat jako jeden souvislý outlier; až následná přesná
+  korekce používá všechna měření s jejich vahami;
   zjevení se rozpoznávají z periody načtené dráhy, takže stejný postup funguje
   pro Halleyův typ i krátkoperiodické komety jako 2P/Encke nebo 78P/Gehrels;
 - volitelné fixování oskulačních elementů;
@@ -50,7 +54,9 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
   Marsdenův vodní model s volitelným časovým posunem aktivity DT pro komety,
   nebo mocninný model `g(r) = r^-m` (výchozí `m = 2`) pro tlak záření a
   Yarkovského A2 u planetek; označení tělesa funkci neomezuje;
-- nejistoty elementů a základní diagnostika fitu.
+- nejistoty elementů a základní diagnostika fitu; při singulární nebo extrémně
+  špatně podmíněné normální matici se nejistota raději neuvede, než aby
+  pseudoinverze vytvořila falešně přesné číslo.
 
 ### Elementy a efemerida
 

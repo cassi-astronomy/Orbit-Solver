@@ -42,12 +42,14 @@ from orbit_app.orbit_fit import (
     _attach_multi_apparition_elements, _balanced_linkage_observations,
     _coherent_secondary_track_candidates,
     _calibrate_fitted_photometry,
+    _formal_element_uncertainties,
     _is_automatic_rejection_candidate,
     _local_light_time_states,
-    _observation_offsets_gcrs, _observation_sigma_arcsec,
+    _observation_offsets_gcrs, _observation_sigma_arcsec, _observation_sigmas,
     _perihelion_offset_days_from_state,
     _latest_observing_apparition, _prefer_parabolic_short_arc,
     _representative_indices, _truncate_rows_to_recent_years,
+    _update_apparition_linkage_metrics,
     fit_orbit, fit_selection_count, parse_observation_time,
 )
 from orbit_app.photometry import estimate_absolute_magnitude, power_law_magnitude
@@ -1312,6 +1314,46 @@ class OrbitFitSelectionTests(unittest.TestCase):
         self.assertEqual(len(selected), 82)
         self.assertEqual(sum(item.time.startswith("1892") for item in selected), 41)
         self.assertEqual(sum(item.time.startswith("2008") for item in selected), 41)
+
+    def test_linkage_metrics_ignore_manually_excluded_observations(self):
+        good = Observation(
+            residual_ra_arcsec=.3, residual_dec_arcsec=-.4,
+            used_in_fit=True, raw={"rmsRA": 1.0, "rmsDec": 1.0},
+        )
+        rejected = Observation(
+            residual_ra_arcsec=500.0, residual_dec_arcsec=-900.0,
+            used_in_fit=False, excluded_from_fit=True,
+            raw={"rmsRA": 1.0, "rmsDec": 1.0},
+        )
+        record = {}
+        _update_apparition_linkage_metrics(record, [good, rejected])
+        self.assertEqual(record["fitted"], 1)
+        self.assertAlmostEqual(record["rms_arcsec"], math.sqrt(.125))
+
+    def test_same_station_night_batch_gets_correlation_floor(self):
+        instant = datetime(2026, 10, 18, 22, tzinfo=timezone.utc)
+        rows = [
+            (Observation(
+                time=(instant + timedelta(minutes=index)).isoformat(),
+                station="I41", raw={"rmsRA": .2, "rmsDec": .3},
+            ), instant + timedelta(minutes=index), 1.0, 2.0)
+            for index in range(10)
+        ]
+        independent = _observation_sigmas(rows)
+        correlated = _observation_sigmas(
+            rows, account_for_batch_correlation=True,
+        )
+        self.assertTrue(np.all(correlated > independent))
+        self.assertAlmostEqual(correlated[0] / independent[0], math.sqrt(2.35))
+
+    def test_rank_deficient_fit_does_not_report_false_formal_errors(self):
+        state = np.array([1.0, 0.0, 0.0, 0.0, .017, 0.0])
+        elements = (1.0, .01, 0.0, 0.0, 0.0, 0.0)
+        uncertainties, covariance = _formal_element_uncertainties(
+            state, elements, np.zeros((20, 6)), np.ones(20), 6,
+        )
+        self.assertIsNone(uncertainties)
+        self.assertIsNone(covariance)
 
     def test_catastrophic_linked_comet_fit_falls_back_to_latest_apparition(self):
         observations = [

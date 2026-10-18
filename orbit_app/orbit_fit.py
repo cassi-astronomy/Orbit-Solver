@@ -197,8 +197,38 @@ def _formal_element_uncertainties(
     try:
         degrees_of_freedom = max(1, astrometric_residual.size - free_parameter_count)
         variance = float(np.dot(astrometric_residual, astrometric_residual) / degrees_of_freedom)
-        parameter_covariance = np.linalg.pinv(
-            astrometric_jacobian.T @ astrometric_jacobian
+        jacobian = np.asarray(astrometric_jacobian, dtype=float)
+        if jacobian.ndim != 2 or jacobian.shape[0] < jacobian.shape[1]:
+            return None, None
+        # Forming pinv(J.T @ J) squares the condition number and used to turn
+        # an effectively unconstrained direction into a deceptively small
+        # formal error.  Normalize columns, inspect rank explicitly, and form
+        # the covariance from the SVD of J itself.  When a parameter is not
+        # identifiable, showing no formal uncertainty is safer than a false
+        # one (especially for T and A1--A3 on short arcs).
+        column_norms = np.linalg.norm(jacobian, axis=0)
+        if np.any(~np.isfinite(column_norms)) or np.any(column_norms <= 0.0):
+            return None, None
+        normalized_jacobian = jacobian / column_norms
+        _u, singular_values, vt = np.linalg.svd(
+            normalized_jacobian, full_matrices=False,
+        )
+        if not singular_values.size or singular_values[0] <= 0.0:
+            return None, None
+        tolerance = (
+            np.finfo(float).eps * max(normalized_jacobian.shape)
+            * singular_values[0]
+        )
+        rank = int(np.count_nonzero(singular_values > tolerance))
+        condition = float(singular_values[0] / singular_values[-1])
+        if rank < jacobian.shape[1] or not np.isfinite(condition) or condition > 1e12:
+            return None, None
+        normalized_covariance = (
+            vt.T @ np.diag(1.0 / np.square(singular_values)) @ vt
+        )
+        inverse_column_scale = np.diag(1.0 / column_norms)
+        parameter_covariance = (
+            inverse_column_scale @ normalized_covariance @ inverse_column_scale
         ) * variance
         state_covariance = parameter_covariance[:6, :6]
         element_jacobian = np.empty((6, 6), dtype=float)
@@ -371,12 +401,39 @@ def _observation_sigma_arcsec(observation: Observation) -> tuple[float, float]:
     return value_for("rmsra"), value_for("rmsdec")
 
 
-def _observation_sigmas(rows: list[tuple[Observation, datetime, float, float]]) -> np.ndarray:
-    return np.asarray([
+def _observation_sigmas(
+    rows: list[tuple[Observation, datetime, float, float]],
+    account_for_batch_correlation: bool = False,
+) -> np.ndarray:
+    """Return astrometric sigmas, optionally accounting for same-night batches.
+
+    Measurements from one station during one observing night share catalogue,
+    timing and reduction systematics.  Treating a run of fifty frames as fifty
+    fully independent absolute positions lets it overwhelm a sparse historical
+    apparition.  A modest 0.15 intra-batch correlation retains the information
+    in a sequence without pretending that its systematic error averages away.
+    """
+    values = np.asarray([
         value
         for item in rows
         for value in _observation_sigma_arcsec(item[0])
     ], dtype=float)
+    if not account_for_batch_correlation or not rows:
+        return values
+    batch_sizes: dict[tuple[str, object], int] = {}
+    batch_keys: list[tuple[str, object]] = []
+    for observation, instant, _ra, _dec in rows:
+        # Noon boundary keeps one astronomical night together across midnight.
+        observing_night = (instant - timedelta(hours=12)).date()
+        key = ((observation.station or "").strip().upper(), observing_night)
+        batch_keys.append(key)
+        batch_sizes[key] = batch_sizes.get(key, 0) + 1
+    factors = np.asarray([
+        np.sqrt(1.0 + 0.15 * (min(batch_sizes[key], 25) - 1))
+        for key in batch_keys
+        for _coordinate in range(2)
+    ], dtype=float)
+    return values * factors
 
 
 def _local_light_time_states(
@@ -453,6 +510,13 @@ def _balanced_linkage_observations(
     populated = [group for group in apparition_groups if group]
     if not populated:
         return []
+    populated = [
+        [observation for observation in group if not observation.excluded_from_fit]
+        for group in populated
+    ]
+    populated = [group for group in populated if group]
+    if not populated:
+        return []
     sizes = [len(group) for group in populated]
     if max(sizes) <= 2 * min(sizes) and max(sizes) <= maximum_per_group:
         return [observation for group in populated for observation in group]
@@ -462,10 +526,47 @@ def _balanced_linkage_observations(
         if len(group) <= target:
             balanced.extend(group)
             continue
-        instants = [parse_observation_time(observation.time) for observation in group]
-        epochs = dynamical_jd(instants)
-        indices = _representative_indices(epochs, target)
-        balanced.extend(group[index] for index in indices)
+        chronological = sorted(group, key=lambda item: parse_observation_time(item.time))
+        buckets: dict[tuple[str, object], list[Observation]] = {}
+        for observation in chronological:
+            instant = parse_observation_time(observation.time)
+            key = (
+                (observation.station or "").strip().upper(),
+                (instant - timedelta(hours=12)).date(),
+            )
+            buckets.setdefault(key, []).append(observation)
+        bucket_rows = list(buckets.values())
+        # Give every station-night one representative when possible, then add
+        # points round-robin.  Within a night the chosen ranks spread over its
+        # full time span instead of always taking the first exposure.
+        if len(bucket_rows) > target:
+            bucket_epochs = np.asarray([
+                np.mean([
+                    parse_observation_time(item.time).timestamp()
+                    for item in bucket
+                ])
+                for bucket in bucket_rows
+            ])
+            keep = _representative_indices(bucket_epochs, target)
+            bucket_rows = [bucket_rows[index] for index in keep]
+        allocations = [0] * len(bucket_rows)
+        while sum(allocations) < target:
+            candidates = [
+                index for index, bucket in enumerate(bucket_rows)
+                if allocations[index] < len(bucket)
+            ]
+            if not candidates:
+                break
+            index = min(
+                candidates,
+                key=lambda value: allocations[value] / len(bucket_rows[value]),
+            )
+            allocations[index] += 1
+        for bucket, count in zip(bucket_rows, allocations):
+            if count <= 0:
+                continue
+            indices = np.linspace(0, len(bucket) - 1, count).round().astype(int)
+            balanced.extend(bucket[index] for index in np.unique(indices))
     balanced.sort(key=lambda observation: parse_observation_time(observation.time))
     return balanced
 
@@ -901,7 +1002,9 @@ def _fit_orbit_once(
     observer_offsets = _observation_offsets_gcrs(usable)
     observed_ra = np.array([item[2] for item in usable])
     observed_dec = np.array([item[3] for item in usable])
-    astrometric_sigmas = _observation_sigmas(usable)
+    astrometric_sigmas = _observation_sigmas(
+        usable, account_for_batch_correlation=True,
+    )
     nongrav_names = tuple(
         name for name in ("A1", "A2", "A3", "DT")
         if name in (nongravitational or {})
@@ -1487,6 +1590,8 @@ def _update_apparition_linkage_metrics(
     normalized: list[float] = []
     fitted = 0
     for observation in observations:
+        if observation.excluded_from_fit:
+            continue
         if observation.used_in_fit:
             fitted += 1
         if observation.residual_ra_arcsec is None or observation.residual_dec_arcsec is None:
@@ -1705,6 +1810,14 @@ def fit_orbit(
         return _fit_orbit_once(*args, **kwargs)
 
     report_progress("Připravuji astrometrii a počáteční dráhu…")
+    # A fit consists of many subset/branch trials.  Residuals left by an older
+    # user run must never be interpreted as the current trial's prediction for
+    # an apparition which has not yet been visited.  OrbitFitWorker restores
+    # the complete snapshot if this run fails or is cancelled.
+    for observation in observations:
+        observation.used_in_fit = False
+        observation.residual_ra_arcsec = None
+        observation.residual_dec_arcsec = None
     active_times: list[datetime] = []
     for observation in observations:
         if (
@@ -2407,6 +2520,65 @@ def fit_orbit(
                                 failures.append(
                                     f"úplný negravitační model: {exc}"
                                 )
+                    # A robust loss is essential while choosing a branch, but
+                    # once both apparitions are only a few arcseconds apart it
+                    # can freeze the older one as a coherent "outlier" and
+                    # never finish the phase correction.  Force one balanced,
+                    # non-robust continuation from the best near solution.
+                    # This is the analogue of including normal places from
+                    # every apparition in the final differential correction;
+                    # it is attempted only after the safer robust branches.
+                    if candidate is None and best_failed_trial is not None:
+                        forcing_parameters = fitted_nongrav(
+                            best_failed_trial[1][0]
+                        )
+                        try:
+                            report_progress(
+                                f"Návrat {return_year}: vynucuji vyváženou "
+                                "korekci všech aparic…"
+                            )
+                            forced_trial = fit_once(
+                                stage_observations,
+                                best_failed_trial[1][0], constraints,
+                                truncate_years, forcing_parameters,
+                                maximum_observations=None,
+                                max_nfev=48, robust_loss=False,
+                                screening=False,
+                            )
+                            forced_normalized = (
+                                forced_trial[0].fit_normalized_rms
+                            )
+                            if (
+                                np.isfinite(forced_trial[1])
+                                and forced_trial[1] <= 60.0
+                                and forced_normalized is not None
+                                and np.isfinite(forced_normalized)
+                                and forced_normalized <= 8.0
+                            ):
+                                candidate = forced_trial
+                                candidate_source = "balanced_forcing"
+                                linked_parameter_names.update(
+                                    forcing_parameters
+                                )
+                            else:
+                                normalized_text = (
+                                    "nedostupné"
+                                    if forced_normalized is None
+                                    or not np.isfinite(forced_normalized)
+                                    else f"{forced_normalized:.2f}σ"
+                                )
+                                failures.append(
+                                    "vyvážená lineární korekce: RMS "
+                                    f"{forced_trial[1]:.2f}″; "
+                                    f"{normalized_text}"
+                                )
+                        except (
+                            OrbitFitError, ValueError, RuntimeError,
+                            FloatingPointError,
+                        ) as exc:
+                            failures.append(
+                                f"vyvážená lineární korekce: {exc}"
+                            )
                     if candidate is None:
                         detail = "; ".join(failures[-3:]) or "bez použitelného pokusu"
                         raise OrbitFitError(
@@ -2456,6 +2628,9 @@ def fit_orbit(
                         "Společný N-body fit byl potvrzen načtenou astrometrií "
                         "po uvolnění celého negravitačního modelu."
                         if candidate_source == "expanded_nongrav" else
+                        "Společný N-body fit byl potvrzen vyváženou lineární "
+                        "korekcí všech připojených aparic."
+                        if candidate_source == "balanced_forcing" else
                         "Společný N-body fit s ostatními označenými návraty."
                     )
                     _update_apparition_linkage_metrics(
@@ -2499,8 +2674,8 @@ def fit_orbit(
                 result = fit_once(
                     observations, exact_seed, constraints, truncate_years,
                     exact_linkage_parameters,
-                    maximum_observations=480,
-                    max_nfev=28, robust_loss=True, robust_scale=8.0,
+                    maximum_observations=None,
+                    max_nfev=14, robust_loss=True, robust_scale=8.0,
                 )
                 failed = failed_apparitions()
                 requested_parameters = fitted_nongrav(result[0])
@@ -2521,8 +2696,8 @@ def fit_orbit(
                     try:
                         expanded = fit_once(
                             observations, result[0], constraints, truncate_years,
-                            requested_parameters, maximum_observations=480,
-                            max_nfev=10, robust_loss=True, robust_scale=25.0,
+                            requested_parameters, maximum_observations=None,
+                            max_nfev=8, robust_loss=True, robust_scale=25.0,
                         )
                         if not failed_apparitions() and expanded[1] <= baseline_score * 1.05:
                             result = expanded
@@ -2572,7 +2747,7 @@ def fit_orbit(
             result = fit_once(
                 observations, result[0], constraints, truncate_years,
                 fitted_nongrav(result[0]),
-                maximum_observations=480 if long_arc else None,
+                maximum_observations=None,
                 max_nfev=8 if long_arc else 12, robust_loss=True,
             )
     elif not multibranch and not constraints and short_arc and active_count > 120:
@@ -2589,7 +2764,7 @@ def fit_orbit(
     # Traditional post-fit rejection remains useful for isolated blunders
     # which do not form a separated final batch.  Remove at most one pass so a
     # weak preliminary orbit cannot cascade into wholesale data rejection.
-    if not constraints:
+    if not constraints and not long_arc and not multi_apparition:
         candidates = [
             item for item in observations
             if not item.excluded_from_fit
@@ -2612,40 +2787,30 @@ def fit_orbit(
             for observation in outliers:
                 observation.excluded_from_fit = True
                 observation.raw["automatic_exclusion"] = True
-            # A second century-scale differential correction costs another
-            # complete numerical Jacobian. Keep the robust long-arc solution
-            # and merely flag its clear outliers; the next explicit user fit
-            # starts without them. Shorter arcs are cheap enough to refit now.
-            if long_arc:
-                note = (
-                    f"{len(outliers)} zjevně odlehlých měření bylo označeno "
-                    "k vyřazení; kvůli délce oblouku se projeví až při dalším "
-                    "spuštění fitu."
+                observation.raw["automatic_exclusion_reason"] = (
+                    "Izolované měření s velkým normalizovaným O−C; po "
+                    "automatickém vyřazení byla dráha znovu spočtena."
                 )
-                result[0].fit_model_note = " ".join(filter(None, (
-                    result[0].fit_model_note, note,
-                )))
-            else:
-                report_progress("Přepočítávám dráhu po vyřazení odlehlých měření…")
-                result = fit_once(
-                    observations, result[0], constraints, truncate_years, nongravitational,
-                    maximum_observations=(
-                        None if nongravitational or (short_arc and not constraints)
-                        else 120
-                    ),
-                    max_nfev=12,
-                )
-                if not nongravitational:
-                    result = (
-                        _prefer_parabolic_short_arc(
-                            observations, result, truncate_years,
-                            cancel_callback,
-                        )
-                        if cancel_callback is not None else
-                        _prefer_parabolic_short_arc(
-                            observations, result, truncate_years,
-                        )
+            report_progress("Přepočítávám dráhu po vyřazení odlehlých měření…")
+            result = fit_once(
+                observations, result[0], constraints, truncate_years, nongravitational,
+                maximum_observations=(
+                    None if nongravitational or (short_arc and not constraints)
+                    else 120
+                ),
+                max_nfev=12,
+            )
+            if not nongravitational:
+                result = (
+                    _prefer_parabolic_short_arc(
+                        observations, result, truncate_years,
+                        cancel_callback,
                     )
+                    if cancel_callback is not None else
+                    _prefer_parabolic_short_arc(
+                        observations, result, truncate_years,
+                    )
+                )
     report_progress("Dokončuji O−C, nejistoty a fotometrii…")
     if secondary_track_exclusions:
         note = (

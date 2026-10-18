@@ -158,18 +158,16 @@ def analyze_original_future_orbit(
         np.asarray(solution.velocity_au_per_day, dtype=float),
     ).packed()
     original, future = _boundary_pair(solution, state, boundary_au)
-    reciprocal_sigma = _formal_reciprocal_a_uncertainty(solution, state)
     result: dict[str, float | str] = {
         "boundary_au": float(boundary_au),
         "original": original,
         "future": future,
-        "original_interpretation": _interpret(original, reciprocal_sigma, True),
-        "future_interpretation": _interpret(future, reciprocal_sigma, False),
+        "original_interpretation": _interpret(original, None, True),
+        "future_interpretation": _interpret(future, None, False),
         "model": (
-            f"N-body model planet ({PLANETS.model_name}); 1σ je lineární formální chyba ze stavové "
-            "kovariance; nejde o publikovanou hodnotu MPC/JPL"
+            f"N-body model planet ({PLANETS.model_name}); nejistota 1/a se "
+            "nezobrazuje, protože kovariance epochy nebyla propagována přes "
+            "planetární oblast až na hranici; nejde o publikovanou hodnotu MPC/JPL"
         ),
     }
-    if reciprocal_sigma is not None:
-        result["reciprocal_a_sigma"] = reciprocal_sigma
     return result
