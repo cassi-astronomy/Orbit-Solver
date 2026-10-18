@@ -933,6 +933,46 @@ class OrbitFitSelectionTests(unittest.TestCase):
             ["linked", "linked"],
         )
 
+    def test_known_comet_can_use_catalogue_state_only_as_verified_third_seed(self):
+        observations = [
+            Observation(
+                time=f"{year}-03-{day:02d}T00:00:00Z",
+                ra_deg=10.0, dec_deg=20.0,
+            )
+            for year in (2012, 2019)
+            for day in range(1, 7)
+        ]
+        catalogue = OrbitSolution(
+            "78P", 2458909.5, 3.73, .46, 6.2, 210.0, 192.0, 0.0,
+            position_au=(2.0, 0.0, 0.0),
+            velocity_au_per_day=(0.0, .01, 0.0),
+            fit_normalized_rms=.8,
+            nongravitational_parameters={"A1": 1e-8},
+        )
+        fitted = replace(catalogue)
+        bad = replace(catalogue, fit_normalized_rms=100.0)
+        calls = []
+
+        def fake_fit(rows, seed, *_args, **kwargs):
+            calls.append((seed, kwargs.get("fit_state", True)))
+            if len(calls) in (3, 6):
+                return bad, 100.0, len(rows)
+            return fitted, 1.0, len(rows)
+
+        with (
+            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit),
+            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
+        ):
+            result = fit_orbit(
+                observations, catalogue, nongravitational={"A1": 0.0},
+            )
+        self.assertIs(calls[6][0], catalogue)
+        self.assertFalse(calls[6][1])
+        self.assertIn(
+            "katalogová větev",
+            result[0].apparition_linkage[0]["reason"],
+        )
+
     def test_final_exact_fit_cannot_claim_return_with_large_residuals(self):
         observations = [
             Observation(

@@ -2122,7 +2122,7 @@ def fit_orbit(
                             truncate_years, linkage_parameters,
                             maximum_observations=min(320, 80 * stage_count),
                             max_nfev=24, robust_loss=True,
-                            robust_scale=8.0, screening=True,
+                            robust_scale=8.0, screening=False,
                         )
                         normalized = trial[0].fit_normalized_rms
                     if (
@@ -2209,7 +2209,7 @@ def fit_orbit(
                                         320, 80 * stage_count
                                     ),
                                     max_nfev=24, robust_loss=True,
-                                    robust_scale=8.0, screening=True,
+                                    robust_scale=8.0, screening=False,
                                 )
                                 normalized = trial[0].fit_normalized_rms
                             if (
@@ -2231,6 +2231,81 @@ def fit_orbit(
                         ) as exc:
                             failures.append(
                                 f"lokální astrometrická větev: {exc}"
+                            )
+                    # The catalogue/MPC state is not accepted as evidence by
+                    # itself, but it is a valuable third initial basin for a
+                    # known periodic comet.  In particular it can preserve the
+                    # correct integer revolution count when both propagation
+                    # from the newest return and an isolated older-return fit
+                    # converge to adjacent local minima.  The observations in
+                    # this application still perform and validate the fit.
+                    if (
+                        candidate is None and initial is not None
+                        and initial is not last_good[0]
+                    ):
+                        catalogue_parameters = dict(linkage_parameters)
+                        catalogue_parameters.update({
+                            name: value
+                            for name, value in (
+                                initial.nongravitational_parameters or {}
+                            ).items()
+                            if name in catalogue_parameters
+                        })
+                        try:
+                            report_progress(
+                                f"Návrat {return_year}: ověřuji katalogovou "
+                                "větev proti načtené astrometrii…"
+                            )
+                            catalogue_prefit = fit_once(
+                                stage_observations, initial, constraints,
+                                truncate_years, catalogue_parameters,
+                                maximum_observations=min(
+                                    240, 60 * stage_count
+                                ),
+                                max_nfev=12, robust_loss=True,
+                                robust_scale=25.0, screening=True,
+                                fit_state=False,
+                            )
+                            catalogue_trial = fit_once(
+                                stage_observations, catalogue_prefit[0],
+                                constraints, truncate_years,
+                                catalogue_parameters,
+                                maximum_observations=min(
+                                    320, 80 * stage_count
+                                ),
+                                max_nfev=28, robust_loss=True,
+                                robust_scale=8.0, screening=False,
+                            )
+                            catalogue_normalized = (
+                                catalogue_trial[0].fit_normalized_rms
+                            )
+                            if (
+                                np.isfinite(catalogue_trial[1])
+                                and catalogue_trial[1] <= 60.0
+                                and catalogue_normalized is not None
+                                and np.isfinite(catalogue_normalized)
+                                and catalogue_normalized <= 8.0
+                            ):
+                                candidate = catalogue_trial
+                                candidate_source = "catalogue_astrometry"
+                            else:
+                                normalized_text = (
+                                    "nedostupné"
+                                    if catalogue_normalized is None
+                                    or not np.isfinite(catalogue_normalized)
+                                    else f"{catalogue_normalized:.2f}σ"
+                                )
+                                failures.append(
+                                    "katalogová astrometrická větev: RMS "
+                                    f"{catalogue_trial[1]:.2f}″; "
+                                    f"{normalized_text}"
+                                )
+                        except (
+                            OrbitFitError, ValueError, RuntimeError,
+                            FloatingPointError,
+                        ) as exc:
+                            failures.append(
+                                f"katalogová astrometrická větev: {exc}"
                             )
                     if candidate is None:
                         detail = "; ".join(failures[-3:]) or "bez použitelného pokusu"
@@ -2275,6 +2350,9 @@ def fit_orbit(
                         "Společný N-body fit; počáteční větev připojeného "
                         "návratu byla určena nezávisle z jeho astrometrie."
                         if candidate_source == "local_astrometry" else
+                        "Společný N-body fit; katalogová větev byla znovu "
+                        "určena a potvrzena načtenou astrometrií."
+                        if candidate_source == "catalogue_astrometry" else
                         "Společný N-body fit s ostatními označenými návraty."
                     )
                     _update_apparition_linkage_metrics(
