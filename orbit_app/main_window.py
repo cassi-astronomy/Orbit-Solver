@@ -81,7 +81,8 @@ from .orbit_fit import (
 )
 from .orbit_engine import MU_SUN, NBodyIntegrator, StateVector
 from .orbit_evolution import (
-    ELEMENT_CENTERS, EvolutionResult, HILL_RADII_AU, PLANET_LABELS, PLANET_MU,
+    ELEMENT_CENTERS, EvolutionResult, EvolutionReturn, HILL_RADII_AU,
+    PLANET_LABELS, PLANET_MU,
     calculate_orbit_evolution, centered_snapshot, centered_solution,
     format_evolution_mpc_report, format_evolution_report, return_solution,
 )
@@ -1357,6 +1358,49 @@ class OrbitEvolutionPanel(QWidget):
             "Výpočet se spouští pouze tlačítkem. Návrat 0 je perihelový průchod "
             "nejbližší epoše dráhy."
         )
+        cached = tuple(solution.apparition_elements or ())
+        cached_returns = tuple(
+            EvolutionReturn(
+                index=int(item.get("index", index)),
+                epoch_jd=float(item["epoch_jd"]),
+                state=tuple(float(value) for value in item["state"]),
+                semi_major_axis_au=float(item["a"]),
+                eccentricity=float(item["e"]),
+                inclination_deg=float(item["i"]),
+                node_deg=float(item["node"]),
+                arg_peri_deg=float(item["arg_peri"]),
+                perihelion_au=float(item["q"]),
+                period_years=(
+                    None if item.get("period_years") is None
+                    else float(item["period_years"])
+                ),
+                reciprocal_a=(
+                    0.0 if float(item["a"]) == 0.0 else 1.0 / float(item["a"])
+                ),
+            )
+            for index, item in enumerate(cached)
+            if item.get("state") is not None
+        )
+        if cached_returns:
+            self.result = EvolutionResult(
+                returns=cached_returns, encounters=(),
+                start_jd=min(item.epoch_jd for item in cached_returns),
+                end_jd=max(item.epoch_jd for item in cached_returns),
+                sample_step_days=0.0,
+                model_note=(
+                    "Převzaty oskulační návraty již vypočtené při "
+                    "víceaparičním fitu; setkání a průběžný vývoj vyžadují "
+                    "samostatnou integraci."
+                ),
+            )
+            self.copy_report.setEnabled(True); self.save_report.setEnabled(True)
+            self.note.setText(
+                "Zobrazeny jsou návraty již vypočtené při navazování astrometrie. "
+                "Tlačítkem Spustit integraci lze rozsah změnit a doplnit setkání "
+                "s planetami i plynulý průběh elementů."
+            )
+            self._populate_state_table()
+            self._draw_result()
 
     def start(self) -> None:
         if self.thread is not None:
@@ -2034,6 +2078,7 @@ class SolarSystemPanel(QWidget):
             else PLANETS.position(center, current_jd)
         )
         trajectory = self._integrated_trajectory()
+        propagated_current: np.ndarray | None = None
         if trajectory is not None:
             trajectory_epochs, trajectory_states = trajectory
             # Plot at most 6000 points; this is visually continuous while a
@@ -2050,8 +2095,36 @@ class SolarSystemPanel(QWidget):
             orbit_segments = [segment for segment in np.split(valid_indices, breaks)
                               if len(segment) > 1]
         else:
-            orbit_radius = solar_orbit_clip_radius(self.solution, curve_radius)
-            xyz, valid = orbital_curve_xyz(self.solution, max_radius_au=orbit_radius)
+            # The moving marker is N-body propagated.  Drawing the ellipse
+            # from elements at the original fit epoch (often a previous
+            # apparition) therefore put the marker visibly off its own orbit.
+            # Build the displayed osculating conic from the same instantaneous
+            # propagated state as the marker.
+            curve_solution = self.solution
+            try:
+                velocity_step = .02
+                local_epochs = np.array([
+                    current_jd - velocity_step, current_jd,
+                    current_jd + velocity_step,
+                ])
+                local_positions = heliocentric_xyz(self.solution, local_epochs)
+                propagated_current = local_positions[1]
+                velocity = (
+                    local_positions[2] - local_positions[0]
+                ) / (2.0 * velocity_step)
+                elements = cartesian_to_elements(propagated_current, velocity)
+                curve_solution = replace(
+                    self.solution, epoch_jd=current_jd,
+                    semi_major_axis_au=elements[0], eccentricity=elements[1],
+                    inclination_deg=elements[2], node_deg=elements[3],
+                    arg_peri_deg=elements[4], mean_anomaly_deg=elements[5],
+                    position_au=tuple(float(value) for value in propagated_current),
+                    velocity_au_per_day=tuple(float(value) for value in velocity),
+                )
+            except (ValueError, RuntimeError, FloatingPointError, OrbitParseError):
+                pass
+            orbit_radius = solar_orbit_clip_radius(curve_solution, curve_radius)
+            xyz, valid = orbital_curve_xyz(curve_solution, max_radius_au=orbit_radius)
             plotted_epochs = None
             valid_indices = np.flatnonzero(valid)
             breaks = np.where(np.diff(valid_indices) > 1)[0] + 1
@@ -2175,6 +2248,8 @@ class SolarSystemPanel(QWidget):
             ax.annotate(name, (px, py), xytext=(4, 4), textcoords="offset points",
                         color=color, fontsize=8)
         heliocentric_current = self._trajectory_position(trajectory, current_jd)
+        if heliocentric_current is None and propagated_current is not None:
+            heliocentric_current = propagated_current
         if heliocentric_current is None:
             heliocentric_current = heliocentric_xyz(self.solution, np.array([current_jd]))[0]
         current = heliocentric_current - center_now
@@ -4127,6 +4202,7 @@ class OrbitConstraintsDialog(QDialog):
         self, solution: OrbitSolution, constraints: dict[str, float],
         nongravitational: dict[str, float] | None = None,
         compute_original_future: bool = False,
+        output_epoch: str = "",
         allow_element_constraints: bool = True, parent=None,
     ) -> None:
         super().__init__(parent)
@@ -4156,6 +4232,13 @@ class OrbitConstraintsDialog(QDialog):
             row_layout.addWidget(enabled); row_layout.addWidget(editor, 1)
             form.addRow(label, row)
             self.controls[name] = (enabled, editor)
+        self.output_epoch = QLineEdit(output_epoch)
+        self.output_epoch.setPlaceholderText("např. 2026 nebo 2026-10-18 00:00")
+        self.output_epoch.setToolTip(
+            "Fit zůstane kvůli numerické stabilitě v epoše uprostřed pozorování; "
+            "výsledné oskulační elementy se po výpočtu převedou na tuto epochu."
+        )
+        form.addRow("Výstupní epocha po fitu:", self.output_epoch)
         ephemeris_heading = QLabel("Planetární efemerida")
         ephemeris_heading.setStyleSheet("font-weight: 650; margin-top: 10px;")
         form.addRow(ephemeris_heading)
@@ -4298,6 +4381,9 @@ class OrbitConstraintsDialog(QDialog):
     def calculate_original_future(self) -> bool:
         return self.is_comet and self.original_future.isChecked()
 
+    def selected_output_epoch(self) -> str:
+        return self.output_epoch.text().strip()
+
 
 class PreliminaryOrbitDialog(QDialog):
     """Settings for a deliberately provisional short-arc orbit."""
@@ -4433,6 +4519,7 @@ class MainWindow(QMainWindow):
         self.nongravitational_fit: dict[str, float] = {}
         self.fit_constraints: dict[str, float] = {}
         self.compute_original_future = False
+        self.fit_output_epoch = ""
         self.has_orbit = False
         self._auto_orbit_request = False
         self._fit_after_orbit_load = False
@@ -4653,6 +4740,7 @@ class MainWindow(QMainWindow):
             self.nongravitational_fit = {}
             self.fit_constraints = {}
             self.compute_original_future = False
+            self.fit_output_epoch = ""
         self.current_designation = designation
         self.current_display_name = display_name or designation
         self.search.setText(designation)
@@ -5123,16 +5211,29 @@ class MainWindow(QMainWindow):
             )
         dialog = OrbitConstraintsDialog(
             settings_solution, self.fit_constraints, self.nongravitational_fit,
-            self.compute_original_future, self.has_orbit, self,
+            self.compute_original_future, self.fit_output_epoch,
+            self.has_orbit, self,
         )
         if dialog.exec() != QDialog.Accepted:
             return
         self.fit_constraints = dialog.selected_constraints()
         self.nongravitational_fit = dialog.selected_nongravitational()
         self.compute_original_future = dialog.calculate_original_future()
+        self.fit_output_epoch = dialog.selected_output_epoch()
+        if self.fit_output_epoch:
+            try:
+                parse_output_epoch(self.fit_output_epoch)
+            except ValueError:
+                QMessageBox.warning(
+                    self, "Výstupní epocha",
+                    "Neplatná výstupní epocha. Použijte například 2026, "
+                    "2026-10-18 nebo 2026-10-18 00:00.",
+                )
+                self.fit_output_epoch = ""
         count = (
             len(self.fit_constraints) + len(self.nongravitational_fit)
             + int(self.compute_original_future)
+            + int(bool(self.fit_output_epoch))
         )
         self.constraints_button.setText(
             f"Vlastní nastavení… ({count})" if count else "Vlastní nastavení…"
@@ -5141,7 +5242,9 @@ class MainWindow(QMainWindow):
             fixed = [f"{name}={value:g}" for name, value in self.fit_constraints.items()]
             fitted = [f"fit {name}" for name in self.nongravitational_fit]
             dynamics = ["original/future 1/a"] if self.compute_original_future else []
-            summary = ", ".join(fixed + fitted + dynamics)
+            epoch = ([f"výstupní epocha {self.fit_output_epoch}"]
+                     if self.fit_output_epoch else [])
+            summary = ", ".join(fixed + fitted + dynamics + epoch)
             self.statusBar().showMessage(f"Aktivní vlastní nastavení: {summary}", 10000)
         else:
             self.statusBar().showMessage("Všech šest elementů je ve vlastním fitu volných.", 6000)
@@ -5285,6 +5388,9 @@ class MainWindow(QMainWindow):
         self.has_orbit = True
         self.tabs.setCurrentIndex(1)
         self._apply_solution(solution)
+        if self.fit_output_epoch:
+            self.elements_panel.output_epoch.setText(self.fit_output_epoch)
+            QTimer.singleShot(0, self.elements_panel._apply_output_epoch)
         self.constraints_button.setEnabled(True)
         for index in range(1, self.tabs.count()):
             self.tabs.setTabEnabled(index, True)

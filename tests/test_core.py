@@ -783,7 +783,7 @@ class OrbitFitSelectionTests(unittest.TestCase):
             )
         # Each older return gets a cheap fixed-state A prefit followed by a
         # short state correction; only one strict all-return polish is done.
-        self.assertEqual(row_counts, [10, 18, 18, 24, 24, 24])
+        self.assertEqual(row_counts, [10, 18, 18, 24, 24, 24, 24])
         self.assertIn("všech 3", result[0].fit_model_note or "")
         self.assertEqual(
             [item["status"] for item in result[0].apparition_linkage or ()],
@@ -842,7 +842,48 @@ class OrbitFitSelectionTests(unittest.TestCase):
         )
         self.assertIn("všech 2", result[0].fit_model_note or "")
 
-    def test_multi_apparition_table_includes_next_future_return(self):
+    def test_final_exact_fit_cannot_claim_return_with_large_residuals(self):
+        observations = [
+            Observation(
+                time=f"{year}-03-{day:02d}T00:00:00Z",
+                ra_deg=10.0, dec_deg=20.0,
+            )
+            for year in (1892, 2008) for day in range(1, 7)
+        ]
+        solution = OrbitSolution(
+            "206P", 2454751.5, 3.2, .64, 32.0, 204.0, 181.0, 0.0,
+            position_au=(1.2, 0.0, 0.0),
+            velocity_au_per_day=(0.0, .015, 0.0),
+            fit_normalized_rms=.8,
+            nongravitational_parameters={"A1": 1e-8},
+        )
+        calls = 0
+
+        def fake_fit(rows, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 4:
+                for observation in observations:
+                    old = observation.time.startswith("1892")
+                    observation.residual_ra_arcsec = 900.0 if old else .3
+                    observation.residual_dec_arcsec = 100.0 if old else -.2
+                    observation.used_in_fit = True
+            return solution, 1.0, len(rows)
+
+        with (
+            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit),
+            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
+        ):
+            result = fit_orbit(
+                observations, solution, nongravitational={"A1": 0.0},
+            )
+        self.assertEqual(
+            [item["status"] for item in result[0].apparition_linkage or ()],
+            ["failed", "linked"],
+        )
+        self.assertIn("NENÍ označen", result[0].fit_model_note or "")
+
+    def test_multi_apparition_table_marks_future_relative_to_today(self):
         solution = OrbitSolution(
             "1P", 2446470.5, 17.8, .967, 162.3, 58.4, 111.3, 0.0,
             position_au=(.586, 0.0, 0.0), velocity_au_per_day=(0.0, .03, 0.0),
@@ -853,16 +894,22 @@ class OrbitFitSelectionTests(unittest.TestCase):
         ]
         past = EvolutionReturn(-1, 2392000.0, (0.0,) * 6, 17.9, .967, 162.3,
                                58.4, 111.3, .59, 75.7, 1 / 17.9)
+        after_observations = EvolutionReturn(
+            0, 2456900.0, (1.0,) * 6, 3.2, .64, 32.0,
+            204.0, 181.0, 1.15, 5.8, 1 / 3.2,
+        )
         future = EvolutionReturn(1, 2474000.0, (0.0,) * 6, 18.0, .968, 162.2,
                                  58.3, 111.4, .58, 76.4, 1 / 18.0)
         with patch(
             "orbit_app.orbit_evolution.perihelion_returns_between",
-            return_value=(past, future),
+            return_value=(past, after_observations, future),
         ):
             _attach_multi_apparition_elements(observations, solution)
-        self.assertEqual(len(solution.apparition_elements or ()), 2)
+        self.assertEqual(len(solution.apparition_elements or ()), 3)
         self.assertFalse(solution.apparition_elements[0]["future"])
-        self.assertTrue(solution.apparition_elements[1]["future"])
+        self.assertFalse(solution.apparition_elements[1]["future"])
+        self.assertTrue(solution.apparition_elements[2]["future"])
+        self.assertEqual(solution.apparition_elements[1]["state"], (1.0,) * 6)
 
     def test_fitted_photometry_reduces_apparent_magnitude_to_absolute(self):
         solution = OrbitSolution(

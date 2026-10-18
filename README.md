@@ -40,6 +40,8 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
   zjevení se rozpoznávají z periody načtené dráhy, takže stejný postup funguje
   pro Halleyův typ i krátkoperiodické komety jako 2P/Encke nebo 78P/Gehrels;
 - volitelné fixování oskulačních elementů;
+- předem volitelná výstupní epocha; fit zůstává kvůli stabilitě uprostřed
+  pozorovacího oblouku a výsledné elementy se následně převedou N-body integrací;
 - volitelný fit negravitačních parametrů komet A1, A2, A3 a časového posunu
   aktivity DT; kladné DT posouvá maximum aktivity za perihel;
 - nejistoty elementů a základní diagnostika fitu.
@@ -48,7 +50,8 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
 
 - přehled orbitálních elementů včetně nejistot;
 - u periodické komety s dlouhým obloukem automatická tabulka integrovaných
-  oskulačních elementů pozorovaných návratů a prvního následujícího návratu;
+  oskulačních elementů pozorovaných návratů a prvního skutečně budoucího
+  návratu; již vypočtená tabulka se ihned zobrazí také ve Vývoji dráhy;
 - převod elementů na uživatelem zvolenou epochu;
 - přepočet oskulačních elementů vůči Slunci nebo zvolené planetě;
 - kopírovatelný textový výstup a MPC 1-line elements;
@@ -65,6 +68,8 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
 
 - interaktivní heliocentrický pohled na Sluneční soustavu s otáčením a plynulým
   logaritmickým přiblížením;
+- oskulační křivka tělesa se odvozuje z N-body stavu aktuálního snímku, takže
+  animovaný bod neleží mimo starou křivku z epochy původního fitu;
 - volitelná průsvitná projekční plocha dráhy k rovině ekliptiky pro názorné
   zobrazení sklonu, výšky nad/pod ekliptikou a uzlů dráhy;
 - rovníková mapa oblohy, středová azimutální projekce a obzorový graf viditelnosti;

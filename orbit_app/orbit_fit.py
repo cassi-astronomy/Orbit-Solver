@@ -1444,21 +1444,26 @@ def _attach_multi_apparition_elements(
         # Include the perihelion associated with the first observations even
         # when a recovery arc begins months or years after it.
         start = float(np.min(epochs) - .65 * period_days)
-        end = float(np.max(epochs) + 1.10 * period_days)
+        now_jd = float(dynamical_jd([datetime.now(timezone.utc)])[0])
+        # The first unobserved return is not necessarily still in the future.
+        # For an old recovery (for example 206P in 2008), integrate far enough
+        # to include the first perihelion after today as well.
+        future_reference = max(float(np.max(epochs)), now_jd)
+        end = float(future_reference + 1.10 * period_days)
         returns = perihelion_returns_between(solution, start, end)
         latest_observation = float(np.max(epochs))
         # A close planetary encounter can lengthen the next revolution enough
         # that 1.1 times the current osculating period is insufficient. Extend
         # only when necessary, avoiding a second costly integration normally.
-        if not any(item.epoch_jd > latest_observation for item in returns):
+        if not any(item.epoch_jd > future_reference for item in returns):
             for multiplier in (2.0, 4.0):
                 extended = perihelion_returns_between(
                     solution, start,
-                    float(np.max(epochs) + multiplier * period_days),
+                    float(future_reference + multiplier * period_days),
                 )
                 if extended:
                     returns = extended
-                if any(item.epoch_jd > latest_observation for item in returns):
+                if any(item.epoch_jd > future_reference for item in returns):
                     break
     except (ValueError, RuntimeError, FloatingPointError):
         return
@@ -1473,7 +1478,8 @@ def _attach_multi_apparition_elements(
         "i": item.inclination_deg,
         "node": item.node_deg,
         "arg_peri": item.arg_peri_deg,
-        "future": item.epoch_jd > latest_observation,
+        "state": tuple(float(value) for value in item.state),
+        "future": item.epoch_jd > now_jd,
     } for item in returns)
     # Replace period-extrapolated labels in the linkage audit with the actual
     # perihelion years found by the same perturbed N-body integration.  For
@@ -1908,6 +1914,23 @@ def fit_orbit(
             })
             return values
 
+        def failed_apparitions() -> list[tuple[int | str, float, float]]:
+            failed: list[tuple[int | str, float, float]] = []
+            for index, group in enumerate(apparition_groups):
+                metrics: dict[str, object] = {}
+                _update_apparition_linkage_metrics(metrics, group)
+                if "rms_arcsec" not in metrics or "normalized_rms" not in metrics:
+                    continue
+                rms = float(metrics.get("rms_arcsec", np.inf))
+                normalized = float(metrics.get("normalized_rms", np.inf))
+                if rms > 120.0 or normalized > 8.0:
+                    year = (
+                        apparition_linkage[index].get("return_year", "?")
+                        if index < len(apparition_linkage) else "?"
+                    )
+                    failed.append((year, rms, normalized))
+            return failed
+
         if multi_apparition_seed is not None and seed_report is not None:
             # Link one earlier return at a time.  Jumping directly from the
             # 1986 state to a simultaneous 1835+1910+1986 correction leaves a
@@ -2119,22 +2142,80 @@ def fit_orbit(
                 report_progress(
                     "Zpřesňuji propojenou dráhu na všech návratech…"
                 )
+                exact_linkage_parameters = {
+                    name: value for name, value in fitted_nongrav(last_good[0]).items()
+                    if name in linkage_names
+                }
                 result = fit_once(
                     observations, last_good[0], constraints, truncate_years,
-                    fitted_nongrav(last_good[0]),
+                    exact_linkage_parameters,
                     maximum_observations=480,
-                    max_nfev=8, robust_loss=True, robust_scale=5.0,
+                    max_nfev=16, robust_loss=True, robust_scale=25.0,
                 )
+                failed = failed_apparitions()
+                requested_parameters = fitted_nongrav(result[0])
+                extra_names = set(requested_parameters) - set(exact_linkage_parameters)
+                if not failed and extra_names:
+                    # A3 and DT are accepted only if their larger, strongly
+                    # correlated model preserves every already-linked return.
+                    baseline = result
+                    baseline_score = result[1]
+                    baseline_report = [
+                        (
+                            observation.residual_ra_arcsec,
+                            observation.residual_dec_arcsec,
+                            observation.used_in_fit,
+                        )
+                        for observation in observations
+                    ]
+                    try:
+                        expanded = fit_once(
+                            observations, result[0], constraints, truncate_years,
+                            requested_parameters, maximum_observations=480,
+                            max_nfev=10, robust_loss=True, robust_scale=25.0,
+                        )
+                        if not failed_apparitions() and expanded[1] <= baseline_score * 1.05:
+                            result = expanded
+                        else:
+                            result = baseline
+                    except (OrbitFitError, ValueError, RuntimeError, FloatingPointError):
+                        result = baseline
+                    if result is baseline:
+                        for observation, values in zip(observations, baseline_report):
+                            (
+                                observation.residual_ra_arcsec,
+                                observation.residual_dec_arcsec,
+                                observation.used_in_fit,
+                            ) = values
                 for group_index, group in enumerate(apparition_groups):
-                    apparition_linkage[group_index]["status"] = "linked"
                     _update_apparition_linkage_metrics(
                         apparition_linkage[group_index], group,
                     )
-                result[0].fit_model_note = (
-                    f"Společný N-body fit propojil všech "
-                    f"{len(apparition_groups)} pozorovaných návratů postupnou "
-                    "apariční předkorekcí a závěrečným přesným řešením DE440."
-                )
+                if failed:
+                    failed_years = {str(item[0]) for item in failed}
+                    for record in apparition_linkage:
+                        if str(record.get("return_year")) in failed_years:
+                            record["status"] = "failed"
+                            record["reason"] = (
+                                "Závěrečná přesná korekce nepotvrdila tento návrat."
+                            )
+                    detail = "; ".join(
+                        f"{year}: {rms:.1f}″/{normalized:.1f}σ"
+                        for year, rms, normalized in failed
+                    )
+                    result[0].fit_model_note = (
+                        "Apariční předkorekce našla kandidátní větev, ale "
+                        "závěrečný přesný fit nepotvrdil všechny návraty "
+                        f"({detail}). Výsledek proto NENÍ označen jako navázaný."
+                    )
+                else:
+                    for record in apparition_linkage:
+                        record["status"] = "linked"
+                    result[0].fit_model_note = (
+                        f"Společný N-body fit propojil všech "
+                        f"{len(apparition_groups)} pozorovaných návratů postupnou "
+                        "apariční předkorekcí a závěrečným přesným řešením DE440."
+                    )
         else:
             report_progress("Zpřesňuji negravitační řešení na celém oblouku…")
             result = fit_once(
