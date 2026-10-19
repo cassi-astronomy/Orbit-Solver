@@ -408,10 +408,10 @@ def _observation_sigmas(
     """Return astrometric sigmas, optionally accounting for same-night batches.
 
     Measurements from one station during one observing night share catalogue,
-    timing and reduction systematics.  Treating a run of fifty frames as fifty
-    fully independent absolute positions lets it overwhelm a sparse historical
-    apparition.  A modest 0.15 intra-batch correlation retains the information
-    in a sequence without pretending that its systematic error averages away.
+    timing and reduction systematics.  Follow the Vereš et al. (2017) rule
+    used by JPL/GRSS: up to four measurements retain their nominal weight and
+    a batch of N > 4 is deweighted by sqrt(N/4).  This keeps a dense CCD run
+    from overwhelming a sparse apparition while retaining its time coverage.
     """
     values = np.asarray([
         value
@@ -429,7 +429,7 @@ def _observation_sigmas(
         batch_keys.append(key)
         batch_sizes[key] = batch_sizes.get(key, 0) + 1
     factors = np.asarray([
-        np.sqrt(1.0 + 0.15 * (min(batch_sizes[key], 25) - 1))
+        np.sqrt(max(1.0, batch_sizes[key] / 4.0))
         for key in batch_keys
         for _coordinate in range(2)
     ], dtype=float)
@@ -492,7 +492,10 @@ def _arc_extension_counts(observation_count: int) -> tuple[int, ...]:
     count = min(6, observation_count)
     while count < observation_count:
         counts.append(count)
-        count = min(observation_count, count * 2)
+        # Each extension performs both a secular-parameter prefit and a full
+        # state correction.  Geometric growth by four keeps a many-thousand
+        # row apparition interactive while still approaching it gradually.
+        count = min(observation_count, count * 4)
     counts.append(observation_count)
     return tuple(counts)
 
@@ -2259,6 +2262,24 @@ def fit_orbit(
                 stage_observations = _balanced_linkage_observations(stage_groups)
                 stage_count = len(apparition_groups) - first_group
                 all_parameters = fitted_nongrav(last_good[0])
+                # Two apparitions usually constrain the revolution count and
+                # osculating state much better than they constrain secular
+                # comet acceleration.  Releasing state and A1/A2 together at
+                # this first bridge can produce a deceptively low-RMS branch
+                # with wildly displaced A terms; the next older apparition
+                # then misses by many arcseconds.  Preserve the requested or
+                # catalogue force law for the first bridge.  Once a third
+                # return is present the longer time base can determine A1/A2
+                # rather than merely trading them against the state vector.
+                hold_secular_parameters = bool(
+                    stage_count == 2 and any(
+                        name in all_parameters
+                        for name in ("A1", "A2", "A3", "DT")
+                    )
+                )
+                held_parameters = (
+                    dict(all_parameters) if hold_secular_parameters else {}
+                )
                 # Classical apparition linking did not repeatedly solve all
                 # orbital elements over a century.  It first corrected a few
                 # secular/non-gravitational terms from normal places, then
@@ -2278,7 +2299,10 @@ def fit_orbit(
                     for name in ("R_EXPONENT",)
                     if name in all_parameters
                 })
-                linked_parameter_names.update(linkage_parameters)
+                linked_parameter_names.update(
+                    held_parameters if hold_secular_parameters
+                    else linkage_parameters
+                )
                 candidate = None
                 candidate_source = "propagated"
                 best_failed_trial = None
@@ -2303,23 +2327,34 @@ def fit_orbit(
                     return_year = apparition_linkage[first_group].get(
                         "return_year", "?"
                     )
-                    report_progress(
-                        f"Návrat {return_year}: rychlý apariční předfit "
-                        f"({'+'.join(linkage_names)})…"
-                    )
-                    prefit = fit_once(
-                        stage_observations, last_good[0], constraints,
-                        truncate_years, linkage_parameters,
-                        maximum_observations=min(160, 40 * stage_count),
-                        max_nfev=8, robust_loss=True, robust_scale=50.0,
-                        screening=True, fit_state=False,
-                    )
+                    if hold_secular_parameters:
+                        report_progress(
+                            f"Návrat {return_year}: hledám společný stav při "
+                            "pevných katalogových A/DT…"
+                        )
+                        prefit = last_good
+                    else:
+                        report_progress(
+                            f"Návrat {return_year}: rychlý apariční předfit "
+                            f"({'+'.join(linkage_names)})…"
+                        )
+                        prefit = fit_once(
+                            stage_observations, last_good[0], constraints,
+                            truncate_years, linkage_parameters,
+                            maximum_observations=min(160, 40 * stage_count),
+                            max_nfev=8, robust_loss=True, robust_scale=50.0,
+                            screening=True, fit_state=False,
+                        )
                     report_progress(
                         f"Návrat {return_year}: krátká společná korekce…"
                     )
                     trial = fit_once(
                         stage_observations, prefit[0], constraints,
-                        truncate_years, linkage_parameters,
+                        truncate_years,
+                        None if hold_secular_parameters else linkage_parameters,
+                        fixed_nongravitational=(
+                            held_parameters if hold_secular_parameters else None
+                        ),
                         maximum_observations=min(240, 60 * stage_count),
                         max_nfev=6, robust_loss=True, robust_scale=25.0,
                         screening=True,
@@ -2336,7 +2371,13 @@ def fit_orbit(
                         )
                         trial = fit_once(
                             stage_observations, trial[0], constraints,
-                            truncate_years, linkage_parameters,
+                            truncate_years,
+                            None if hold_secular_parameters
+                            else linkage_parameters,
+                            fixed_nongravitational=(
+                                held_parameters
+                                if hold_secular_parameters else None
+                            ),
                             maximum_observations=min(320, 80 * stage_count),
                             max_nfev=24, robust_loss=True,
                             robust_scale=8.0, screening=False,
@@ -2390,21 +2431,33 @@ def fit_orbit(
                                 "lokální astrometrická větev: "
                                 f"RMS {local_seed[1]:.2f}″"
                             )
-                            report_progress(
-                                f"Návrat {return_year}: rychlý předfit z "
-                                "lokální astrometrické větve…"
-                            )
-                            local_prefit = fit_once(
-                                stage_observations, local_seed[0], constraints,
-                                truncate_years, linkage_parameters,
-                                maximum_observations=min(160, 40 * stage_count),
-                                max_nfev=8, robust_loss=True,
-                                robust_scale=50.0, screening=True,
-                                fit_state=False,
-                            )
+                            if hold_secular_parameters:
+                                local_prefit = local_seed
+                            else:
+                                report_progress(
+                                    f"Návrat {return_year}: rychlý předfit z "
+                                    "lokální astrometrické větve…"
+                                )
+                                local_prefit = fit_once(
+                                    stage_observations, local_seed[0],
+                                    constraints, truncate_years,
+                                    linkage_parameters,
+                                    maximum_observations=min(
+                                        160, 40 * stage_count
+                                    ),
+                                    max_nfev=8, robust_loss=True,
+                                    robust_scale=50.0, screening=True,
+                                    fit_state=False,
+                                )
                             trial = fit_once(
                                 stage_observations, local_prefit[0], constraints,
-                                truncate_years, linkage_parameters,
+                                truncate_years,
+                                None if hold_secular_parameters
+                                else linkage_parameters,
+                                fixed_nongravitational=(
+                                    held_parameters
+                                    if hold_secular_parameters else None
+                                ),
                                 maximum_observations=min(240, 60 * stage_count),
                                 max_nfev=6, robust_loss=True,
                                 robust_scale=25.0, screening=True,
@@ -2422,7 +2475,13 @@ def fit_orbit(
                                 )
                                 trial = fit_once(
                                     stage_observations, trial[0], constraints,
-                                    truncate_years, linkage_parameters,
+                                    truncate_years,
+                                    None if hold_secular_parameters
+                                    else linkage_parameters,
+                                    fixed_nongravitational=(
+                                        held_parameters
+                                        if hold_secular_parameters else None
+                                    ),
                                     maximum_observations=min(
                                         320, 80 * stage_count
                                     ),
@@ -2462,6 +2521,14 @@ def fit_orbit(
                         candidate is None and initial is not None
                         and initial is not last_good[0]
                     ):
+                        catalogue_force = dict(
+                            initial.nongravitational_parameters or {}
+                        )
+                        catalogue_force.update({
+                            name: value
+                            for name, value in all_parameters.items()
+                            if name not in catalogue_force
+                        })
                         catalogue_parameters = dict(linkage_parameters)
                         catalogue_parameters.update({
                             name: value
@@ -2475,30 +2542,79 @@ def fit_orbit(
                                 f"Návrat {return_year}: ověřuji katalogovou "
                                 "větev proti načtené astrometrii…"
                             )
-                            catalogue_prefit = fit_once(
+                            # First preserve the independently published force
+                            # law.  Letting A1/A2 move before the six-state
+                            # correction can erase the very integer-revolution
+                            # branch for which the catalogue state is useful.
+                            catalogue_fixed_trial = fit_once(
                                 stage_observations, initial, constraints,
-                                truncate_years, catalogue_parameters,
-                                maximum_observations=min(
-                                    240, 60 * stage_count
-                                ),
-                                max_nfev=12, robust_loss=True,
-                                robust_scale=25.0, screening=True,
-                                fit_state=False,
-                            )
-                            catalogue_trial = fit_once(
-                                stage_observations, catalogue_prefit[0],
-                                constraints, truncate_years,
-                                catalogue_parameters,
+                                truncate_years, None,
+                                fixed_nongravitational=catalogue_force,
                                 maximum_observations=min(
                                     320, 80 * stage_count
                                 ),
                                 max_nfev=28, robust_loss=True,
-                                robust_scale=8.0, screening=False,
+                                robust_scale=12.0, screening=False,
                             )
+                            catalogue_fixed_normalized = (
+                                catalogue_fixed_trial[0].fit_normalized_rms
+                            )
+                            if (
+                                np.isfinite(catalogue_fixed_trial[1])
+                                and catalogue_fixed_trial[1] <= 60.0
+                                and catalogue_fixed_normalized is not None
+                                and np.isfinite(catalogue_fixed_normalized)
+                                and catalogue_fixed_normalized <= 8.0
+                            ):
+                                candidate = catalogue_fixed_trial
+                                candidate_source = "catalogue_fixed_force"
+                            else:
+                                remember_failed_trial(catalogue_fixed_trial)
+                                failures.append(
+                                    "katalogová větev s pevným silovým "
+                                    f"modelem: RMS {catalogue_fixed_trial[1]:.2f}″"
+                                )
+                            if candidate is not None:
+                                catalogue_trial = catalogue_fixed_trial
+                            elif hold_secular_parameters:
+                                catalogue_prefit = (initial, np.inf, 0)
+                                catalogue_trial = fit_once(
+                                    stage_observations, catalogue_prefit[0],
+                                    constraints, truncate_years, None,
+                                    fixed_nongravitational=held_parameters,
+                                    maximum_observations=min(
+                                        320, 80 * stage_count
+                                    ),
+                                    max_nfev=28, robust_loss=True,
+                                    robust_scale=8.0, screening=False,
+                                )
+                            else:
+                                catalogue_prefit = fit_once(
+                                    stage_observations, initial, constraints,
+                                    truncate_years, catalogue_parameters,
+                                    maximum_observations=min(
+                                        240, 60 * stage_count
+                                    ),
+                                    max_nfev=12, robust_loss=True,
+                                    robust_scale=25.0, screening=True,
+                                    fit_state=False,
+                                )
+                                catalogue_trial = fit_once(
+                                    stage_observations, catalogue_prefit[0],
+                                    constraints, truncate_years,
+                                    catalogue_parameters,
+                                    maximum_observations=min(
+                                        320, 80 * stage_count
+                                    ),
+                                    max_nfev=28, robust_loss=True,
+                                    robust_scale=8.0, screening=False,
+                                )
                             catalogue_normalized = (
                                 catalogue_trial[0].fit_normalized_rms
                             )
                             if (
+                                candidate is None
+                                and
                                 np.isfinite(catalogue_trial[1])
                                 and catalogue_trial[1] <= 60.0
                                 and catalogue_normalized is not None
@@ -2507,7 +2623,7 @@ def fit_orbit(
                             ):
                                 candidate = catalogue_trial
                                 candidate_source = "catalogue_astrometry"
-                            else:
+                            elif candidate is None:
                                 remember_failed_trial(catalogue_trial)
                                 normalized_text = (
                                     "nedostupné"
@@ -2526,6 +2642,108 @@ def fit_orbit(
                         ) as exc:
                             failures.append(
                                 f"katalogová astrometrická větev: {exc}"
+                            )
+                    # A catalogue and the already linked recent arc can each
+                    # be right along a different correlated force direction.
+                    # Test the small Cartesian product of their A1/A2 values
+                    # with the state free but the force law fixed.  This is a
+                    # deterministic, bounded analogue of statistical ranging:
+                    # it crosses the shallow valley which a local simultaneous
+                    # state+A correction cannot cross, then performs a normal
+                    # joint correction from the best astrometric branch.
+                    if (
+                        candidate is None and initial is not None
+                        and {"A1", "A2"} <= set(all_parameters)
+                        and {"A1", "A2"} <= set(
+                            initial.nongravitational_parameters or {}
+                        )
+                    ):
+                        catalogue_force = dict(
+                            initial.nongravitational_parameters or {}
+                        )
+                        force_trials: list[tuple[float, object]] = []
+                        current_a1 = float(all_parameters["A1"])
+                        current_a2 = float(all_parameters["A2"])
+                        catalogue_a1 = float(catalogue_force["A1"])
+                        catalogue_a2 = float(catalogue_force["A2"])
+                        force_grid = (
+                            (catalogue_a1, current_a2),
+                            (current_a1, catalogue_a2),
+                            (catalogue_a1, catalogue_a2),
+                        )
+                        try:
+                            report_progress(
+                                f"Návrat {return_year}: prohledávám "
+                                "korelované větve A1/A2…"
+                            )
+                            for trial_a1, trial_a2 in force_grid:
+                                trial_force = dict(all_parameters)
+                                trial_force.update({
+                                    "A1": trial_a1, "A2": trial_a2,
+                                })
+                                grid_trial = fit_once(
+                                    stage_observations, last_good[0],
+                                    constraints, truncate_years, None,
+                                    fixed_nongravitational=trial_force,
+                                    maximum_observations=min(
+                                        240, 60 * stage_count
+                                    ),
+                                    max_nfev=16, robust_loss=True,
+                                    robust_scale=15.0, screening=True,
+                                )
+                                grid_normalized = (
+                                    grid_trial[0].fit_normalized_rms
+                                )
+                                grid_score = (
+                                    float(grid_normalized)
+                                    if grid_normalized is not None
+                                    and np.isfinite(grid_normalized)
+                                    else np.inf
+                                )
+                                force_trials.append((grid_score, grid_trial))
+                            _, grid_seed = min(
+                                force_trials, key=lambda item: item[0]
+                            )
+                            grid_parameters = {
+                                name: value for name, value in
+                                fitted_nongrav(grid_seed[0]).items()
+                                if name in ("A1", "A2")
+                            }
+                            grid_polish = fit_once(
+                                stage_observations, grid_seed[0], constraints,
+                                truncate_years, grid_parameters,
+                                maximum_observations=min(
+                                    400, 100 * stage_count
+                                ),
+                                max_nfev=48, robust_loss=True,
+                                robust_scale=6.0, screening=False,
+                            )
+                            grid_normalized = (
+                                grid_polish[0].fit_normalized_rms
+                            )
+                            if (
+                                np.isfinite(grid_polish[1])
+                                and grid_polish[1] <= 60.0
+                                and grid_normalized is not None
+                                and np.isfinite(grid_normalized)
+                                and grid_normalized <= 8.0
+                            ):
+                                candidate = grid_polish
+                                candidate_source = "force_grid"
+                                linked_parameter_names.update(grid_parameters)
+                            else:
+                                remember_failed_trial(grid_polish)
+                                failures.append(
+                                    "mřížka korelovaných A1/A2: RMS "
+                                    f"{grid_polish[1]:.2f}″; "
+                                    f"{grid_normalized:.2f}σ"
+                                )
+                        except (
+                            OrbitFitError, ValueError, RuntimeError,
+                            FloatingPointError,
+                        ) as exc:
+                            failures.append(
+                                f"mřížka korelovaných A1/A2: {exc}"
                             )
                     # A1/A2 are normally the most stable quantities for
                     # selecting an integer-revolution branch.  If that reduced
@@ -2621,7 +2839,12 @@ def fit_orbit(
                             key=lambda item: parse_observation_time(item.time),
                         )
                         extension_counts = _arc_extension_counts(len(older_rows))
-                        extension_seed = best_failed_trial[1][0]
+                        # Continuation must start on the already verified
+                        # newer-apparition branch.  Starting from the
+                        # numerically "best" failed whole-arc trial preserves
+                        # exactly the phase/revolution error that incremental
+                        # extension is intended to avoid.
+                        extension_seed = last_good[0]
                         extension_parameters = fitted_nongrav(extension_seed)
                         extension_trial = None
                         try:
@@ -2640,12 +2863,44 @@ def fit_orbit(
                                         maximum_per_group=max(6, min(120, count)),
                                     )
                                 )
+                                # First correct the secular phase terms while
+                                # holding the already verified osculating state
+                                # fixed.  If state and A1/A2/DT are released at
+                                # once, a wrong period can be absorbed into a
+                                # displaced state and the fit remains on the
+                                # adjacent revolution branch.
+                                if hold_secular_parameters:
+                                    extension_prefit = (
+                                        extension_seed, np.inf, 0
+                                    )
+                                else:
+                                    extension_prefit = fit_once(
+                                        extension_observations, extension_seed,
+                                        constraints, truncate_years,
+                                        extension_parameters,
+                                        maximum_observations=None,
+                                        max_nfev=12,
+                                        robust_loss=True,
+                                        robust_scale=(
+                                            50.0 if count <= 24 else 12.0
+                                        ),
+                                        screening=False,
+                                        fit_state=False,
+                                    )
+                                    extension_parameters = fitted_nongrav(
+                                        extension_prefit[0]
+                                    )
                                 extension_trial = fit_once(
-                                    extension_observations, extension_seed,
+                                    extension_observations, extension_prefit[0],
                                     constraints, truncate_years,
-                                    extension_parameters,
+                                    None if hold_secular_parameters
+                                    else extension_parameters,
+                                    fixed_nongravitational=(
+                                        held_parameters
+                                        if hold_secular_parameters else None
+                                    ),
                                     maximum_observations=None,
-                                    max_nfev=24,
+                                    max_nfev=20,
                                     robust_loss=True,
                                     robust_scale=50.0 if count <= 12 else 12.0,
                                     screening=False,
@@ -2717,7 +2972,13 @@ def fit_orbit(
                             forced_trial = fit_once(
                                 stage_observations,
                                 best_failed_trial[1][0], constraints,
-                                truncate_years, forcing_parameters,
+                                truncate_years,
+                                None if hold_secular_parameters
+                                else forcing_parameters,
+                                fixed_nongravitational=(
+                                    held_parameters
+                                    if hold_secular_parameters else None
+                                ),
                                 maximum_observations=None,
                                 max_nfev=48, robust_loss=False,
                                 screening=False,
@@ -2802,6 +3063,12 @@ def fit_orbit(
                         "Společný N-body fit; katalogová větev byla znovu "
                         "určena a potvrzena načtenou astrometrií."
                         if candidate_source == "catalogue_astrometry" else
+                        "Společný N-body fit potvrdil katalogovou větev při "
+                        "pevném publikovaném negravitačním modelu."
+                        if candidate_source == "catalogue_fixed_force" else
+                        "Společný N-body fit byl nalezen prohledáním "
+                        "korelovaných větví A1/A2 a potvrzen astrometrií."
+                        if candidate_source == "force_grid" else
                         "Společný N-body fit byl potvrzen načtenou astrometrií "
                         "po uvolnění celého negravitačního modelu."
                         if candidate_source == "expanded_nongrav" else
@@ -2911,7 +3178,8 @@ def fit_orbit(
                     result[0].fit_model_note = (
                         "Vyvážená apariční předkorekce našla kandidátní větev, ale "
                         "závěrečný přesný fit nepotvrdil všechny návraty "
-                        f"({detail}). Výsledek proto NENÍ označen jako navázaný."
+                        f"({detail}). Společný dynamický model proto není potvrzen; "
+                        "to samo o sobě nevyvrací identitu aparic."
                     )
                 else:
                     for record in apparition_linkage:

@@ -207,8 +207,8 @@ def datetime_from_jd(jd: float) -> datetime | None:
 _LINKAGE_STATUS_LABELS = {
     "linked": "společně fitován",
     "seed_only": "jen samostatný fit",
-    "failed": "navázání selhalo",
-    "not_attempted": "navázání nezkoušeno",
+    "failed": "společný dynamický model neprošel",
+    "not_attempted": "společný model nezkoušen",
     "integrated_only": "jen integrovaná předpověď",
 }
 
@@ -225,8 +225,8 @@ def apparition_linkage_summary(solution: OrbitSolution) -> str | None:
     if linked == len(records):
         return f"NAVÁZÁNO {linked}/{len(records)} návratů ({years})"
     if linked >= 2:
-        return f"ČÁSTEČNĚ NAVÁZÁNO {linked}/{len(records)} návratů ({years})"
-    return f"NENAVÁZÁNO — společný fit 1/{len(records)} návratů"
+        return f"ČÁSTEČNÝ SPOLEČNÝ FIT {linked}/{len(records)} návratů ({years})"
+    return f"SPOLEČNÝ MODEL NEPOTVRZEN — fit 1/{len(records)} návratů"
 
 
 def apparition_observation_count_text(solution: OrbitSolution) -> str:
@@ -5642,8 +5642,10 @@ class MainWindow(QMainWindow):
                 details.append(f"Návrat {year}: {reason}")
             QMessageBox.warning(
                 self,
-                "Návraty komety nebyly úplně navázány",
-                "Výsledná dráha NENÍ společným řešením všech načtených návratů.\n\n"
+                "Společný dynamický model nepotvrdil všechny návraty",
+                "Výsledná dráha NENÍ společným řešením všech načtených návratů. "
+                "To samo o sobě nevyvrací jejich identitu: příčinou může být "
+                "proměnlivá kometární aktivita nebo nedostatečný silový model.\n\n"
                 + "\n".join(details)
                 + "\n\nPodrobný protokol je v záložce Elementy.",
             )

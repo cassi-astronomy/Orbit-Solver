@@ -29,7 +29,7 @@ from orbit_app.observatories import (
 from orbit_app.orbit_engine import (
     MU_SUN, NBodyIntegrator, StateVector, delayed_heliocentric_radius,
     marsden_water_ice_law,
-    nongravitational_acceleration,
+    nongravitational_acceleration, solar_post_newtonian_acceleration,
 )
 from orbit_app.orbit_evolution import (
     EvolutionResult, EvolutionReturn, EvolutionSnapshot, PLANET_MU, PlanetEncounter,
@@ -805,7 +805,7 @@ class OrbitFitSelectionTests(unittest.TestCase):
         ):
             fit_orbit(observations, solution, nongravitational={"A1": 0.0, "DT": 30.0})
         self.assertEqual(calls[0], ({}, {"A1": 0.0}, True))
-        self.assertEqual(calls[1], ({"A1": 2e-8}, {}, False))
+        self.assertEqual(calls[1], ({}, {"A1": 2e-8, "DT": 30.0}, True))
         self.assertTrue(calls[-1][2])
 
     def test_three_comet_returns_are_linked_progressively(self):
@@ -838,9 +838,10 @@ class OrbitFitSelectionTests(unittest.TestCase):
                 observations, solution,
                 nongravitational={"A1": 0.0, "DT": 0.0},
             )
-        # Each older return gets a cheap fixed-state A prefit followed by a
-        # short state correction; only one strict all-return polish is done.
-        self.assertEqual(row_counts, [10, 18, 18, 24, 24, 24, 24])
+        # The first bridge holds the supplied force model fixed.  Later
+        # returns get a secular prefit plus a state correction, followed by
+        # the balanced bridge and strict all-return polish.
+        self.assertEqual(row_counts, [10, 18, 24, 24, 24])
         self.assertIn("všech 3", result[0].fit_model_note or "")
         self.assertEqual(
             [item["status"] for item in result[0].apparition_linkage or ()],
@@ -877,11 +878,17 @@ class OrbitFitSelectionTests(unittest.TestCase):
         )
         row_counts = []
 
-        def fake_fit(rows, *_args, **_kwargs):
+        failed_joint = False
+
+        def fake_fit(rows, *_args, **kwargs):
+            nonlocal failed_joint
             row_counts.append(len(rows))
-            # The fixed-state prefit is call 2; make the subsequent state
-            # correction fail so the independent local branch is exercised.
-            if len(row_counts) == 3:
+            if (
+                len(rows) == 12
+                and kwargs.get("fixed_nongravitational")
+                and not failed_joint
+            ):
+                failed_joint = True
                 return bad, 100.0, len(rows)
             return seed, 1.0, len(rows)
 
@@ -892,7 +899,8 @@ class OrbitFitSelectionTests(unittest.TestCase):
             result = fit_orbit(
                 observations, seed, nongravitational={"A1": 0.0},
             )
-        self.assertEqual(row_counts, [6, 12, 12, 6, 12, 12, 12])
+        self.assertTrue(failed_joint)
+        self.assertIn(6, row_counts[2:])
         self.assertEqual(
             [item["status"] for item in result[0].apparition_linkage or ()],
             ["linked", "linked"],
@@ -919,8 +927,9 @@ class OrbitFitSelectionTests(unittest.TestCase):
         calls = []
 
         def fake_fit(rows, *_args, **kwargs):
-            calls.append(kwargs.get("max_nfev"))
-            if len(calls) == 3:
+            max_nfev = kwargs.get("max_nfev")
+            calls.append(max_nfev)
+            if len(rows) == 12 and max_nfev == 6:
                 return near, 9.0, len(rows)
             return good, 1.0, len(rows)
 
@@ -931,7 +940,7 @@ class OrbitFitSelectionTests(unittest.TestCase):
             result = fit_orbit(
                 observations, good, nongravitational={"A1": 0.0},
             )
-        self.assertEqual(calls[:4], [8, 8, 6, 24])
+        self.assertEqual(calls[:3], [8, 6, 24])
         self.assertEqual(
             [item["status"] for item in result[0].apparition_linkage or ()],
             ["linked", "linked"],
@@ -957,9 +966,16 @@ class OrbitFitSelectionTests(unittest.TestCase):
         bad = replace(catalogue, fit_normalized_rms=100.0)
         calls = []
 
+        joint_attempts = 0
+
         def fake_fit(rows, seed, *_args, **kwargs):
-            calls.append((seed, kwargs.get("fit_state", True)))
-            if len(calls) in (3, 6):
+            nonlocal joint_attempts
+            calls.append((
+                seed, kwargs.get("fit_state", True),
+                dict(kwargs.get("fixed_nongravitational") or {}),
+            ))
+            if len(rows) == 12 and seed is not catalogue:
+                joint_attempts += 1
                 return bad, 100.0, len(rows)
             return fitted, 1.0, len(rows)
 
@@ -970,10 +986,11 @@ class OrbitFitSelectionTests(unittest.TestCase):
             result = fit_orbit(
                 observations, catalogue, nongravitational={"A1": 0.0},
             )
-        self.assertIs(calls[6][0], catalogue)
-        self.assertFalse(calls[6][1])
+        catalogue_calls = [call for call in calls if call[0] is catalogue]
+        self.assertGreaterEqual(joint_attempts, 1)
+        self.assertTrue(any(call[2] for call in catalogue_calls))
         self.assertIn(
-            "katalogová větev",
+            "pevném publikovaném",
             result[0].apparition_linkage[0]["reason"],
         )
 
@@ -1004,7 +1021,7 @@ class OrbitFitSelectionTests(unittest.TestCase):
             nonlocal expanded_seen
             names = set(parameters or {})
             parameter_sets.append(names)
-            if len(parameter_sets) == 1 or not names:
+            if len(rows) == 6:
                 return fitted, 1.0, len(rows)
             if {"A3", "DT"} & names:
                 expanded_seen = True
@@ -1046,10 +1063,10 @@ class OrbitFitSelectionTests(unittest.TestCase):
         )
         calls = 0
 
-        def fake_fit(rows, *_args, **_kwargs):
+        def fake_fit(rows, *_args, **kwargs):
             nonlocal calls
             calls += 1
-            if calls == 4:
+            if kwargs.get("max_nfev") == 14:
                 for observation in observations:
                     old = observation.time.startswith("1892")
                     observation.residual_ra_arcsec = 900.0 if old else .3
@@ -1068,7 +1085,7 @@ class OrbitFitSelectionTests(unittest.TestCase):
             [item["status"] for item in result[0].apparition_linkage or ()],
             ["failed", "linked"],
         )
-        self.assertIn("NENÍ označen", result[0].fit_model_note or "")
+        self.assertIn("model proto není potvrzen", result[0].fit_model_note or "")
 
     def test_multi_apparition_table_marks_future_relative_to_today(self):
         solution = OrbitSolution(
@@ -1332,7 +1349,7 @@ class OrbitFitSelectionTests(unittest.TestCase):
         self.assertEqual(record["fitted"], 1)
         self.assertAlmostEqual(record["rms_arcsec"], math.sqrt(.125))
 
-    def test_same_station_night_batch_gets_correlation_floor(self):
+    def test_same_station_night_batch_uses_veres_deweighting(self):
         instant = datetime(2026, 10, 18, 22, tzinfo=timezone.utc)
         rows = [
             (Observation(
@@ -1346,7 +1363,7 @@ class OrbitFitSelectionTests(unittest.TestCase):
             rows, account_for_batch_correlation=True,
         )
         self.assertTrue(np.all(correlated > independent))
-        self.assertAlmostEqual(correlated[0] / independent[0], math.sqrt(2.35))
+        self.assertAlmostEqual(correlated[0] / independent[0], math.sqrt(2.5))
 
     def test_rank_deficient_fit_does_not_report_false_formal_errors(self):
         state = np.array([1.0, 0.0, 0.0, 0.0, .017, 0.0])
@@ -1379,7 +1396,7 @@ class OrbitFitSelectionTests(unittest.TestCase):
     def test_distant_apparition_is_extended_in_doubling_stages(self):
         self.assertEqual(_arc_extension_counts(0), ())
         self.assertEqual(_arc_extension_counts(5), (5,))
-        self.assertEqual(_arc_extension_counts(41), (6, 12, 24, 41))
+        self.assertEqual(_arc_extension_counts(41), (6, 24, 41))
 
     def test_catastrophic_linked_comet_fit_falls_back_to_latest_apparition(self):
         observations = [
@@ -1404,7 +1421,12 @@ class OrbitFitSelectionTests(unittest.TestCase):
             fit_normalized_rms=5000.0, nongravitational_parameters={"A1": 2e-8},
         )
 
-        def staged_fit(rows, *_args, **_kwargs):
+        progress_label = ""
+        extension_seeds = []
+
+        def staged_fit(rows, *args, **_kwargs):
+            if "postupně připojuji" in progress_label:
+                extension_seeds.append(args[0])
             if staged_fit.calls == 0:
                 for observation in rows:
                     observation.residual_ra_arcsec = .2
@@ -1421,12 +1443,18 @@ class OrbitFitSelectionTests(unittest.TestCase):
             return result
 
         staged_fit.calls = 0
+
+        def progress(label, _step, _total):
+            nonlocal progress_label
+            progress_label = label
+
         with (
             patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=staged_fit),
             patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
         ):
             result = fit_orbit(
                 observations, seed, nongravitational={"A1": 0.0},
+                progress_callback=progress,
             )
         self.assertIs(result[0], seed)
         self.assertIsNone(observations[0].residual_ra_arcsec)
@@ -1438,8 +1466,10 @@ class OrbitFitSelectionTests(unittest.TestCase):
         )
         self.assertEqual(
             apparition_linkage_summary(seed),
-            "NENAVÁZÁNO — společný fit 1/2 návratů",
+            "SPOLEČNÝ MODEL NEPOTVRZEN — fit 1/2 návratů",
         )
+        self.assertTrue(extension_seeds)
+        self.assertIs(extension_seeds[0], seed)
 
     def test_representative_count_says_which_arc_it_describes(self):
         solution = OrbitSolution("1P", 2446470.5, 17.8, .967, 162, 58, 111, 0)
@@ -1529,6 +1559,14 @@ class _NoPlanets:
 
 
 class NativeIntegratorTests(unittest.TestCase):
+    def test_solar_post_newtonian_acceleration_for_circular_state(self):
+        correction = solar_post_newtonian_acceleration(
+            np.array([1.0, 0.0, 0.0]),
+            np.array([0.0, math.sqrt(MU_SUN), 0.0]),
+        )
+        expected = 3.0 * MU_SUN**2 / 173.1446326846693**2
+        np.testing.assert_allclose(correction, [expected, 0.0, 0.0], rtol=1e-14)
+
     def test_local_light_time_expansion_matches_short_exact_propagation(self):
         epoch = 2460000.5
         position = np.array([5.0, 1.0, .2])

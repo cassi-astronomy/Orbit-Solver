@@ -9,6 +9,31 @@ from scipy.integrate import solve_ivp
 # Units used throughout the engine: AU, day, solar mass.
 GAUSSIAN_K = 0.01720209895
 MU_SUN = GAUSSIAN_K * GAUSSIAN_K
+C_AU_PER_DAY = 173.1446326846693
+
+
+def solar_post_newtonian_acceleration(
+    position: np.ndarray, velocity: np.ndarray,
+) -> np.ndarray:
+    """First post-Newtonian Schwarzschild correction from the Sun.
+
+    This is the standard heliocentric test-particle form used for small-body
+    orbit determination.  It is much smaller than Newtonian gravity, but its
+    secular perihelion effect is measurable when apparitions separated by
+    decades are fitted together.
+    """
+    r_vector = np.asarray(position, dtype=float)
+    v_vector = np.asarray(velocity, dtype=float)
+    radius = float(np.linalg.norm(r_vector))
+    if radius <= 0.0:
+        raise ValueError("Těleso nemůže být ve středu Slunce.")
+    speed2 = float(np.dot(v_vector, v_vector))
+    radial_product = float(np.dot(r_vector, v_vector))
+    factor = MU_SUN / (C_AU_PER_DAY**2 * radius**3)
+    return factor * (
+        (4.0 * MU_SUN / radius - speed2) * r_vector
+        + 4.0 * radial_product * v_vector
+    )
 
 
 def marsden_water_ice_law(radius_au: float | np.ndarray) -> float | np.ndarray:
@@ -183,12 +208,14 @@ class NBodyIntegrator:
         relative_tolerance: float = 2e-12,
         absolute_tolerance: float = 1e-14,
         nongravitational_parameters: dict[str, float] | None = None,
+        include_solar_relativity: bool = True,
     ) -> None:
         self.ephemeris = ephemeris
         self.perturbers = perturbers
         self.rtol = relative_tolerance
         self.atol = absolute_tolerance
         self.nongravitational_parameters = dict(nongravitational_parameters or {})
+        self.include_solar_relativity = bool(include_solar_relativity)
 
     def acceleration(
         self, jd: float, position: np.ndarray, velocity: np.ndarray | None = None,
@@ -197,6 +224,8 @@ class NBodyIntegrator:
         if radius == 0:
             raise ValueError("Těleso nemůže být ve středu Slunce.")
         acceleration = -MU_SUN * position / radius**3
+        if velocity is not None and self.include_solar_relativity:
+            acceleration += solar_post_newtonian_acceleration(position, velocity)
         names = tuple(body.name for body in self.perturbers)
         batch_method = getattr(self.ephemeris, "positions", None)
         if callable(batch_method):

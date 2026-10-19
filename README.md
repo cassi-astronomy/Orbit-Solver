@@ -47,8 +47,12 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
   korekce používá všechna měření s jejich vahami; na víceletých obloucích se
   kroky numerických derivací průběžně přizpůsobují skutečné změně O−C, podobně
   jako při `Full step` ve Find_Orbu, aby se neztratil úzký směr změny fáze;
-  vzdálený návrat se navíc připojuje od nejbližších měření po rostoucích
-  úsecích 6, 12, 24… místo jediného skoku přes celou aparici;
+  vzdálený návrat se navíc připojuje od nejbližších měření po geometricky
+  rostoucích úsecích místo jediného skoku přes celou aparici; první most drží
+  katalogové A/DT pevné, delší oblouk je teprve potom uvolní a při ztrátě
+  konvergence se prověří i korelované kombinace A1/A2 obou větví;
+  husté dávky jedné stanice a noci se převáží pravidlem `sqrt(N/4)` podle
+  Vereše et al., aby nepřeválcovaly řidší návraty;
   zjevení se rozpoznávají z periody načtené dráhy, takže stejný postup funguje
   pro Halleyův typ i krátkoperiodické komety jako 2P/Encke nebo 78P/Gehrels;
 - volitelné fixování oskulačních elementů;
@@ -226,8 +230,9 @@ aplikací nutné porovnat s MPC, JPL Horizons nebo jiným nezávislým softwarem
   kliknutím stáhnout a aktivovat JPL DE440 (přibližně 114 MB, 1549–2650).
   Výpočty mimo pokrytí aktivního kernelu program odmítne místo tichého přechodu
   na méně přesný model.
-- Samostatný Měsíc je zahrnut; Pluto, relativistické členy a perturbace hmotných
-  planetek zatím v dynamickém modelu zahrnuty nejsou.
+- Samostatný Měsíc i první postnewtonovská (Schwarzschildova) korekce Slunce
+  jsou zahrnuty. Pluto, úplný EIH/PPN model a perturbace hmotných planetek
+  zatím v dynamickém modelu zahrnuty nejsou.
 - Konstantní A1/A2/A3/DT při integraci komety přes mnoho návratů jsou modelový
   předpoklad; skutečná negravitační aktivita komety se může mezi návraty měnit.
   DT je vhodné uvolnit až pro dlouhý oblouk, protože na jednom krátkém zjevení
@@ -305,8 +310,8 @@ Planet Center; katalog hvězd a obrazce souhvězdí pocházejí z d3-celestial.
 
 ## Vývoj a plánované kroky
 
-Následovat může samostatný Měsíc, relativistické členy, hmotné planetky,
-ukládání projektů a distribuční balíčky pro Windows a Linux.
+Následovat mohou Pluto, úplný EIH/PPN model, hmotné planetky, ukládání projektů
+a distribuční balíčky pro Windows a Linux.
 
 Příspěvky a hlášení reprodukovatelných chyb jsou vítány prostřednictvím
 [GitHub Issues](https://github.com/cassi-astronomy/Orbit-Solver/issues). K hlášení
