@@ -51,7 +51,7 @@ from orbit_app.orbit_fit import (
     _perihelion_offset_days_from_state,
     _latest_observing_apparition, _prefer_parabolic_short_arc,
     _representative_indices, _truncate_rows_to_recent_years,
-    _update_apparition_linkage_metrics,
+    _robust_apparition_appraisal, _update_apparition_linkage_metrics,
     fit_orbit, fit_selection_count, parse_observation_time,
 )
 from orbit_app.photometry import estimate_absolute_magnitude, power_law_magnitude
@@ -748,7 +748,10 @@ class OrbitFitSelectionTests(unittest.TestCase):
             Observation(
                 time=f"1835-10-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
             )
-            for day in range(1, 7)
+            # A historical recovery can consist of only three plates (325P
+            # in 1951).  It must remain an auditable linkage apparition even
+            # though it cannot support a stable standalone six-state fit.
+            for day in range(1, 4)
         ] + [
             Observation(
                 time=f"1986-03-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
@@ -769,6 +772,88 @@ class OrbitFitSelectionTests(unittest.TestCase):
         self.assertEqual(len(fit_once.call_args_list[0].args[0]), 10)
         self.assertEqual(fit_once.call_args_list[0].kwargs["maximum_observations"], 120)
         self.assertIn("posledního pozorovaného návratu", solution.fit_model_note)
+
+    def test_sparse_catalogue_linkage_preserves_verified_branch_and_rejects_blunder(self):
+        old = [
+            Observation(
+                time=f"2010-03-0{day}T00:00:00Z", ra_deg=10.0, dec_deg=20.0,
+                station="711",
+            )
+            for day in range(1, 4)
+        ]
+        recent = [
+            Observation(
+                time=f"2020-03-0{day}T00:00:00Z", ra_deg=10.0, dec_deg=20.0,
+                station="500",
+            )
+            for day in range(1, 7)
+        ]
+        observations = old + recent
+        catalogue = OrbitSolution(
+            "325P", 2458909.5, 4.6416, .45, 12.0, 30.0, 60.0, 0.0,
+            position_au=(2.5, 0.0, 0.0),
+            velocity_au_per_day=(0.0, .01, 0.0),
+            nongravitational_parameters={"A1": 1e-8},
+        )
+        corrected = replace(catalogue)
+
+        def fake_evaluate(rows, *_args, **_kwargs):
+            for index, observation in enumerate(rows):
+                residual = 100.0 if observation is old[-1] else (
+                    .5 if observation in old else .2
+                )
+                observation.residual_ra_arcsec = residual
+                observation.residual_dec_arcsec = 0.0
+                observation.used_in_fit = False
+            return 25.0, 10.0, len(rows)
+
+        def fake_fit(rows, *_args, **_kwargs):
+            for observation in rows:
+                if not observation.excluded_from_fit:
+                    observation.residual_ra_arcsec = 5.0
+                    observation.residual_dec_arcsec = 0.0
+                    observation.used_in_fit = True
+            corrected.fit_normalized_rms = 2.0
+            return corrected, 3.5, len(rows)
+
+        with (
+            patch(
+                "orbit_app.orbit_fit._evaluate_solution_observations",
+                side_effect=fake_evaluate,
+            ),
+            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit) as fit_once,
+            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
+        ):
+            result = fit_orbit(
+                observations, catalogue, nongravitational={"A1": 1e-8},
+            )
+
+        self.assertIs(result[0], catalogue)
+        self.assertEqual(fit_once.call_count, 1)
+        self.assertTrue(fit_once.call_args.kwargs["strict_polish"])
+        self.assertTrue(old[-1].excluded_from_fit)
+        self.assertTrue(old[-1].raw["historical_duplicate_outlier"])
+        self.assertAlmostEqual(old[0].residual_ra_arcsec, .5)
+        self.assertIn("korekce byla odmítnuta", catalogue.fit_model_note or "")
+        self.assertEqual(
+            [item["status"] for item in catalogue.apparition_linkage or ()],
+            ["linked", "linked"],
+        )
+
+    def test_sparse_appraisal_requires_two_consistent_plates(self):
+        observations = [
+            Observation(
+                time=f"1951-05-28T0{index}:00:00Z", ra_deg=10.0, dec_deg=20.0,
+                residual_ra_arcsec=value, residual_dec_arcsec=0.0,
+            )
+            for index, value in enumerate((1.0, 2.0, 100.0), start=1)
+        ]
+        rms, _normalized, retained, rejected = _robust_apparition_appraisal(
+            observations
+        )
+        self.assertEqual(len(retained), 2)
+        self.assertEqual(rejected, [observations[-1]])
+        self.assertLess(rms, 2.0)
 
     def test_long_arc_seed_holds_a_parameters_then_frees_them_progressively(self):
         observations = [

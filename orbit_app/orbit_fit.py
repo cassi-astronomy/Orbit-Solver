@@ -1025,6 +1025,8 @@ def _fit_orbit_once(
     robust_scale: float = 3.0,
     screening: bool = False,
     fit_state: bool = True,
+    observation_weights: dict[int, float] | None = None,
+    strict_polish: bool = False,
     cancel_callback: CancelCallback | None = None,
 ) -> tuple[OrbitSolution, float, int]:
     def check_cancelled() -> None:
@@ -1069,6 +1071,18 @@ def _fit_orbit_once(
     astrometric_sigmas = _observation_sigmas(
         usable, account_for_batch_correlation=True,
     )
+    if observation_weights:
+        row_weights = np.asarray([
+            max(1e-12, float(observation_weights.get(id(item[0]), 1.0)))
+            for item in usable
+        ])
+        # Least squares divides residuals by sigma.  Dividing sigma by the
+        # square root gives each apparition the requested total statistical
+        # leverage without cloning observations or changing their published
+        # per-row uncertainty.
+        astrometric_sigmas = astrometric_sigmas / np.repeat(
+            np.sqrt(row_weights), 2,
+        )
     nongrav_names = tuple(
         name for name in ("A1", "A2", "A3", "DT")
         if name in (nongravitational or {})
@@ -1351,6 +1365,38 @@ def _fit_orbit_once(
             max_nfev=4 if screening else 8, verbose=0,
         )
         result_vector = result.x
+    elif arc_days > 730.0 and not screening and strict_polish:
+        # The relaxed century-scale integration above is only a branch finder.
+        # Its state can differ imperceptibly at the reference epoch yet miss a
+        # remote apparition by arcminutes after many revolutions.  The old
+        # code merely *reported* that discrepancy with the strict engine even
+        # though the comment promised a strict polish.  Select the better
+        # starting state in the exact force model, then really correct it.
+        def strict_optimizer_residuals(vector: np.ndarray) -> np.ndarray:
+            return residuals_with_engine(expand_fit_vector(vector), full_engine)
+
+        def strict_optimizer_jacobian(vector: np.ndarray) -> np.ndarray:
+            return _adaptive_finite_difference_jacobian(
+                strict_optimizer_residuals, vector, derivative_steps,
+                optimizer_lower, optimizer_upper, observed_ra.size * 2,
+            )
+
+        candidate_residual = strict_optimizer_residuals(result.x)
+        initial_residual = strict_optimizer_residuals(optimizer_initial)
+        candidate_cost = float(np.dot(candidate_residual, candidate_residual))
+        initial_cost = float(np.dot(initial_residual, initial_residual))
+        strict_start = result.x if candidate_cost <= initial_cost else optimizer_initial
+        result = least_squares(
+            strict_optimizer_residuals,
+            strict_start,
+            jac=strict_optimizer_jacobian,
+            method="trf", x_scale=optimizer_scale,
+            bounds=(optimizer_lower, optimizer_upper),
+            loss="soft_l1" if robust_loss else "linear",
+            f_scale=float(robust_scale),
+            max_nfev=min(8, max_nfev or 8), verbose=0,
+        )
+        result_vector = expand_fit_vector(result.x)
     if not result.success and result.nfev < 2:
         raise OrbitFitError(result.message)
     check_cancelled()
@@ -1700,6 +1746,145 @@ def _update_apparition_linkage_metrics(
         record["normalized_rms"] = float(np.sqrt(np.mean(np.square(normalized))))
 
 
+def _evaluate_solution_observations(
+    observations: list[Observation], solution: OrbitSolution,
+    nongravitational: dict[str, float] | None = None,
+    cancel_callback: CancelCallback | None = None,
+) -> tuple[float, float, int]:
+    """Propagate an existing solution and populate O-C without fitting it.
+
+    This deliberately read-only orbit appraisal is important for historical
+    comet recoveries.  A catalogue solution may already represent the correct
+    revolution count across several apparitions; first fitting only the newest
+    return can move it into an excellent *local* minimum which misses an old
+    sparse recovery by many arcminutes.
+    """
+    if solution.position_au is None or solution.velocity_au_per_day is None:
+        raise OrbitFitError("Chybí počáteční kartézský stav dráhy.")
+    parsed: list[tuple[Observation, datetime, float, float]] = []
+    for observation in observations:
+        if (
+            observation.excluded_from_fit or observation.ra_deg is None
+            or observation.dec_deg is None or not observation.time
+        ):
+            continue
+        try:
+            parsed.append((
+                observation, parse_observation_time(observation.time),
+                float(observation.ra_deg), float(observation.dec_deg),
+            ))
+        except (TypeError, ValueError):
+            continue
+    if not parsed:
+        raise OrbitFitError("Pro kontrolu dráhy nejsou dostupná platná měření.")
+    parsed.sort(key=lambda item: item[1])
+    if cancel_callback is not None and cancel_callback():
+        raise OrbitFitCancelled("Výpočet dráhy byl zrušen uživatelem.")
+    epochs = dynamical_jd([item[1] for item in parsed])
+    cache_start = min(float(np.min(epochs)), float(solution.epoch_jd)) - 2.0
+    cache_end = max(float(np.max(epochs)), float(solution.epoch_jd)) + 2.0
+    ephemeris = (
+        _InterpolatedPlanetEphemeris(PLANETS, cache_start, cache_end)
+        if cache_end - cache_start <= 730.0 else
+        SplinePlanetEphemeris(
+            PLANETS, _PLANET_NAMES, cache_start, cache_end,
+        )
+    )
+    force_parameters = dict(solution.nongravitational_parameters or {})
+    force_parameters.update(nongravitational or {})
+    engine = NBodyIntegrator(
+        ephemeris, relative_tolerance=3e-11, absolute_tolerance=2e-13,
+        nongravitational_parameters=force_parameters,
+    )
+    source = StateVector(
+        solution.epoch_jd, np.asarray(solution.position_au, dtype=float),
+        np.asarray(solution.velocity_au_per_day, dtype=float),
+    )
+    try:
+        received = engine.propagate(source, epochs)
+        earth = earth_heliocentric_ecliptic(epochs)
+        light_time = np.linalg.norm(received[:, :3] - earth, axis=1) / C_AU_PER_DAY
+        emitted = engine.propagate(source, epochs - light_time)
+    except (RuntimeError, ValueError, FloatingPointError, OverflowError) as exc:
+        raise OrbitFitError(
+            "Kontrolní propagace katalogové dráhy skončila numerickou chybou."
+        ) from exc
+    offsets = _observation_offsets_gcrs(parsed)
+    computed_ra, computed_dec = _equatorial_direction(
+        emitted, epochs, offsets, earth,
+    )
+    observed_ra = np.asarray([item[2] for item in parsed])
+    observed_dec = np.asarray([item[3] for item in parsed])
+    residual_ra = (observed_ra - computed_ra + 180.0) % 360.0 - 180.0
+    residual_ra *= np.cos(np.radians(observed_dec)) * 3600.0
+    residual_dec = (observed_dec - computed_dec) * 3600.0
+    normalized: list[float] = []
+    physical: list[float] = []
+    for item, delta_ra, delta_dec in zip(parsed, residual_ra, residual_dec):
+        observation = item[0]
+        observation.residual_ra_arcsec = float(delta_ra)
+        observation.residual_dec_arcsec = float(delta_dec)
+        observation.used_in_fit = False
+        sigma_ra, sigma_dec = _observation_sigma_arcsec(observation)
+        physical.extend((float(delta_ra), float(delta_dec)))
+        normalized.extend((float(delta_ra) / sigma_ra, float(delta_dec) / sigma_dec))
+    return (
+        float(np.sqrt(np.mean(np.square(physical)))),
+        float(np.sqrt(np.mean(np.square(normalized)))),
+        len(parsed),
+    )
+
+
+def _robust_apparition_appraisal(
+    observations: list[Observation],
+) -> tuple[float, float, list[Observation], list[Observation]]:
+    """Score an apparition while allowing a minority of obvious blunders."""
+    scored: list[tuple[float, Observation]] = []
+    for observation in observations:
+        if (
+            observation.excluded_from_fit
+            or observation.residual_ra_arcsec is None
+            or observation.residual_dec_arcsec is None
+        ):
+            continue
+        sigma_ra, sigma_dec = _observation_sigma_arcsec(observation)
+        score = float(np.hypot(
+            observation.residual_ra_arcsec / sigma_ra,
+            observation.residual_dec_arcsec / sigma_dec,
+        ))
+        scored.append((score, observation))
+    if not scored:
+        return np.inf, np.inf, [], []
+    scored.sort(key=lambda item: item[0])
+    # A three-plate recovery must be supported by at least two plates.  Dense
+    # returns may discard only the worst ten percent during this *appraisal*;
+    # actual fit exclusions remain explicit and auditable below.
+    retained_count = (
+        max(2, int(np.ceil(2.0 * len(scored) / 3.0)))
+        if len(scored) < 6 else
+        max(6, int(np.ceil(0.9 * len(scored))))
+    )
+    retained = [item[1] for item in scored[:retained_count]]
+    rejected = [item[1] for item in scored[retained_count:]]
+    physical: list[float] = []
+    normalized: list[float] = []
+    for observation in retained:
+        sigma_ra, sigma_dec = _observation_sigma_arcsec(observation)
+        physical.extend((
+            float(observation.residual_ra_arcsec),
+            float(observation.residual_dec_arcsec),
+        ))
+        normalized.extend((
+            float(observation.residual_ra_arcsec) / sigma_ra,
+            float(observation.residual_dec_arcsec) / sigma_dec,
+        ))
+    return (
+        float(np.sqrt(np.mean(np.square(physical)))),
+        float(np.sqrt(np.mean(np.square(normalized)))),
+        retained, rejected,
+    )
+
+
 def _attach_multi_apparition_elements(
     observations: list[Observation], solution: OrbitSolution,
 ) -> None:
@@ -1942,6 +2127,13 @@ def fit_orbit(
     apparition_groups: list[list[Observation]] = []
     apparition_linkage: list[dict[str, object]] = []
     secondary_track_exclusions = 0
+    catalogue_seed_verified = False
+    verified_catalogue_result: tuple[OrbitSolution, float, int] | None = None
+    verified_catalogue_report: list[
+        tuple[float | None, float | None, bool | None]
+    ] | None = None
+    verified_catalogue_appraisals: list[tuple[float, float]] | None = None
+    catalogue_correction_rejected = False
     if multibranch:
         initial_candidates = initial_orbit_from_observations(
             observations, return_candidates=True,
@@ -2026,7 +2218,14 @@ def fit_orbit(
         apparition_groups = (
             [
                 group for group in _observing_apparition_groups(observations, initial)
-                if len(group) >= 6
+                # Three timed sky positions are the classical minimum for an
+                # historical linkage.  They are not sufficient for a robust
+                # standalone six-parameter fit, but the common fit also has
+                # the well-observed newer apparition and can test whether the
+                # propagated branch predicts this sparse return.  Requiring
+                # six here silently discarded exactly the three 1951 plates
+                # that establish the recovery linkage of 325P/2019 F55.
+                if len(group) >= 3
             ]
             if periodic_comet else []
         )
@@ -2091,13 +2290,131 @@ def fit_orbit(
                 }
                 if "DT" in (nongravitational or {}) else nongravitational
             )
-            report_progress("Určuji lokální dráhu posledního návratu…")
-            seed = fit_once(
-                recent_apparition, initial, constraints, truncate_years,
-                None, fixed_nongravitational=seed_nongrav,
-                maximum_observations=120,
-                max_nfev=8, robust_loss=True,
-            )
+            # Sparse historical recoveries (notably the three 1951 plates of
+            # 325P) cannot define an independent six-parameter orbit.  Before
+            # altering a supplied catalogue state with a latest-return-only
+            # fit, test whether that state already propagates onto every
+            # observed apparition.  This preserves the correct revolution
+            # branch when it is already known.
+            if initial is not None and any(
+                len(group) < 6 for group in apparition_groups[:-1]
+            ):
+                try:
+                    report_progress(
+                        "Ověřuji katalogovou dráhu na všech návratech…"
+                    )
+                    preflight = _evaluate_solution_observations(
+                        observations, initial, seed_nongrav, cancel_callback,
+                    )
+                    appraisals = [
+                        _robust_apparition_appraisal(group)
+                        for group in apparition_groups
+                    ]
+                    catalogue_seed_verified = bool(appraisals) and all(
+                        appraisal[0] <= 30.0 and appraisal[1] <= 8.0
+                        for appraisal in appraisals
+                    )
+                    if catalogue_seed_verified:
+                        for group, appraisal in zip(apparition_groups, appraisals):
+                            if len(group) >= 6 or not appraisal[3]:
+                                continue
+                            retained_radial = [
+                                float(np.hypot(
+                                    item.residual_ra_arcsec or 0.0,
+                                    item.residual_dec_arcsec or 0.0,
+                                ))
+                                for item in appraisal[2]
+                            ]
+                            reference = max(3.0, float(np.median(retained_radial)))
+                            for outlier in appraisal[3]:
+                                sigma_ra, sigma_dec = _observation_sigma_arcsec(outlier)
+                                radial = float(np.hypot(
+                                    outlier.residual_ra_arcsec or 0.0,
+                                    outlier.residual_dec_arcsec or 0.0,
+                                ))
+                                normalized = float(np.hypot(
+                                    (outlier.residual_ra_arcsec or 0.0) / sigma_ra,
+                                    (outlier.residual_dec_arcsec or 0.0) / sigma_dec,
+                                ))
+                                if radial > max(30.0, 5.0 * reference) and normalized > 8.0:
+                                    outlier.excluded_from_fit = True
+                                    outlier.raw["automatic_exclusion"] = True
+                                    outlier.raw["historical_duplicate_outlier"] = True
+                                    outlier.raw["automatic_exclusion_reason"] = (
+                                        "Řídký historický návrat: údaj odporuje nejméně "
+                                        "dvěma dalším deskám na ověřené společné dráze."
+                                    )
+                        # Recompute aggregate statistics after the explicit
+                        # sparse-return rejection.  The already propagated
+                        # O-C values themselves remain valid.
+                        physical: list[float] = []
+                        normalized: list[float] = []
+                        used_count = 0
+                        for observation in observations:
+                            if (
+                                observation.excluded_from_fit
+                                or observation.residual_ra_arcsec is None
+                                or observation.residual_dec_arcsec is None
+                            ):
+                                continue
+                            used_count += 1
+                            sigma_ra, sigma_dec = _observation_sigma_arcsec(
+                                observation
+                            )
+                            physical.extend((
+                                float(observation.residual_ra_arcsec),
+                                float(observation.residual_dec_arcsec),
+                            ))
+                            normalized.extend((
+                                float(observation.residual_ra_arcsec) / sigma_ra,
+                                float(observation.residual_dec_arcsec) / sigma_dec,
+                            ))
+                            observation.used_in_fit = True
+                        verified_rms = float(np.sqrt(np.mean(np.square(physical))))
+                        verified_normalized = float(np.sqrt(
+                            np.mean(np.square(normalized))
+                        ))
+                        initial.fit_observation_count = used_count
+                        initial.fit_available_observation_count = used_count
+                        initial.fit_rms_arcsec = verified_rms
+                        initial.fit_normalized_rms = verified_normalized
+                        seed = (initial, verified_rms, used_count)
+                        verified_catalogue_result = seed
+                        verified_catalogue_report = [
+                            (
+                                observation.residual_ra_arcsec,
+                                observation.residual_dec_arcsec,
+                                observation.used_in_fit,
+                            )
+                            for observation in observations
+                        ]
+                        verified_catalogue_appraisals = [
+                            appraisal[:2]
+                            for appraisal in (
+                                _robust_apparition_appraisal(group)
+                                for group in apparition_groups
+                            )
+                        ]
+                    else:
+                        # The values belong only to this appraisal; the local
+                        # seed below must establish its own complete O-C table.
+                        for observation in observations:
+                            observation.used_in_fit = False
+                            observation.residual_ra_arcsec = None
+                            observation.residual_dec_arcsec = None
+                except (
+                    OrbitFitError, ValueError, RuntimeError,
+                    FloatingPointError, OverflowError,
+                ):
+                    catalogue_seed_verified = False
+            if not catalogue_seed_verified:
+                report_progress("Určuji lokální dráhu posledního návratu…")
+                seed = fit_once(
+                    recent_apparition, initial, constraints, truncate_years,
+                    None, fixed_nongravitational=seed_nongrav,
+                    maximum_observations=120,
+                    max_nfev=8, robust_loss=True,
+                )
             # A four-parameter comet model may need more than the quick seed
             # pass even within the modern apparition.  Only pay for a denser
             # polishing pass when the first result is visibly worse than the
@@ -2105,10 +2422,13 @@ def fit_orbit(
             # 8–18 arcsecond 1986 residuals into the historical linkage.
             seed_normalized = seed[0].fit_normalized_rms
             if (
+                not catalogue_seed_verified
+                and (
                 seed[1] > 3.0
                 or seed_normalized is None
                 or not np.isfinite(seed_normalized)
                 or seed_normalized > 3.0
+                )
             ):
                 unpolished_report = [
                     (
@@ -2154,8 +2474,9 @@ def fit_orbit(
                             observation.residual_dec_arcsec,
                             observation.used_in_fit,
                         ) = values
-            secondary_track = _coherent_secondary_track_candidates(
-                recent_apparition
+            secondary_track = (
+                [] if catalogue_seed_verified else
+                _coherent_secondary_track_candidates(recent_apparition)
             )
             if secondary_track:
                 secondary_track_exclusions = len(secondary_track)
@@ -2192,6 +2513,11 @@ def fit_orbit(
             if apparition_linkage:
                 apparition_linkage[-1]["status"] = "seed_only"
                 apparition_linkage[-1]["reason"] = (
+                    (
+                        "Publikovaná společná dráha před korekcí ověřena na všech "
+                        "návratech; čeká na závěrečný společný fit."
+                    )
+                    if catalogue_seed_verified else
                     "Výchozí samostatný fit posledního návratu; čeká na navázání starších."
                 )
                 _update_apparition_linkage_metrics(
@@ -2202,6 +2528,7 @@ def fit_orbit(
             result = fit_once(
                 observations, initial, constraints, truncate_years,
                 nongravitational, maximum_observations=120,
+                strict_polish=long_arc,
             )
     if not constraints and not nongravitational:
         result = (
@@ -2255,12 +2582,32 @@ def fit_orbit(
             # was the source of the spurious degree-sized Halley residuals.
             last_good = multi_apparition_seed
             last_good_report = seed_report
-            linked_count = 1
-            linked_parameter_names: set[str] = set()
-            for first_group in range(len(apparition_groups) - 2, -1, -1):
+            linked_count = (
+                len(apparition_groups) if catalogue_seed_verified else 1
+            )
+            linked_parameter_names: set[str] = (
+                set(fitted_nongrav(last_good[0]))
+                if catalogue_seed_verified else set()
+            )
+            if catalogue_seed_verified:
+                for group_index, group in enumerate(apparition_groups):
+                    apparition_linkage[group_index]["status"] = "linked"
+                    apparition_linkage[group_index]["reason"] = (
+                        "Publikovaná společná N-body větev byla přímo ověřena "
+                        "na astrometrii tohoto návratu před diferenciální korekcí."
+                    )
+                    _update_apparition_linkage_metrics(
+                        apparition_linkage[group_index], group,
+                    )
+            linkage_range = (
+                range(len(apparition_groups) - 2, -1, -1)
+                if not catalogue_seed_verified else range(0)
+            )
+            for first_group in linkage_range:
                 stage_groups = apparition_groups[first_group:]
                 stage_observations = _balanced_linkage_observations(stage_groups)
                 stage_count = len(apparition_groups) - first_group
+                sparse_linkage = len(apparition_groups[first_group]) < 6
                 all_parameters = fitted_nongrav(last_good[0])
                 # Two apparitions usually constrain the revolution count and
                 # osculating state much better than they constrain secular
@@ -2407,7 +2754,10 @@ def fit_orbit(
                     # the same joint correction from that second branch.  The
                     # local state is never accepted as the answer by itself:
                     # every linked return must still pass the common O-C test.
-                    if candidate is None:
+                    if (
+                        candidate is None
+                        and len(apparition_groups[first_group]) >= 6
+                    ):
                         local_force = {
                             name: value for name, value in all_parameters.items()
                             if name != "DT"
@@ -2510,6 +2860,92 @@ def fit_orbit(
                             failures.append(
                                 f"lokální astrometrická větev: {exc}"
                             )
+                    elif candidate is None:
+                        # Three historical positions can strongly confirm or
+                        # reject a propagated common solution, but they do not
+                        # warrant presenting an independently determined
+                        # six-state orbit.  Keep them solely as constraints on
+                        # the branch established by the newer apparitions.
+                        failures.append(
+                            "samostatná lokální dráha záměrně nepočítána "
+                            f"(jen {len(apparition_groups[first_group])} měření)"
+                        )
+                        # With only three historical positions the useful
+                        # information is accumulated orbital phase, not a new
+                        # six-state orbit.  Continue from the nearest failed
+                        # common branch by correcting only A1/A2 first.  This
+                        # is the classical apparition-linking strategy and is
+                        # vastly cheaper than a Cartesian-product grid of full
+                        # century-scale six-state corrections.
+                        if best_failed_trial is not None and linkage_parameters:
+                            try:
+                                report_progress(
+                                    f"Návrat {return_year}: zpřesňuji fázi "
+                                    "řídké historické aparice přes A1/A2…"
+                                )
+                                sparse_seed = best_failed_trial[1][0]
+                                sparse_parameters = {
+                                    name: value for name, value in
+                                    fitted_nongrav(sparse_seed).items()
+                                    if name in linkage_parameters
+                                }
+                                sparse_prefit = fit_once(
+                                    stage_observations, sparse_seed,
+                                    constraints, truncate_years,
+                                    sparse_parameters,
+                                    maximum_observations=None,
+                                    max_nfev=36, robust_loss=True,
+                                    robust_scale=25.0, screening=True,
+                                    fit_state=False,
+                                )
+                                sparse_parameters = {
+                                    name: value for name, value in
+                                    fitted_nongrav(sparse_prefit[0]).items()
+                                    if name in linkage_parameters
+                                }
+                                sparse_trial = fit_once(
+                                    stage_observations, sparse_prefit[0],
+                                    constraints, truncate_years,
+                                    sparse_parameters,
+                                    maximum_observations=None,
+                                    max_nfev=12, robust_loss=True,
+                                    robust_scale=8.0, screening=True,
+                                )
+                                sparse_normalized = (
+                                    sparse_trial[0].fit_normalized_rms
+                                )
+                                if (
+                                    np.isfinite(sparse_trial[1])
+                                    and sparse_trial[1] <= 60.0
+                                    and sparse_normalized is not None
+                                    and np.isfinite(sparse_normalized)
+                                    and sparse_normalized <= 8.0
+                                ):
+                                    candidate = sparse_trial
+                                    candidate_source = "sparse_phase"
+                                    linked_parameter_names.update(
+                                        sparse_parameters
+                                    )
+                                else:
+                                    remember_failed_trial(sparse_trial)
+                                    failures.append(
+                                        "fázová korekce řídké aparice: RMS "
+                                        f"{sparse_trial[1]:.2f}″; "
+                                        f"{sparse_normalized:.2f}σ"
+                                    )
+                            except (
+                                OrbitFitError, ValueError, RuntimeError,
+                                FloatingPointError,
+                            ) as exc:
+                                failures.append(
+                                    f"fázová korekce řídké aparice: {exc}"
+                                )
+                        if candidate is None:
+                            detail = "; ".join(failures[-3:])
+                            raise OrbitFitError(
+                                "Řídký historický návrat nepotvrdila přímá "
+                                f"ani fázová společná korekce ({detail})."
+                            )
                     # The catalogue/MPC state is not accepted as evidence by
                     # itself, but it is a valuable third initial basin for a
                     # known periodic comet.  In particular it can preserve the
@@ -2553,8 +2989,9 @@ def fit_orbit(
                                 maximum_observations=min(
                                     320, 80 * stage_count
                                 ),
-                                max_nfev=28, robust_loss=True,
-                                robust_scale=12.0, screening=False,
+                                max_nfev=10 if sparse_linkage else 28,
+                                robust_loss=True, robust_scale=12.0,
+                                screening=sparse_linkage,
                             )
                             catalogue_fixed_normalized = (
                                 catalogue_fixed_trial[0].fit_normalized_rms
@@ -2585,8 +3022,9 @@ def fit_orbit(
                                     maximum_observations=min(
                                         320, 80 * stage_count
                                     ),
-                                    max_nfev=28, robust_loss=True,
-                                    robust_scale=8.0, screening=False,
+                                    max_nfev=10 if sparse_linkage else 28,
+                                    robust_loss=True, robust_scale=8.0,
+                                    screening=sparse_linkage,
                                 )
                             else:
                                 catalogue_prefit = fit_once(
@@ -2595,7 +3033,8 @@ def fit_orbit(
                                     maximum_observations=min(
                                         240, 60 * stage_count
                                     ),
-                                    max_nfev=12, robust_loss=True,
+                                    max_nfev=6 if sparse_linkage else 12,
+                                    robust_loss=True,
                                     robust_scale=25.0, screening=True,
                                     fit_state=False,
                                 )
@@ -2606,8 +3045,9 @@ def fit_orbit(
                                     maximum_observations=min(
                                         320, 80 * stage_count
                                     ),
-                                    max_nfev=28, robust_loss=True,
-                                    robust_scale=8.0, screening=False,
+                                    max_nfev=10 if sparse_linkage else 28,
+                                    robust_loss=True, robust_scale=8.0,
+                                    screening=sparse_linkage,
                                 )
                             catalogue_normalized = (
                                 catalogue_trial[0].fit_normalized_rms
@@ -2688,7 +3128,8 @@ def fit_orbit(
                                     maximum_observations=min(
                                         240, 60 * stage_count
                                     ),
-                                    max_nfev=16, robust_loss=True,
+                                    max_nfev=6 if sparse_linkage else 16,
+                                    robust_loss=True,
                                     robust_scale=15.0, screening=True,
                                 )
                                 grid_normalized = (
@@ -2715,7 +3156,8 @@ def fit_orbit(
                                 maximum_observations=min(
                                     400, 100 * stage_count
                                 ),
-                                max_nfev=48, robust_loss=True,
+                                max_nfev=16 if sparse_linkage else 48,
+                                robust_loss=True,
                                 robust_scale=6.0, screening=False,
                             )
                             grid_normalized = (
@@ -3078,6 +3520,10 @@ def fit_orbit(
                         "Společný N-body fit byl nalezen postupným rozšířením "
                         "pozorovacího oblouku do starší aparice."
                         if candidate_source == "arc_extension" else
+                        "Společný N-body fit řídkého historického návratu byl "
+                        "nalezen korekcí nahromaděné fáze přes A1/A2 a následně "
+                        "potvrzen jeho astrometrií."
+                        if candidate_source == "sparse_phase" else
                         "Společný N-body fit s ostatními označenými návraty."
                     )
                     _update_apparition_linkage_metrics(
@@ -3106,7 +3552,10 @@ def fit_orbit(
                 }
                 balanced_final = _balanced_linkage_observations(apparition_groups)
                 exact_seed = last_good[0]
-                if len(balanced_final) < sum(map(len, apparition_groups)):
+                if (
+                    not catalogue_seed_verified
+                    and len(balanced_final) < sum(map(len, apparition_groups))
+                ):
                     report_progress(
                         "Vyvažuji astrometrii jednotlivých návratů před "
                         "závěrečnou korekcí…"
@@ -3118,12 +3567,66 @@ def fit_orbit(
                         max_nfev=28, robust_loss=True, robust_scale=8.0,
                     )
                     exact_seed = bridge[0]
+                apparition_weights = None
+                if catalogue_seed_verified:
+                    enabled_group_sizes = [
+                        sum(not item.excluded_from_fit for item in group)
+                        for group in apparition_groups
+                    ]
+                    largest_group = max(enabled_group_sizes, default=1)
+                    apparition_weights = {
+                        id(observation): largest_group / max(1, group_size)
+                        for group, group_size in zip(
+                            apparition_groups, enabled_group_sizes,
+                        )
+                        for observation in group
+                        if not observation.excluded_from_fit
+                    }
                 result = fit_once(
                     observations, exact_seed, constraints, truncate_years,
                     exact_linkage_parameters,
                     maximum_observations=None,
-                    max_nfev=14, robust_loss=True, robust_scale=8.0,
+                    max_nfev=8 if catalogue_seed_verified else 14,
+                    robust_loss=True, robust_scale=8.0,
+                    strict_polish=True,
+                    observation_weights=apparition_weights,
                 )
+                if (
+                    catalogue_seed_verified
+                    and verified_catalogue_result is not None
+                    and verified_catalogue_report is not None
+                    and verified_catalogue_appraisals is not None
+                ):
+                    corrected_appraisals = [
+                        _robust_apparition_appraisal(group)[:2]
+                        for group in apparition_groups
+                    ]
+                    materially_worse = any(
+                        corrected_rms > max(baseline_rms + 1.0, baseline_rms * 1.5)
+                        or corrected_normalized > max(
+                            baseline_normalized + 1.0,
+                            baseline_normalized * 1.5,
+                        )
+                        for (
+                            corrected_rms, corrected_normalized,
+                        ), (
+                            baseline_rms, baseline_normalized,
+                        ) in zip(
+                            corrected_appraisals,
+                            verified_catalogue_appraisals,
+                        )
+                    )
+                    if materially_worse:
+                        catalogue_correction_rejected = True
+                        result = verified_catalogue_result
+                        for observation, values in zip(
+                            observations, verified_catalogue_report,
+                        ):
+                            (
+                                observation.residual_ra_arcsec,
+                                observation.residual_dec_arcsec,
+                                observation.used_in_fit,
+                            ) = values
                 failed = failed_apparitions()
                 requested_parameters = fitted_nongrav(result[0])
                 extra_names = set(requested_parameters) - set(exact_linkage_parameters)
@@ -3185,6 +3688,14 @@ def fit_orbit(
                     for record in apparition_linkage:
                         record["status"] = "linked"
                     result[0].fit_model_note = (
+                        (
+                            f"Publikovaná N-body větev přímo propojila všech "
+                            f"{len(apparition_groups)} pozorovaných návratů. "
+                            "Následná diferenciální korekce byla odmítnuta, "
+                            "protože zhoršila alespoň jednu již ověřenou "
+                            "aparici; zachována je lépe sedící ověřená větev."
+                        )
+                        if catalogue_correction_rejected else
                         f"Společný N-body fit propojil všech "
                         f"{len(apparition_groups)} pozorovaných návratů postupnou "
                         "vyváženou apariční předkorekcí a závěrečným přesným "
@@ -3197,6 +3708,7 @@ def fit_orbit(
                 fitted_nongrav(result[0]),
                 maximum_observations=None,
                 max_nfev=8 if long_arc else 12, robust_loss=True,
+                strict_polish=long_arc,
             )
     elif not multibranch and not constraints and short_arc and active_count > 120:
         # A representative subset is a fast seed, not a sufficient final
