@@ -2845,7 +2845,14 @@ def fit_orbit(
                     recent_apparition, initial, constraints, truncate_years,
                     None, fixed_nongravitational=seed_nongrav,
                     maximum_observations=120,
-                    max_nfev=8, robust_loss=True,
+                    # A present-day catalogue state can miss a pre-encounter
+                    # apparition by several arcminutes when propagated back
+                    # through a close planetary encounter (206P/Jupiter 2017).
+                    # A narrow robust loss would classify that coherent shift
+                    # as outliers and suppress the very gradient needed to
+                    # capture the local 2008 branch.  Use a wide capture pass;
+                    # the following pass restores normal robust weighting.
+                    max_nfev=24, robust_loss=True, robust_scale=100.0,
                 )
             # A four-parameter comet model may need more than the quick seed
             # pass even within the modern apparition.  Only pay for a denser
@@ -2884,7 +2891,7 @@ def fit_orbit(
                         recent_apparition, seed[0], constraints, truncate_years,
                         None, fixed_nongravitational=polished_nongrav,
                         maximum_observations=240,
-                        max_nfev=12, robust_loss=True,
+                        max_nfev=24, robust_loss=True, robust_scale=8.0,
                     )
                     if polished[1] < seed[1]:
                         seed = polished
@@ -2906,6 +2913,56 @@ def fit_orbit(
                             observation.residual_dec_arcsec,
                             observation.used_in_fit,
                         ) = values
+            if not _linkage_trial_is_acceptable(seed):
+                # The current catalogue epoch can lie beyond a strong
+                # encounter, so even a wider differential capture may remain
+                # in the wrong pre-encounter basin.  Determine the modern
+                # apparition independently from its own angles before trying
+                # to identify it with the historical return.
+                try:
+                    report_progress(
+                        "Hledám nezávislé větve posledního návratu…"
+                    )
+                    local_rows = _normal_place_observations(recent_apparition)
+                    preliminary = initial_orbit_from_observations(
+                        local_rows, return_candidates=True,
+                    )
+                    assert isinstance(preliminary, list)
+                    local_trials: list[tuple[OrbitSolution, float, int]] = []
+                    for local_initial in preliminary[:8]:
+                        try:
+                            local_trial = fit_once(
+                                recent_apparition, local_initial, constraints,
+                                truncate_years, None,
+                                fixed_nongravitational=seed_nongrav,
+                                maximum_observations=120, max_nfev=32,
+                                robust_loss=True, robust_scale=100.0,
+                            )
+                            if np.isfinite(local_trial[1]):
+                                local_trials.append(local_trial)
+                        except (
+                            OrbitFitError, ValueError, RuntimeError,
+                            FloatingPointError,
+                        ):
+                            continue
+                    if local_trials:
+                        local_seed = min(
+                            local_trials,
+                            key=lambda item: (
+                                item[0].fit_normalized_rms
+                                if item[0].fit_normalized_rms is not None
+                                and np.isfinite(item[0].fit_normalized_rms)
+                                else np.inf,
+                                item[1],
+                            ),
+                        )
+                        if local_seed[1] < seed[1]:
+                            seed = local_seed
+                except (
+                    OrbitFitError, ValueError, RuntimeError,
+                    FloatingPointError,
+                ):
+                    pass
             secondary_track = (
                 [] if catalogue_seed_verified else
                 _coherent_secondary_track_candidates(recent_apparition)

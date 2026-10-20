@@ -940,8 +940,10 @@ class OrbitFitSelectionTests(unittest.TestCase):
             fit_normalized_rms=.8,
         )
         calls = []
+        fit_options = []
 
         def fake_fit(*args, **kwargs):
+            fit_options.append(dict(kwargs))
             calls.append((
                 dict(args[4] or {}),
                 dict(kwargs.get("fixed_nongravitational") or {}),
@@ -957,8 +959,59 @@ class OrbitFitSelectionTests(unittest.TestCase):
         ):
             fit_orbit(observations, solution, nongravitational={"A1": 0.0, "DT": 30.0})
         self.assertEqual(calls[0], ({}, {"A1": 0.0}, True))
+        self.assertEqual(fit_options[0]["max_nfev"], 24)
+        self.assertEqual(fit_options[0]["robust_scale"], 100.0)
         self.assertEqual(calls[1], ({}, {"A1": 2e-8, "DT": 30.0}, True))
         self.assertTrue(calls[-1][2])
+
+    def test_bad_post_encounter_seed_restarts_from_modern_astrometry(self):
+        observations = [
+            Observation(
+                time=f"{year}-10-{day:02d}T00:00:00Z",
+                ra_deg=10.0 + .01 * day, dec_deg=20.0,
+            )
+            for year in (1892, 2008)
+            for day in range(1, 7)
+        ]
+        catalogue = OrbitSolution(
+            "206P", 2461000.5, 3.49, .55, 33.6, 202.3, 189.5, 260.0,
+            position_au=(-2.3, -3.6, 1.6),
+            velocity_au_per_day=(.0064, .0005, .0013),
+            fit_normalized_rms=200.0,
+        )
+        bad = replace(catalogue)
+        bad.fit_normalized_rms = 200.0
+        independent = replace(catalogue, epoch_jd=2454750.5)
+        independent.fit_normalized_rms = 1.0
+
+        preliminary_calls = []
+
+        def fake_preliminary(rows, **kwargs):
+            preliminary_calls.append((list(rows), dict(kwargs)))
+            return [independent]
+
+        def fake_fit(rows, initial, *_args, **_kwargs):
+            if initial is catalogue or initial is bad:
+                return bad, 300.0, len(rows)
+            independent.fit_normalized_rms = 1.0
+            return independent, 1.0, len(rows)
+
+        with (
+            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit),
+            patch(
+                "orbit_app.orbit_fit.initial_orbit_from_observations",
+                side_effect=fake_preliminary,
+            ),
+            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
+        ):
+            result = fit_orbit(
+                observations, catalogue,
+                nongravitational={"A1": 1.01e-8, "A2": .06684e-8},
+            )
+        self.assertTrue(preliminary_calls)
+        self.assertTrue(preliminary_calls[0][1]["return_candidates"])
+        self.assertTrue(all(row.time.startswith("2008") for row in preliminary_calls[0][0]))
+        self.assertIs(result[0], independent)
 
     def test_three_comet_returns_are_linked_progressively(self):
         observations = [
@@ -1107,7 +1160,7 @@ class OrbitFitSelectionTests(unittest.TestCase):
             result = fit_orbit(
                 observations, good, nongravitational={"A1": 0.0},
             )
-        self.assertEqual(calls[:3], [8, 6, 24])
+        self.assertEqual(calls[:3], [24, 6, 24])
         self.assertEqual(
             [item["status"] for item in result[0].apparition_linkage or ()],
             ["linked", "linked"],
