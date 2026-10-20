@@ -191,6 +191,7 @@ DEFAULT_PERTURBERS = (
     Perturber("saturn", MU_SUN * 2.858856e-4),
     Perturber("uranus", MU_SUN * 4.366244e-5),
     Perturber("neptune", MU_SUN * 5.151389e-5),
+    Perturber("pluto", MU_SUN * 7.350478973e-9),
 )
 
 
@@ -247,6 +248,200 @@ class NBodyIntegrator:
                 position, velocity, self.nongravitational_parameters
             )
         return acceleration
+
+    def _acceleration_partials(
+        self, jd: float, position: np.ndarray, velocity: np.ndarray,
+        parameter_names: tuple[str, ...], parameter_scales: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return da/dr, da/dv and da/dp for variational integration.
+
+        Position and velocity derivatives use analytic Newtonian gravity.
+        Only the much smaller relativistic and non-gravitational terms are
+        differenced locally, so deriving a century-long trajectory does not
+        require a separate complete integration for every fitted parameter.
+        ``parameter_scales`` maps optimizer units to the physical units used
+        by the force model (AU/day² for A1--A3 and days for DT).
+        """
+        identity = np.eye(3)
+        radius = float(np.linalg.norm(position))
+        position_jacobian = MU_SUN * (
+            3.0 * np.outer(position, position) / radius**5
+            - identity / radius**3
+        )
+        names = tuple(body.name for body in self.perturbers)
+        batch_method = getattr(self.ephemeris, "positions", None)
+        if callable(batch_method):
+            planet_positions = batch_method(names, jd)
+        else:
+            planet_positions = tuple(
+                self.ephemeris.position(name, jd) for name in names
+            )
+        for body, planet_value in zip(self.perturbers, planet_positions):
+            relative = np.asarray(planet_value, dtype=float) - position
+            distance = float(np.linalg.norm(relative))
+            if distance == 0.0:
+                continue
+            position_jacobian += body.mu_au3_day2 * (
+                3.0 * np.outer(relative, relative) / distance**5
+                - identity / distance**3
+            )
+
+        def extra(pos: np.ndarray, vel: np.ndarray) -> np.ndarray:
+            value = np.zeros(3, dtype=float)
+            if self.include_solar_relativity:
+                value += solar_post_newtonian_acceleration(pos, vel)
+            value += nongravitational_acceleration(
+                pos, vel, self.nongravitational_parameters,
+            )
+            return value
+
+        velocity_jacobian = np.zeros((3, 3), dtype=float)
+        for column in range(3):
+            position_step = max(1e-8, abs(float(position[column])) * 1e-7)
+            plus = position.copy()
+            minus = position.copy()
+            plus[column] += position_step
+            minus[column] -= position_step
+            position_jacobian[:, column] += (
+                extra(plus, velocity) - extra(minus, velocity)
+            ) / (2.0 * position_step)
+
+            velocity_step = max(1e-10, abs(float(velocity[column])) * 1e-7)
+            plus_velocity = velocity.copy()
+            minus_velocity = velocity.copy()
+            plus_velocity[column] += velocity_step
+            minus_velocity[column] -= velocity_step
+            velocity_jacobian[:, column] = (
+                extra(position, plus_velocity) - extra(position, minus_velocity)
+            ) / (2.0 * velocity_step)
+
+        parameter_jacobian = np.zeros((3, len(parameter_names)), dtype=float)
+        for column, (name, scale) in enumerate(zip(parameter_names, parameter_scales)):
+            physical_value = float(self.nongravitational_parameters.get(name, 0.0))
+            physical_step = (
+                max(1e-10, abs(physical_value) * 1e-4)
+                if name != "DT" else max(.01, abs(physical_value) * 1e-5)
+            )
+            plus_parameters = dict(self.nongravitational_parameters)
+            minus_parameters = dict(self.nongravitational_parameters)
+            plus_parameters[name] = physical_value + physical_step
+            minus_parameters[name] = physical_value - physical_step
+            plus = nongravitational_acceleration(
+                position, velocity, plus_parameters,
+            )
+            minus = nongravitational_acceleration(
+                position, velocity, minus_parameters,
+            )
+            parameter_jacobian[:, column] = (
+                (plus - minus) / (2.0 * physical_step) * float(scale)
+            )
+        return position_jacobian, velocity_jacobian, parameter_jacobian
+
+    def propagate_with_partials(
+        self, initial: StateVector, epochs_jd: np.ndarray,
+        parameter_names: tuple[str, ...] = (),
+        parameter_scales: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Propagate states and derivatives with respect to state/force parameters.
+
+        The returned partial array has shape ``(N, 6, 6 + P)``.  Its first
+        six columns are the state-transition matrix from ``initial``; the
+        remaining columns refer to ``parameter_names`` in optimizer units.
+        """
+        epochs = np.asarray(epochs_jd, dtype=float)
+        if epochs.ndim != 1 or epochs.size == 0 or not np.all(np.isfinite(epochs)):
+            raise ValueError("Je potřeba alespoň jeden konečný výstupní čas.")
+        scales = np.asarray(
+            np.ones(len(parameter_names)) if parameter_scales is None
+            else parameter_scales,
+            dtype=float,
+        )
+        if scales.shape != (len(parameter_names),) or not np.all(np.isfinite(scales)):
+            raise ValueError("Měřítka variačních parametrů mají chybný rozměr.")
+
+        order = np.argsort(epochs, kind="stable")
+        sorted_epochs = epochs[order]
+        unique_epochs, inverse = np.unique(sorted_epochs, return_inverse=True)
+        if unique_epochs.size != epochs.size or not np.array_equal(
+            order, np.arange(epochs.size)
+        ):
+            unique_states, unique_partials = self.propagate_with_partials(
+                initial, unique_epochs, parameter_names, scales,
+            )
+            states = np.empty((epochs.size, 6), dtype=float)
+            partials = np.empty((epochs.size, 6, 6 + len(parameter_names)), dtype=float)
+            states[order] = unique_states[inverse]
+            partials[order] = unique_partials[inverse]
+            return states, partials
+
+        parameter_count = len(parameter_names)
+        initial_partials = np.column_stack((
+            np.eye(6), np.zeros((6, parameter_count), dtype=float),
+        ))
+        augmented_initial = np.concatenate((
+            initial.packed(), initial_partials.ravel(),
+        ))
+
+        def derivative(offset_days: float, augmented: np.ndarray) -> np.ndarray:
+            state = augmented[:6]
+            position = state[:3]
+            velocity = state[3:]
+            partials = augmented[6:].reshape(6, 6 + parameter_count)
+            acceleration = self.acceleration(
+                initial.epoch_jd + offset_days, position, velocity,
+            )
+            da_dr, da_dv, da_dp = self._acceleration_partials(
+                initial.epoch_jd + offset_days, position, velocity,
+                parameter_names, scales,
+            )
+            dynamics = np.block([
+                [np.zeros((3, 3)), np.eye(3)],
+                [da_dr, da_dv],
+            ])
+            forcing = np.zeros((6, parameter_count), dtype=float)
+            forcing[3:, :] = da_dp
+            partial_derivative = dynamics @ partials
+            partial_derivative[:, 6:] += forcing
+            return np.concatenate((
+                velocity, acceleration,
+                partial_derivative.ravel(),
+            ))
+
+        offsets = unique_epochs - initial.epoch_jd
+        output = np.empty((len(offsets), augmented_initial.size), dtype=float)
+        if np.all(offsets == 0.0):
+            output[:] = augmented_initial
+        else:
+            start = min(0.0, float(offsets[0]))
+            stop = max(0.0, float(offsets[-1]))
+            negative = np.flatnonzero(offsets < 0.0)
+            nonnegative = np.flatnonzero(offsets >= 0.0)
+            if negative.size:
+                evaluation = offsets[negative][::-1]
+                result = solve_ivp(
+                    derivative, (0.0, start), augmented_initial,
+                    method="DOP853", t_eval=evaluation,
+                    rtol=self.rtol, atol=self.atol,
+                )
+                if not result.success:
+                    raise RuntimeError(result.message)
+                output[negative] = result.y.T[::-1]
+            if nonnegative.size:
+                evaluation = offsets[nonnegative]
+                if stop == 0.0:
+                    output[nonnegative] = augmented_initial
+                else:
+                    result = solve_ivp(
+                        derivative, (0.0, stop), augmented_initial,
+                        method="DOP853", t_eval=evaluation,
+                        rtol=self.rtol, atol=self.atol,
+                    )
+                    if not result.success:
+                        raise RuntimeError(result.message)
+                    output[nonnegative] = result.y.T
+        return output[:, :6], output[:, 6:].reshape(
+            len(offsets), 6, 6 + parameter_count,
+        )
 
     def propagate(self, initial: StateVector, epochs_jd: np.ndarray) -> np.ndarray:
         epochs = np.asarray(epochs_jd, dtype=float)

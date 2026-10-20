@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
@@ -24,7 +25,7 @@ LINKAGE_ACCEPT_NORMALIZED_RMS = 8.0
 LINKAGE_DIVERGENCE_RMS_ARCSEC = 200.0
 _PLANET_NAMES = (
     "mercury", "venus", "earth", "moon", "mars",
-    "jupiter", "saturn", "uranus", "neptune",
+    "jupiter", "saturn", "uranus", "neptune", "pluto",
 )
 
 
@@ -598,6 +599,7 @@ def _balanced_linkage_observations(
     populated = [group for group in populated if group]
     if not populated:
         return []
+    populated = [_normal_place_observations(group) for group in populated]
     sizes = [len(group) for group in populated]
     if max(sizes) <= 2 * min(sizes) and max(sizes) <= maximum_per_group:
         return [observation for group in populated for observation in group]
@@ -650,6 +652,106 @@ def _balanced_linkage_observations(
             balanced.extend(bucket[index] for index in np.unique(indices))
     balanced.sort(key=lambda observation: parse_observation_time(observation.time))
     return balanced
+
+
+def _normal_place_observations(
+    observations: list[Observation], maximum_independent_per_night: int = 4,
+) -> list[Observation]:
+    """Build deterministic station-night normal places for branch finding.
+
+    A dense CCD batch is not a collection of fully independent directions:
+    catalogue and reduction errors are shared by the whole station-night.
+    Batches up to ``maximum_independent_per_night`` are therefore retained
+    unchanged, while larger batches are represented by a spherical mean with
+    an uncertainty that gains at most that many independent measurements.
+    The original observations remain untouched and are used by the final fit.
+    """
+    passthrough: list[Observation] = []
+    buckets: dict[tuple[str, object], list[Observation]] = {}
+    for observation in observations:
+        if observation.excluded_from_fit or not observation.time:
+            continue
+        try:
+            instant = parse_observation_time(observation.time)
+        except ValueError:
+            continue
+        if observation.ra_deg is None or observation.dec_deg is None:
+            passthrough.append(observation)
+            continue
+        key = (
+            (observation.station or "").strip().upper(),
+            (instant - timedelta(hours=12)).date(),
+        )
+        buckets.setdefault(key, []).append(observation)
+
+    output: list[Observation] = list(passthrough)
+    for bucket in buckets.values():
+        chronological = sorted(bucket, key=lambda item: parse_observation_time(item.time))
+        if len(chronological) <= maximum_independent_per_night:
+            output.extend(chronological)
+            continue
+
+        instants = [parse_observation_time(item.time) for item in chronological]
+        epochs = np.asarray([instant.timestamp() for instant in instants], dtype=float)
+        ras = np.radians([float(item.ra_deg) for item in chronological])
+        decs = np.radians([float(item.dec_deg) for item in chronological])
+        directions = np.column_stack((
+            np.cos(decs) * np.cos(ras),
+            np.cos(decs) * np.sin(ras),
+            np.sin(decs),
+        ))
+        mean_direction = np.mean(directions, axis=0)
+        norm = float(np.linalg.norm(mean_direction))
+        if not np.isfinite(norm) or norm <= 0.0:
+            output.extend(chronological)
+            continue
+        mean_direction /= norm
+        mean_ra = float(np.degrees(np.arctan2(
+            mean_direction[1], mean_direction[0],
+        )) % 360.0)
+        mean_dec = float(np.degrees(np.arcsin(np.clip(mean_direction[2], -1.0, 1.0))))
+        mean_timestamp = float(np.mean(epochs))
+        mean_time = datetime.fromtimestamp(
+            mean_timestamp, tz=instants[0].tzinfo,
+        ).isoformat().replace("+00:00", "Z")
+
+        sigma_pairs = np.asarray([
+            _observation_sigma_arcsec(item) for item in chronological
+        ], dtype=float)
+        effective_count = min(len(chronological), maximum_independent_per_night)
+        # The formal mean may improve as sqrt(N), but never below the actual
+        # within-night scatter or an epoch-appropriate systematic floor.
+        delta_ra = (
+            (np.degrees(ras) - mean_ra + 180.0) % 360.0 - 180.0
+        ) * np.cos(np.radians(mean_dec)) * 3600.0
+        delta_dec = (np.degrees(decs) - mean_dec) * 3600.0
+        nominal = np.sqrt(np.mean(np.square(sigma_pairs), axis=0)) / np.sqrt(
+            effective_count
+        )
+        scatter = np.asarray((
+            np.std(delta_ra, ddof=1), np.std(delta_dec, ddof=1),
+        )) / np.sqrt(effective_count)
+        sigma = np.maximum(nominal, scatter)
+        template = chronological[len(chronological) // 2]
+        raw = dict(template.raw)
+        raw.update({
+            "rmsRA": float(sigma[0]),
+            "rmsDec": float(sigma[1]),
+            "normalPlaceCount": len(chronological),
+        })
+        output.append(Observation(
+            designation=template.designation,
+            time=mean_time,
+            ra_deg=mean_ra,
+            dec_deg=mean_dec,
+            magnitude=template.magnitude,
+            band=template.band,
+            station=template.station,
+            catalog=template.catalog,
+            raw=raw,
+        ))
+    output.sort(key=lambda item: parse_observation_time(item.time))
+    return output
 
 
 def initial_orbit_from_observations(
@@ -1244,6 +1346,107 @@ def _fit_orbit_once(
         delta_dec = computed_dec - observed_dec
         return np.column_stack((delta_ra, delta_dec)).ravel() * 3600.0
 
+    def variational_residuals_and_jacobian(
+        vector: np.ndarray, engine: NBodyIntegrator,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Evaluate normalized residuals and one-pass variational derivatives."""
+        parameters = force_parameters(vector)
+        working_engine = engine
+        if parameters != engine.nongravitational_parameters:
+            working_engine = NBodyIntegrator(
+                engine.ephemeris, perturbers=engine.perturbers,
+                relative_tolerance=engine.rtol, absolute_tolerance=engine.atol,
+                nongravitational_parameters=parameters,
+                include_solar_relativity=engine.include_solar_relativity,
+            )
+        state = StateVector(reference_epoch, vector[:3], vector[3:6])
+        parameter_scales = np.asarray([
+            1.0 if name == "DT" else 1e-8 for name in nongrav_names
+        ])
+        propagated, state_partials = working_engine.propagate_with_partials(
+            state, epochs, nongrav_names, parameter_scales,
+        )
+
+        def projected(states: np.ndarray) -> np.ndarray:
+            emitted, _light_time = _local_light_time_states(
+                states, earth_at_observations,
+            )
+            computed_ra, computed_dec = _equatorial_direction(
+                emitted, epochs, observer_offsets, earth_at_observations,
+            )
+            delta_ra = (computed_ra - observed_ra + 180.0) % 360.0 - 180.0
+            delta_ra *= np.cos(np.radians(observed_dec))
+            return np.column_stack((
+                delta_ra, computed_dec - observed_dec,
+            )).ravel() * 3600.0
+
+        astrometry = projected(propagated)
+        column_steps = np.concatenate((
+            np.array([1e-6, 1e-6, 1e-6, 1e-8, 1e-8, 1e-8]),
+            np.array([.05 if name == "DT" else 5e-3 for name in nongrav_names]),
+        ))
+        astrometric_jacobian = np.empty(
+            (astrometry.size, 6 + len(nongrav_names)), dtype=float,
+        )
+        # Only the cheap sky projection is differenced here.  All expensive
+        # dynamical derivatives came from the same augmented integration.
+        for column, nominal_step in enumerate(column_steps):
+            # Over several revolutions a unit velocity or A correction can
+            # move the remote apparition by AU.  Size the cheap projection
+            # perturbation from the propagated partial so it remains local
+            # (roughly a few arcseconds at one AU) without reintegrating.
+            position_sensitivity = float(np.max(np.linalg.norm(
+                state_partials[:, :3, column], axis=1,
+            )))
+            step = float(nominal_step)
+            if np.isfinite(position_sensitivity) and position_sensitivity > 0.0:
+                step = min(step, 1e-5 / position_sensitivity)
+            step = max(step, 1e-12)
+            displacement = state_partials[:, :, column] * step
+            astrometric_jacobian[:, column] = (
+                projected(propagated + displacement)
+                - projected(propagated - displacement)
+            ) / (2.0 * step)
+
+        residual_values = astrometry / astrometric_sigmas
+        jacobian_values = astrometric_jacobian / astrometric_sigmas[:, None]
+        if constraints:
+            names = ("a", "e", "i", "node", "arg_peri", "mean_anomaly")
+
+            def constraint_values(candidate: np.ndarray) -> np.ndarray:
+                try:
+                    elements = cartesian_to_elements(candidate[:3], candidate[3:6])
+                except Exception:
+                    return np.full(len(constraints), 1e9)
+                penalties = []
+                for name, target in constraints.items():
+                    actual = elements[names.index(name)]
+                    if name in ("i", "node", "arg_peri", "mean_anomaly"):
+                        difference = (actual - target + 180.0) % 360.0 - 180.0
+                        penalties.append(difference * 1e5)
+                    elif name == "e":
+                        penalties.append((actual - target) * 1e7)
+                    else:
+                        penalties.append((actual - target) * 1e6)
+                return np.asarray(penalties, dtype=float)
+
+            penalties = constraint_values(vector)
+            penalty_jacobian = np.zeros(
+                (len(penalties), 6 + len(nongrav_names)), dtype=float,
+            )
+            for column in range(6):
+                step = column_steps[column]
+                plus = vector.copy()
+                minus = vector.copy()
+                plus[column] += step
+                minus[column] -= step
+                penalty_jacobian[:, column] = (
+                    constraint_values(plus) - constraint_values(minus)
+                ) / (2.0 * step)
+            residual_values = np.append(residual_values, penalties)
+            jacobian_values = np.vstack((jacobian_values, penalty_jacobian))
+        return residual_values, jacobian_values
+
     def residuals_with_engine(
         vector: np.ndarray, engine: NBodyIntegrator,
     ) -> np.ndarray:
@@ -1318,10 +1521,48 @@ def _fit_orbit_once(
         full_derivative_steps if fit_state else full_derivative_steps[6:]
     ).copy()
 
+    use_variational_jacobian = arc_days > 365.25
+    variational_cache: dict[str, np.ndarray | None] = {
+        "vector": None, "residual": None, "jacobian": None,
+    }
+
+    def variational_evaluation(
+        vector: np.ndarray, engine: NBodyIntegrator = optimizer_engine,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        cached_vector = variational_cache["vector"]
+        if (
+            engine is optimizer_engine and cached_vector is not None
+            and np.array_equal(np.asarray(cached_vector), vector)
+        ):
+            return (
+                np.asarray(variational_cache["residual"]),
+                np.asarray(variational_cache["jacobian"]),
+            )
+        full_residual, full_jacobian = variational_residuals_and_jacobian(
+            expand_fit_vector(vector), engine,
+        )
+        selected_jacobian = full_jacobian if fit_state else full_jacobian[:, 6:]
+        if engine is optimizer_engine:
+            variational_cache["vector"] = vector.copy()
+            variational_cache["residual"] = full_residual
+            variational_cache["jacobian"] = selected_jacobian
+        return full_residual, selected_jacobian
+
     def optimizer_residuals(vector: np.ndarray) -> np.ndarray:
+        if use_variational_jacobian:
+            check_cancelled()
+            try:
+                return variational_evaluation(vector)[0]
+            except (RuntimeError, ValueError, FloatingPointError, OverflowError):
+                return np.full(
+                    observed_ra.size * 2 + len(constraints or {}),
+                    1e12, dtype=float,
+                )
         return residuals(expand_fit_vector(vector))
 
     def optimizer_jacobian(vector: np.ndarray) -> np.ndarray:
+        if use_variational_jacobian:
+            return variational_evaluation(vector)[1]
         return _adaptive_finite_difference_jacobian(
             optimizer_residuals, vector, derivative_steps,
             optimizer_lower, optimizer_upper, observed_ra.size * 2,
@@ -2266,36 +2507,210 @@ def fit_orbit(
         if (
             multi_apparition and not nongravitational
         ):
-            # A single gravity-only correction cannot faithfully join active
-            # comet apparitions separated by decades: it otherwise invents a
-            # compromise state with huge systematic O-C values. Fit the latest
-            # apparition and use planetary integration only to predict the
-            # other returns. Enabling A1/A2/A3 below opts into a genuinely
-            # linked multi-apparition solution.
-            for observation in observations:
-                observation.used_in_fit = False
-                observation.residual_ra_arcsec = None
-                observation.residual_dec_arcsec = None
-            report_progress("Fituji poslední pozorovaný návrat…", 3)
-            result = fit_once(
-                recent_apparition, initial, constraints, truncate_years,
-                None, maximum_observations=120,
-                max_nfev=8, robust_loss=True,
-            )
-            result[0].fit_model_note = (
-                "Bez A1–A3 byl fit určen z posledního pozorovaného návratu; "
-                "starší a budoucí návraty jsou čistě gravitační integrace, "
-                "nikoli společný fit všech zjevení."
-            )
-            for record in apparition_linkage:
-                record["status"] = "integrated_only"
-                record["reason"] = "A1–A3 nebyly zapnuty; návrat nebyl společně fitován."
-            if apparition_linkage:
-                apparition_linkage[-1]["status"] = "seed_only"
-                apparition_linkage[-1]["reason"] = "Samostatný fit posledního návratu."
-                _update_apparition_linkage_metrics(
-                    apparition_linkage[-1], recent_apparition,
+            # A catalogue solution can already encode the correct integer-
+            # revolution branch across all observed returns.  This is the
+            # normal situation for recovered comets such as 206P: JPL's
+            # published common solution is gravity-only.  Fitting the latest
+            # return first used to destroy that branch and then incorrectly
+            # required the user to enable A1/A2/A3 to search for it again.
+            # Verify the supplied state before changing it.  When it predicts
+            # every apparition, make only a bounded correction on a balanced
+            # sample and validate the result independently on every row.
+            catalogue_verified = False
+            verified_report: list[
+                tuple[float | None, float | None, bool | None]
+            ] | None = None
+            verified_appraisals: list[tuple[float, float]] | None = None
+            verified_result: tuple[OrbitSolution, float, int] | None = None
+            if initial is not None:
+                gravity_initial = replace(
+                    initial, nongravitational_parameters=None,
                 )
+                try:
+                    report_progress(
+                        "Ověřuji katalogovou gravitační dráhu na všech návratech…",
+                        4,
+                    )
+                    catalogue_rms, catalogue_normalized, catalogue_count = (
+                        _evaluate_solution_observations(
+                            observations, gravity_initial, None, cancel_callback,
+                        )
+                    )
+                    appraisals = [
+                        _robust_apparition_appraisal(group)
+                        for group in apparition_groups
+                    ]
+                    catalogue_verified = bool(appraisals) and all(
+                        appraisal[0] <= LINKAGE_ACCEPT_RMS_ARCSEC
+                        and appraisal[1] <= LINKAGE_ACCEPT_NORMALIZED_RMS
+                        for appraisal in appraisals
+                    )
+                    if catalogue_verified:
+                        gravity_initial.fit_observation_count = catalogue_count
+                        gravity_initial.fit_available_observation_count = catalogue_count
+                        gravity_initial.fit_rms_arcsec = catalogue_rms
+                        gravity_initial.fit_normalized_rms = catalogue_normalized
+                        for observation in observations:
+                            if (
+                                not observation.excluded_from_fit
+                                and observation.residual_ra_arcsec is not None
+                                and observation.residual_dec_arcsec is not None
+                            ):
+                                observation.used_in_fit = True
+                        verified_result = (
+                            gravity_initial, catalogue_rms, catalogue_count,
+                        )
+                        verified_report = [
+                            (
+                                observation.residual_ra_arcsec,
+                                observation.residual_dec_arcsec,
+                                observation.used_in_fit,
+                            )
+                            for observation in observations
+                        ]
+                        verified_appraisals = [
+                            appraisal[:2] for appraisal in appraisals
+                        ]
+                except OrbitFitCancelled:
+                    raise
+                except (
+                    OrbitFitError, ValueError, RuntimeError,
+                    FloatingPointError, OverflowError,
+                ):
+                    catalogue_verified = False
+
+            if (
+                catalogue_verified
+                and verified_result is not None
+                and verified_report is not None
+                and verified_appraisals is not None
+            ):
+                balanced = _balanced_linkage_observations(apparition_groups)
+                result = verified_result
+                correction_accepted = False
+                try:
+                    report_progress(
+                        "Krátce zpřesňuji ověřenou společnou gravitační dráhu…"
+                    )
+                    corrected = fit_once(
+                        balanced, verified_result[0], constraints, truncate_years,
+                        None, maximum_observations=None,
+                        max_nfev=6, robust_loss=True, robust_scale=8.0,
+                    )
+                    corrected_rms, corrected_normalized, corrected_count = (
+                        _evaluate_solution_observations(
+                            observations, corrected[0], None, cancel_callback,
+                        )
+                    )
+                    corrected_appraisals = [
+                        _robust_apparition_appraisal(group)[:2]
+                        for group in apparition_groups
+                    ]
+                    materially_worse = any(
+                        corrected_group_rms > max(
+                            baseline_rms + 1.0, baseline_rms * 1.5,
+                        )
+                        or corrected_group_normalized > max(
+                            baseline_normalized + 1.0,
+                            baseline_normalized * 1.5,
+                        )
+                        for (
+                            corrected_group_rms, corrected_group_normalized,
+                        ), (
+                            baseline_rms, baseline_normalized,
+                        ) in zip(corrected_appraisals, verified_appraisals)
+                    )
+                    all_returns_acceptable = all(
+                        rms <= LINKAGE_ACCEPT_RMS_ARCSEC
+                        and normalized <= LINKAGE_ACCEPT_NORMALIZED_RMS
+                        for rms, normalized in corrected_appraisals
+                    )
+                    if all_returns_acceptable and not materially_worse:
+                        corrected[0].fit_observation_count = len(balanced)
+                        corrected[0].fit_available_observation_count = corrected_count
+                        corrected[0].fit_rms_arcsec = corrected_rms
+                        corrected[0].fit_normalized_rms = corrected_normalized
+                        fitted_ids = {id(item) for item in balanced}
+                        for observation in observations:
+                            observation.used_in_fit = bool(
+                                id(observation) in fitted_ids
+                                and not observation.excluded_from_fit
+                            )
+                        result = (
+                            corrected[0], corrected_rms, len(balanced),
+                        )
+                        correction_accepted = True
+                except OrbitFitCancelled:
+                    raise
+                except (
+                    OrbitFitError, ValueError, RuntimeError,
+                    FloatingPointError, OverflowError,
+                ):
+                    correction_accepted = False
+
+                if not correction_accepted:
+                    result = verified_result
+                    for observation, values in zip(observations, verified_report):
+                        (
+                            observation.residual_ra_arcsec,
+                            observation.residual_dec_arcsec,
+                            observation.used_in_fit,
+                        ) = values
+                for record, group in zip(apparition_linkage, apparition_groups):
+                    record["status"] = "linked"
+                    record["reason"] = (
+                        "Ověřená katalogová gravitační větev; krátká společná "
+                        "korekce byla potvrzena na všech načtených měřeních."
+                        if correction_accepted else
+                        "Katalogová gravitační větev byla přímo potvrzena na "
+                        "všech načtených měřeních; krátká korekce byla odmítnuta, "
+                        "protože zhoršila alespoň jeden návrat."
+                    )
+                    _update_apparition_linkage_metrics(record, group)
+                result[0].fit_model_note = (
+                    f"Společná gravitační dráha propojila všech "
+                    f"{len(apparition_groups)} pozorovaných návratů. "
+                    + (
+                        "Ověřená katalogová větev byla krátce zpřesněna na "
+                        "vyváženém vzorku a znovu potvrzena na celém oblouku."
+                        if correction_accepted else
+                        "Zachována je přímo ověřená katalogová větev, protože "
+                        "omezená korekce neposkytla bezpečně lepší společné řešení."
+                    )
+                )
+            else:
+                # Without a verified common branch, a gravity-only correction
+                # across decades can invent a low-quality compromise.  Retain
+                # the conservative latest-return behaviour in that case.
+                for observation in observations:
+                    observation.used_in_fit = False
+                    observation.residual_ra_arcsec = None
+                    observation.residual_dec_arcsec = None
+                report_progress("Fituji poslední pozorovaný návrat…", 3)
+                result = fit_once(
+                    recent_apparition, initial, constraints, truncate_years,
+                    None, maximum_observations=120,
+                    max_nfev=8, robust_loss=True,
+                )
+                result[0].fit_model_note = (
+                    "Bez ověřené společné katalogové větve byl gravitační fit "
+                    "určen z posledního pozorovaného návratu; starší a budoucí "
+                    "návraty jsou pouze integrované předpovědi."
+                )
+                for record in apparition_linkage:
+                    record["status"] = "integrated_only"
+                    record["reason"] = (
+                        "Katalogová dráha nepotvrdila společnou gravitační větev; "
+                        "návrat nebyl společně fitován."
+                    )
+                if apparition_linkage:
+                    apparition_linkage[-1]["status"] = "seed_only"
+                    apparition_linkage[-1]["reason"] = (
+                        "Samostatný fit posledního návratu."
+                    )
+                    _update_apparition_linkage_metrics(
+                        apparition_linkage[-1], recent_apparition,
+                    )
         elif multi_apparition:
             # First lock onto the best-observed modern apparition.  Correcting
             # all six state components across a century immediately forces
@@ -2909,62 +3324,69 @@ def fit_orbit(
                                 f"Návrat {return_year}: určuji nezávislou "
                                 "lokální dráhu z astrometrie…"
                             )
-                            local_seed = fit_once(
-                                apparition_groups[first_group], last_good[0],
-                                constraints, truncate_years, None,
-                                fixed_nongravitational=local_force,
-                                maximum_observations=120, max_nfev=36,
-                                robust_loss=True, robust_scale=25.0,
+                            local_rows = _normal_place_observations(
+                                apparition_groups[first_group]
                             )
+                            preliminary = initial_orbit_from_observations(
+                                local_rows, return_candidates=True,
+                            )
+                            assert isinstance(preliminary, list)
+                            local_solutions: list[
+                                tuple[OrbitSolution, float, int]
+                            ] = []
+                            # Each hypothesis comes solely from the old
+                            # apparition.  This is the identification stage;
+                            # no propagated modern state is smuggled in as a
+                            # nominally "independent" local orbit.
+                            for local_initial in preliminary[:8]:
+                                try:
+                                    local_trial = fit_once(
+                                        local_rows, local_initial, constraints,
+                                        truncate_years, None,
+                                        fixed_nongravitational=local_force,
+                                        maximum_observations=None, max_nfev=28,
+                                        robust_loss=True, robust_scale=8.0,
+                                    )
+                                    if np.isfinite(local_trial[1]):
+                                        local_solutions.append(local_trial)
+                                except (
+                                    OrbitFitError, ValueError, RuntimeError,
+                                    FloatingPointError,
+                                ):
+                                    continue
+                            if not local_solutions:
+                                raise OrbitFitError(
+                                    "Starší návrat neposkytl použitelnou "
+                                    "samostatnou předběžnou dráhu."
+                                )
+                            local_solutions.sort(key=lambda item: item[1])
                             failures.append(
-                                "lokální astrometrická větev: "
-                                f"RMS {local_seed[1]:.2f}″"
+                                "nejlepší nezávislá lokální dráha: "
+                                f"RMS {local_solutions[0][1]:.2f}″"
                             )
-                            if hold_secular_parameters:
+                            for local_seed in local_solutions[:3]:
+                                if candidate is not None:
+                                    break
                                 local_prefit = local_seed
-                            else:
-                                report_progress(
-                                    f"Návrat {return_year}: rychlý předfit z "
-                                    "lokální astrometrické větve…"
-                                )
-                                local_prefit = fit_once(
-                                    stage_observations, local_seed[0],
-                                    constraints, truncate_years,
-                                    linkage_parameters,
-                                    maximum_observations=min(
-                                        160, 40 * stage_count
-                                    ),
-                                    max_nfev=8, robust_loss=True,
-                                    robust_scale=50.0, screening=True,
-                                    fit_state=False,
-                                )
-                            trial = fit_once(
-                                stage_observations, local_prefit[0], constraints,
-                                truncate_years,
-                                None if hold_secular_parameters
-                                else linkage_parameters,
-                                fixed_nongravitational=(
-                                    held_parameters
-                                    if hold_secular_parameters else None
-                                ),
-                                maximum_observations=min(240, 60 * stage_count),
-                                max_nfev=6, robust_loss=True,
-                                robust_scale=25.0, screening=True,
-                            )
-                            normalized = trial[0].fit_normalized_rms
-                            if (
-                                np.isfinite(trial[1]) and trial[1] <= 30.0
-                                and normalized is not None
-                                and np.isfinite(normalized)
-                                and normalized > 8.0
-                            ):
-                                report_progress(
-                                    f"Návrat {return_year}: pokračuji v "
-                                    "konvergenci lokální větve…"
-                                )
+                                if not hold_secular_parameters:
+                                    report_progress(
+                                        f"Návrat {return_year}: rychlý předfit "
+                                        "nezávislé lokální větve…"
+                                    )
+                                    local_prefit = fit_once(
+                                        stage_observations, local_seed[0],
+                                        constraints, truncate_years,
+                                        linkage_parameters,
+                                        maximum_observations=min(
+                                            160, 40 * stage_count
+                                        ),
+                                        max_nfev=8, robust_loss=True,
+                                        robust_scale=50.0, screening=True,
+                                        fit_state=False,
+                                    )
                                 trial = fit_once(
-                                    stage_observations, trial[0], constraints,
-                                    truncate_years,
+                                    stage_observations, local_prefit[0],
+                                    constraints, truncate_years,
                                     None if hold_secular_parameters
                                     else linkage_parameters,
                                     fixed_nongravitational=(
@@ -2972,21 +3394,47 @@ def fit_orbit(
                                         if hold_secular_parameters else None
                                     ),
                                     maximum_observations=min(
-                                        320, 80 * stage_count
+                                        240, 60 * stage_count
                                     ),
-                                    max_nfev=24, robust_loss=True,
-                                    robust_scale=8.0, screening=False,
+                                    max_nfev=8, robust_loss=True,
+                                    robust_scale=25.0, screening=True,
                                 )
                                 normalized = trial[0].fit_normalized_rms
-                            if _linkage_trial_is_acceptable(trial):
-                                candidate = trial
-                                candidate_source = "local_astrometry"
-                            else:
-                                remember_failed_trial(trial)
-                                failures.append(
-                                    "lokální rychlá větev: RMS "
-                                    f"{trial[1]:.2f}″"
-                                )
+                                if (
+                                    np.isfinite(trial[1])
+                                    and trial[1] <= 30.0
+                                    and normalized is not None
+                                    and np.isfinite(normalized)
+                                    and normalized > 8.0
+                                ):
+                                    report_progress(
+                                        f"Návrat {return_year}: pokračuji v "
+                                        "konvergenci lokální větve…"
+                                    )
+                                    trial = fit_once(
+                                        stage_observations, trial[0],
+                                        constraints, truncate_years,
+                                        None if hold_secular_parameters
+                                        else linkage_parameters,
+                                        fixed_nongravitational=(
+                                            held_parameters
+                                            if hold_secular_parameters else None
+                                        ),
+                                        maximum_observations=min(
+                                            320, 80 * stage_count
+                                        ),
+                                        max_nfev=24, robust_loss=True,
+                                        robust_scale=8.0, screening=False,
+                                    )
+                                if _linkage_trial_is_acceptable(trial):
+                                    candidate = trial
+                                    candidate_source = "local_astrometry"
+                                else:
+                                    remember_failed_trial(trial)
+                                    failures.append(
+                                        "lokální spojovací větev: RMS "
+                                        f"{trial[1]:.2f}″"
+                                    )
                         except (
                             OrbitFitError, ValueError, RuntimeError,
                             FloatingPointError,
@@ -3451,6 +3899,19 @@ def fit_orbit(
                             apparition_linkage[older_index]["reason"] = (
                                 "Nezkoušeno, protože navázání následujícího návratu selhalo."
                             )
+                    # Never turn a failed linkage attempt into an apparently
+                    # successful replacement orbit when even the retained
+                    # newest-apparition solution is grossly inconsistent with
+                    # its own astrometry.  Raising here lets OrbitFitWorker
+                    # restore the pre-fit catalogue/user solution and O-C
+                    # table instead of installing a hundreds-of-arcseconds
+                    # fallback such as the former 206P result.
+                    if not _linkage_trial_is_acceptable(last_good):
+                        raise OrbitFitError(
+                            "Výpočet nenašel ani spolehlivou dráhu výchozího "
+                            "návratu; původní řešení zůstává beze změny "
+                            f"(RMS {last_good[1]:.2f}″)."
+                        ) from exc
                     result = last_good
                     for observation, report_values in zip(
                         observations, last_good_report,

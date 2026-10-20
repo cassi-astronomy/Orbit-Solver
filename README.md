@@ -34,19 +34,24 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
   bez sigmy; série jedné stanice z jedné noci mají korelační podlahu, aby stovky
   snímků nepředstíraly stovky nezávislých absolutních poloh; moderní chybná CCD
   měření nadále zachytává robustní fit podle O−C;
-- bezpečný víceapariční režim periodických komet: bez A1–A3 se fituje poslední
-  pozorovaný návrat a ostatní se označí jako čistě gravitační integrace;
-  při zapnutém negravitačním modelu slouží poslední návrat jako počáteční
+- bezpečný víceapariční režim periodických komet: bez A1–A3 se nejprve ověří
+  načtená katalogová dráha na všech návratech; pokud už představuje společnou
+  gravitační větev, následuje jen omezená korekce na vyváženém vzorku a nezávislá
+  kontrola celého oblouku; teprve když katalogová větev nevyhoví, fituje se
+  pouze poslední pozorovaný návrat a ostatní se označí jako integrované
+  předpovědi; při zapnutém negravitačním modelu slouží poslední návrat jako počáteční
   korekce pro společný fit celého oblouku; starší zjevení se nejprve rychle
   navážou apariční předkorekcí A1/A2 s uvolněným stavem až v krátkém druhém
   kroku a jediná přesná korekce DE440 následuje až po nalezení celé větve;
-  při hledání větve jsou řídké historické a husté moderní návraty zastoupeny
-  vyváženě po návratech, stanicích a nocích; pokud robustní hledání skončí těsně
+  při hledání větve se husté dávky jedné stanice a noci převádějí na sférická
+  normální místa, zatímco řídká historická měření zůstávají jednotlivě; starší
+  návrat vytváří vlastní nezávislé předběžné dráhy místo opětovného použití
+  moderního stavu; pokud robustní hledání skončí těsně
   vedle společného řešení, následuje vyvážená lineární korekce, která nedovolí
   odepsat celý starší návrat jako jeden souvislý outlier; až následná přesná
   korekce používá všechna měření s jejich vahami; na víceletých obloucích se
-  kroky numerických derivací průběžně přizpůsobují skutečné změně O−C, podobně
-  jako při `Full step` ve Find_Orbu, aby se neztratil úzký směr změny fáze;
+  stav a jeho variační derivace podle šesti složek stavu a A1/A2/A3/DT integrují
+  společně, takže se kvůli každému sloupci Jacobianu neopakuje celý staletý běh;
   vzdálený návrat se navíc připojuje od nejbližších měření po geometricky
   rostoucích úsecích místo jediného skoku přes celou aparici; tento levný
   screening přes nejvýše 24 časově a staničně rozložených míst na návrat se
@@ -227,14 +232,16 @@ uživatelské rozhraní zůstalo ovladatelné.
 Orbit Solver je pracovní a vizualizační nástroj. Výsledky je u důležitých
 aplikací nutné porovnat s MPC, JPL Horizons nebo jiným nezávislým softwarem.
 
-- N-body model zahrnuje perturbace osmi planet. Bez volitelného kernelu používá
+- N-body model zahrnuje perturbace osmi planet a systému Pluto. Bez volitelného kernelu používá
   jejich analytické střední elementy; v **Vlastním nastavení** lze jedním
   kliknutím stáhnout a aktivovat JPL DE440 (přibližně 114 MB, 1549–2650).
   Výpočty mimo pokrytí aktivního kernelu program odmítne místo tichého přechodu
   na méně přesný model.
 - Samostatný Měsíc i první postnewtonovská (Schwarzschildova) korekce Slunce
-  jsou zahrnuty. Pluto, úplný EIH/PPN model a perturbace hmotných planetek
-  zatím v dynamickém modelu zahrnuty nejsou.
+  jsou zahrnuty. Úplný EIH/PPN model a perturbace 16 hmotných planetek z
+  `sb441-n16.bsp` zatím zahrnuty nejsou; tento přibližně 650MB asteroidový
+  kernel vyžaduje čtečku SPK typu používaného SB441, kterou současná knihovna
+  `jplephem` neposkytuje.
 - Konstantní A1/A2/A3/DT při integraci komety přes mnoho návratů jsou modelový
   předpoklad; skutečná negravitační aktivita komety se může mezi návraty měnit.
   DT je vhodné uvolnit až pro dlouhý oblouk, protože na jednom krátkém zjevení
@@ -335,7 +342,7 @@ Planet Center; katalog hvězd a obrazce souhvězdí pocházejí z d3-celestial.
 
 ## Vývoj a plánované kroky
 
-Následovat mohou Pluto, úplný EIH/PPN model, hmotné planetky, ukládání projektů
+Následovat mohou úplný EIH/PPN model, hmotné planetky, ukládání projektů
 a distribuční balíčky pro Windows a Linux.
 
 Příspěvky a hlášení reprodukovatelných chyb jsou vítány prostřednictvím

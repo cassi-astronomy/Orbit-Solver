@@ -40,7 +40,7 @@ from orbit_app.orbit_evolution import (
 )
 from orbit_app.planetary import PLANETS
 from orbit_app.orbit_fit import (
-    OrbitFitCancelled, _adaptive_finite_difference_jacobian,
+    OrbitFitCancelled, OrbitFitError, _adaptive_finite_difference_jacobian,
     _arc_extension_counts,
     _automatic_orbit_score, _InterpolatedPlanetEphemeris,
     _attach_multi_apparition_elements, _balanced_linkage_observations,
@@ -50,6 +50,7 @@ from orbit_app.orbit_fit import (
     _is_automatic_rejection_candidate,
     _local_light_time_states,
     _linkage_trial_is_acceptable,
+    _normal_place_observations,
     _observation_offsets_gcrs, _observation_sigma_arcsec, _observation_sigmas,
     _perihelion_offset_days_from_state,
     _latest_observing_apparition, _prefer_parabolic_short_arc,
@@ -787,6 +788,58 @@ class OrbitFitSelectionTests(unittest.TestCase):
         self.assertEqual(fit_once.call_args_list[0].kwargs["maximum_observations"], 120)
         self.assertIn("posledního pozorovaného návratu", solution.fit_model_note)
 
+    def test_verified_dense_catalogue_branch_gets_short_gravity_correction(self):
+        observations = [
+            Observation(
+                time=f"{year}-10-{day:02d}T00:00:00Z",
+                ra_deg=10.0, dec_deg=20.0,
+            )
+            for year, count in ((1892, 8), (2008, 10))
+            for day in range(1, count + 1)
+        ]
+        catalogue = OrbitSolution(
+            "206P", 2453922.5, 3.2335, .6485, 33.2, 204.4, 181.4, 217.4,
+            position_au=(1.2, 0.0, 0.0),
+            velocity_au_per_day=(0.0, .015, 0.0),
+        )
+        corrected = replace(catalogue)
+        evaluation_calls = 0
+
+        def fake_evaluate(rows, *_args, **_kwargs):
+            nonlocal evaluation_calls
+            evaluation_calls += 1
+            residual = .4 if evaluation_calls == 1 else .3
+            for observation in rows:
+                observation.residual_ra_arcsec = residual
+                observation.residual_dec_arcsec = -residual
+                observation.used_in_fit = False
+            return residual, .5, len(rows)
+
+        with (
+            patch(
+                "orbit_app.orbit_fit._evaluate_solution_observations",
+                side_effect=fake_evaluate,
+            ),
+            patch(
+                "orbit_app.orbit_fit._fit_orbit_once",
+                return_value=(corrected, .3, len(observations)),
+            ) as fit_once,
+            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
+        ):
+            result = fit_orbit(observations, catalogue)
+
+        self.assertIs(result[0], corrected)
+        self.assertEqual(evaluation_calls, 2)
+        self.assertEqual(fit_once.call_count, 1)
+        self.assertEqual(fit_once.call_args.kwargs["max_nfev"], 6)
+        self.assertFalse(fit_once.call_args.kwargs.get("strict_polish", False))
+        self.assertEqual(len(fit_once.call_args.args[0]), len(observations))
+        self.assertEqual(
+            [item["status"] for item in corrected.apparition_linkage or ()],
+            ["linked", "linked"],
+        )
+        self.assertIn("krátce zpřesněna", corrected.fit_model_note or "")
+
     def test_sparse_catalogue_linkage_preserves_verified_branch_and_rejects_blunder(self):
         old = [
             Observation(
@@ -1448,6 +1501,36 @@ class OrbitFitSelectionTests(unittest.TestCase):
         self.assertEqual(sum(item.time.startswith("1892") for item in selected), 41)
         self.assertEqual(sum(item.time.startswith("2008") for item in selected), 41)
 
+    def test_dense_station_night_becomes_one_spherical_normal_place(self):
+        start = datetime(2008, 10, 20, 20, tzinfo=timezone.utc)
+        observations = [
+            Observation(
+                designation="206P", station="J95",
+                time=(start + timedelta(minutes=5 * index)).isoformat(),
+                ra_deg=(359.98 + .01 * index) % 360.0,
+                dec_deg=12.0 + .001 * index,
+                raw={"rmsRA": .4, "rmsDec": .5},
+            )
+            for index in range(8)
+        ]
+        normal_places = _normal_place_observations(observations)
+        self.assertEqual(len(normal_places), 1)
+        normal = normal_places[0]
+        self.assertEqual(normal.raw["normalPlaceCount"], 8)
+        self.assertLess(min(normal.ra_deg, 360.0 - normal.ra_deg), .1)
+        self.assertEqual(normal.station, "J95")
+        self.assertGreater(normal.raw["rmsRA"], 0.0)
+
+    def test_sparse_station_night_is_not_artificially_averaged(self):
+        observations = [
+            Observation(
+                time=f"1892-10-1{index}T20:00:00Z", station="024",
+                ra_deg=10.0 + index, dec_deg=20.0,
+            )
+            for index in range(4)
+        ]
+        self.assertEqual(_normal_place_observations(observations), observations)
+
     def test_linkage_metrics_ignore_manually_excluded_observations(self):
         good = Observation(
             residual_ra_arcsec=.3, residual_dec_arcsec=-.4,
@@ -1585,6 +1668,38 @@ class OrbitFitSelectionTests(unittest.TestCase):
         self.assertTrue(extension_seeds)
         self.assertIs(extension_seeds[0], seed)
 
+    def test_catastrophic_latest_apparition_is_not_returned_as_success(self):
+        observations = [
+            Observation(
+                time=f"{year}-03-{day:02d}T00:00:00Z",
+                ra_deg=10.0, dec_deg=20.0,
+            )
+            for year in (1892, 2008)
+            for day in range(1, 7)
+        ]
+        failed = OrbitSolution(
+            "206P", 2454758.5, 3.24, .646, 32.9, 204.1, 181.4, 0.0,
+            position_au=(1.2, 0.0, 0.0),
+            velocity_au_per_day=(0.0, .02, 0.0),
+            fit_normalized_rms=190.0,
+            nongravitational_parameters={"A1": 1.01e-8, "A2": .06684e-8},
+        )
+
+        def always_bad(rows, *_args, **_kwargs):
+            return failed, 300.0, len(rows)
+
+        with (
+            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=always_bad),
+            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
+        ):
+            with self.assertRaisesRegex(
+                OrbitFitError, "původní řešení zůstává beze změny",
+            ):
+                fit_orbit(
+                    observations, failed,
+                    nongravitational={"A1": 1.01e-8, "A2": .06684e-8},
+                )
+
     def test_representative_count_says_which_arc_it_describes(self):
         solution = OrbitSolution("1P", 2446470.5, 17.8, .967, 162, 58, 111, 0)
         solution.fit_observation_count = 360
@@ -1698,6 +1813,11 @@ class NativeIntegratorTests(unittest.TestCase):
         distance = float(np.linalg.norm(moon - earth))
         self.assertGreater(distance, .0023)
         self.assertLess(distance, .0028)
+
+    def test_planet_provider_includes_pluto_system_perturber(self):
+        pluto = PLANETS.position("pluto", 2451545.0)
+        self.assertTrue(np.all(np.isfinite(pluto)))
+        self.assertGreater(float(np.linalg.norm(pluto)), 20.0)
 
     def test_planetocentric_elements_use_selected_planet_mass(self):
         radius = .01
@@ -1877,6 +1997,52 @@ class NativeIntegratorTests(unittest.TestCase):
         self.assertEqual(result.shape, (2, 6))
         self.assertTrue(np.allclose(result[0], state.packed()))
         self.assertTrue(np.allclose(result[1], state.packed()))
+
+    def test_variational_state_transition_matches_complete_reintegration(self):
+        initial = StateVector(
+            2451545.0, np.array([1.2, .1, .02]),
+            np.array([-.002, .014, .001]),
+        )
+        engine = NBodyIntegrator(_NoPlanets(), perturbers=())
+        epochs = np.array([2451545.0 + 40.0])
+        states, partials = engine.propagate_with_partials(initial, epochs)
+        step = 1e-7
+        shifted = initial.packed().copy()
+        shifted[3] += step
+        perturbed = engine.propagate(
+            StateVector(initial.epoch_jd, shifted[:3], shifted[3:]), epochs,
+        )
+        finite_difference = (perturbed[0] - states[0]) / step
+        np.testing.assert_allclose(
+            partials[0, :, 3], finite_difference, rtol=2e-5, atol=2e-7,
+        )
+
+    def test_variational_a1_column_uses_optimizer_scale(self):
+        initial = StateVector(
+            2451545.0, np.array([1.1, .2, 0.0]),
+            np.array([-.003, .015, .001]),
+        )
+        base_a1 = 1.2e-8
+        engine = NBodyIntegrator(
+            _NoPlanets(), perturbers=(),
+            nongravitational_parameters={"A1": base_a1},
+        )
+        epochs = np.array([2451545.0 + 30.0])
+        states, partials = engine.propagate_with_partials(
+            initial, epochs, ("A1",), np.array([1e-8]),
+        )
+        optimizer_step = 1e-3
+        shifted_engine = NBodyIntegrator(
+            _NoPlanets(), perturbers=(),
+            nongravitational_parameters={
+                "A1": base_a1 + optimizer_step * 1e-8,
+            },
+        )
+        shifted = shifted_engine.propagate(initial, epochs)
+        finite_difference = (shifted[0] - states[0]) / optimizer_step
+        np.testing.assert_allclose(
+            partials[0, :, 6], finite_difference, rtol=3e-4, atol=2e-10,
+        )
 
     def test_one_year_circular_solar_orbit(self):
         initial = StateVector(
