@@ -19,6 +19,9 @@ from .planetary import PLANETS, SplinePlanetEphemeris
 from .photometry import estimate_absolute_magnitude, hg_phase_correction
 
 C_AU_PER_DAY = 173.1446326846693
+LINKAGE_ACCEPT_RMS_ARCSEC = 60.0
+LINKAGE_ACCEPT_NORMALIZED_RMS = 8.0
+LINKAGE_DIVERGENCE_RMS_ARCSEC = 200.0
 _PLANET_NAMES = (
     "mercury", "venus", "earth", "moon", "mars",
     "jupiter", "saturn", "uranus", "neptune",
@@ -35,6 +38,20 @@ class OrbitFitCancelled(Exception):
 
 ProgressCallback = Callable[[str, int, int], None]
 CancelCallback = Callable[[], bool]
+
+
+def _linkage_trial_is_acceptable(
+    trial: tuple[OrbitSolution, float, int],
+) -> bool:
+    """Apply the common quality gate used by multi-apparition branch trials."""
+    normalized_rms = trial[0].fit_normalized_rms
+    return bool(
+        np.isfinite(trial[1])
+        and trial[1] <= LINKAGE_ACCEPT_RMS_ARCSEC
+        and normalized_rms is not None
+        and np.isfinite(normalized_rms)
+        and normalized_rms <= LINKAGE_ACCEPT_NORMALIZED_RMS
+    )
 
 
 def _calibrate_fitted_photometry(
@@ -2670,10 +2687,123 @@ def fit_orbit(
                         return
                     if score < best_failed_trial[0]:
                         best_failed_trial = (score, trial_result)
-                try:
-                    return_year = apparition_linkage[first_group].get(
-                        "return_year", "?"
+
+                return_year = apparition_linkage[first_group].get(
+                    "return_year", "?"
+                )
+
+                def attempt_arc_extension():
+                    """Grow the old arc before trying unrelated full-fit basins."""
+                    older_rows = sorted(
+                        (
+                            item for item in apparition_groups[first_group]
+                            if not item.excluded_from_fit
+                        ),
+                        key=lambda item: parse_observation_time(item.time),
                     )
+                    extension_counts = _arc_extension_counts(len(older_rows))
+                    # Always continue from the verified newer-return branch.
+                    # A failed whole-arc result may already have crossed to an
+                    # adjacent integer-revolution solution.
+                    extension_seed = last_good[0]
+                    extension_parameters = fitted_nongrav(extension_seed)
+                    extension_trial = None
+                    try:
+                        for count in extension_counts:
+                            report_progress(
+                                f"Návrat {return_year}: postupně připojuji "
+                                f"{count}/{len(older_rows)} měření…"
+                            )
+                            extension_groups = [
+                                older_rows[-count:],
+                                *apparition_groups[first_group + 1:],
+                            ]
+                            # These are branch-finding normal places only.
+                            # The exact final correction below still receives
+                            # every original enabled observation.
+                            extension_observations = (
+                                _balanced_linkage_observations(
+                                    extension_groups,
+                                    maximum_per_group=max(6, min(24, count)),
+                                )
+                            )
+                            # Correct accumulated phase first, with the state
+                            # held fixed, and release the Cartesian state only
+                            # after that reduced problem has converged.
+                            if hold_secular_parameters:
+                                extension_prefit = (
+                                    extension_seed, np.inf, 0
+                                )
+                            else:
+                                extension_prefit = fit_once(
+                                    extension_observations, extension_seed,
+                                    constraints, truncate_years,
+                                    extension_parameters,
+                                    maximum_observations=None,
+                                    max_nfev=6 if count > 24 else 10,
+                                    robust_loss=True,
+                                    robust_scale=(
+                                        50.0 if count <= 24 else 12.0
+                                    ),
+                                    screening=True,
+                                    fit_state=False,
+                                )
+                                extension_parameters = fitted_nongrav(
+                                    extension_prefit[0]
+                                )
+                            extension_trial = fit_once(
+                                extension_observations, extension_prefit[0],
+                                constraints, truncate_years,
+                                None if hold_secular_parameters
+                                else extension_parameters,
+                                fixed_nongravitational=(
+                                    held_parameters
+                                    if hold_secular_parameters else None
+                                ),
+                                maximum_observations=None,
+                                max_nfev=10 if count > 24 else 16,
+                                robust_loss=True,
+                                robust_scale=50.0 if count <= 12 else 12.0,
+                                screening=True,
+                            )
+                            extension_seed = extension_trial[0]
+                            extension_parameters = fitted_nongrav(
+                                extension_seed
+                            )
+                            if (
+                                not np.isfinite(extension_trial[1])
+                                or extension_trial[1]
+                                > LINKAGE_DIVERGENCE_RMS_ARCSEC
+                            ):
+                                raise OrbitFitError(
+                                    "postupné rozšíření se vzdálilo od "
+                                    "astrometrie"
+                                )
+                        if extension_trial is None:
+                            return None, "postupné rozšíření nemělo žádná měření"
+                        extension_normalized = (
+                            extension_trial[0].fit_normalized_rms
+                        )
+                        if _linkage_trial_is_acceptable(extension_trial):
+                            linked_parameter_names.update(extension_parameters)
+                            return extension_trial, None
+                        remember_failed_trial(extension_trial)
+                        normalized_text = (
+                            "nedostupné"
+                            if extension_normalized is None
+                            or not np.isfinite(extension_normalized)
+                            else f"{extension_normalized:.2f}σ"
+                        )
+                        return None, (
+                            "postupné rozšíření oblouku: RMS "
+                            f"{extension_trial[1]:.2f}″; {normalized_text}"
+                        )
+                    except (
+                        OrbitFitError, ValueError, RuntimeError,
+                        FloatingPointError,
+                    ) as exc:
+                        return None, f"postupné rozšíření oblouku: {exc}"
+                try:
                     if hold_secular_parameters:
                         report_progress(
                             f"Návrat {return_year}: hledám společný stav při "
@@ -2730,11 +2860,7 @@ def fit_orbit(
                             robust_scale=8.0, screening=False,
                         )
                         normalized = trial[0].fit_normalized_rms
-                    if (
-                        np.isfinite(trial[1]) and trial[1] <= 60.0
-                        and normalized is not None and np.isfinite(normalized)
-                        and normalized <= 8.0
-                    ):
+                    if _linkage_trial_is_acceptable(trial):
                         candidate = trial
                     else:
                         remember_failed_trial(trial)
@@ -2745,6 +2871,19 @@ def fit_orbit(
                         failures.append(
                             f"rychlá větev: RMS {trial[1]:.2f}″; {normalized_text}"
                         )
+                    # This continuation is the normal path, not a last-resort
+                    # recovery after several expensive whole-arc fits.  It is
+                    # deliberately attempted before a standalone old-return
+                    # orbit, catalogue basin, force grid, or expanded A model.
+                    if candidate is None and best_failed_trial is not None:
+                        extension_candidate, extension_failure = (
+                            attempt_arc_extension()
+                        )
+                        if extension_candidate is not None:
+                            candidate = extension_candidate
+                            candidate_source = "arc_extension"
+                        elif extension_failure:
+                            failures.append(extension_failure)
                     # A propagated solution can be only tens of arcseconds
                     # from an older apparition and still lie outside the
                     # narrow basin in which a century-scale numerical
@@ -2839,12 +2978,7 @@ def fit_orbit(
                                     robust_scale=8.0, screening=False,
                                 )
                                 normalized = trial[0].fit_normalized_rms
-                            if (
-                                np.isfinite(trial[1]) and trial[1] <= 60.0
-                                and normalized is not None
-                                and np.isfinite(normalized)
-                                and normalized <= 8.0
-                            ):
+                            if _linkage_trial_is_acceptable(trial):
                                 candidate = trial
                                 candidate_source = "local_astrometry"
                             else:
@@ -2914,13 +3048,7 @@ def fit_orbit(
                                 sparse_normalized = (
                                     sparse_trial[0].fit_normalized_rms
                                 )
-                                if (
-                                    np.isfinite(sparse_trial[1])
-                                    and sparse_trial[1] <= 60.0
-                                    and sparse_normalized is not None
-                                    and np.isfinite(sparse_normalized)
-                                    and sparse_normalized <= 8.0
-                                ):
+                                if _linkage_trial_is_acceptable(sparse_trial):
                                     candidate = sparse_trial
                                     candidate_source = "sparse_phase"
                                     linked_parameter_names.update(
@@ -2991,17 +3119,13 @@ def fit_orbit(
                                 ),
                                 max_nfev=10 if sparse_linkage else 28,
                                 robust_loss=True, robust_scale=12.0,
-                                screening=sparse_linkage,
+                                screening=True,
                             )
                             catalogue_fixed_normalized = (
                                 catalogue_fixed_trial[0].fit_normalized_rms
                             )
-                            if (
-                                np.isfinite(catalogue_fixed_trial[1])
-                                and catalogue_fixed_trial[1] <= 60.0
-                                and catalogue_fixed_normalized is not None
-                                and np.isfinite(catalogue_fixed_normalized)
-                                and catalogue_fixed_normalized <= 8.0
+                            if _linkage_trial_is_acceptable(
+                                catalogue_fixed_trial
                             ):
                                 candidate = catalogue_fixed_trial
                                 candidate_source = "catalogue_fixed_force"
@@ -3024,7 +3148,7 @@ def fit_orbit(
                                     ),
                                     max_nfev=10 if sparse_linkage else 28,
                                     robust_loss=True, robust_scale=8.0,
-                                    screening=sparse_linkage,
+                                    screening=True,
                                 )
                             else:
                                 catalogue_prefit = fit_once(
@@ -3047,19 +3171,14 @@ def fit_orbit(
                                     ),
                                     max_nfev=10 if sparse_linkage else 28,
                                     robust_loss=True, robust_scale=8.0,
-                                    screening=sparse_linkage,
+                                    screening=True,
                                 )
                             catalogue_normalized = (
                                 catalogue_trial[0].fit_normalized_rms
                             )
                             if (
                                 candidate is None
-                                and
-                                np.isfinite(catalogue_trial[1])
-                                and catalogue_trial[1] <= 60.0
-                                and catalogue_normalized is not None
-                                and np.isfinite(catalogue_normalized)
-                                and catalogue_normalized <= 8.0
+                                and _linkage_trial_is_acceptable(catalogue_trial)
                             ):
                                 candidate = catalogue_trial
                                 candidate_source = "catalogue_astrometry"
@@ -3163,13 +3282,7 @@ def fit_orbit(
                             grid_normalized = (
                                 grid_polish[0].fit_normalized_rms
                             )
-                            if (
-                                np.isfinite(grid_polish[1])
-                                and grid_polish[1] <= 60.0
-                                and grid_normalized is not None
-                                and np.isfinite(grid_normalized)
-                                and grid_normalized <= 8.0
-                            ):
+                            if _linkage_trial_is_acceptable(grid_polish):
                                 candidate = grid_polish
                                 candidate_source = "force_grid"
                                 linked_parameter_names.update(grid_parameters)
@@ -3234,13 +3347,7 @@ def fit_orbit(
                                 expanded_normalized = (
                                     expanded_trial[0].fit_normalized_rms
                                 )
-                                if (
-                                    np.isfinite(expanded_trial[1])
-                                    and expanded_trial[1] <= 60.0
-                                    and expanded_normalized is not None
-                                    and np.isfinite(expanded_normalized)
-                                    and expanded_normalized <= 8.0
-                                ):
+                                if _linkage_trial_is_acceptable(expanded_trial):
                                     candidate = expanded_trial
                                     candidate_source = "expanded_nongrav"
                                     linked_parameter_names.update(
@@ -3266,134 +3373,6 @@ def fit_orbit(
                                 failures.append(
                                     f"úplný negravitační model: {exc}"
                                 )
-                    # Find_Orb's attempt_extensions() does not switch an
-                    # entire distant arc on at once.  It adds the observations
-                    # nearest to the current arc, corrects, and only then grows
-                    # the included span.  Reproduce that continuation here:
-                    # 6, 12, 24... points from the end of the older apparition,
-                    # balanced against each already-linked apparition.
-                    if candidate is None and best_failed_trial is not None:
-                        older_rows = sorted(
-                            (
-                                item for item in apparition_groups[first_group]
-                                if not item.excluded_from_fit
-                            ),
-                            key=lambda item: parse_observation_time(item.time),
-                        )
-                        extension_counts = _arc_extension_counts(len(older_rows))
-                        # Continuation must start on the already verified
-                        # newer-apparition branch.  Starting from the
-                        # numerically "best" failed whole-arc trial preserves
-                        # exactly the phase/revolution error that incremental
-                        # extension is intended to avoid.
-                        extension_seed = last_good[0]
-                        extension_parameters = fitted_nongrav(extension_seed)
-                        extension_trial = None
-                        try:
-                            for count in extension_counts:
-                                report_progress(
-                                    f"Návrat {return_year}: postupně připojuji "
-                                    f"{count}/{len(older_rows)} měření…"
-                                )
-                                extension_groups = [
-                                    older_rows[-count:],
-                                    *apparition_groups[first_group + 1:],
-                                ]
-                                extension_observations = (
-                                    _balanced_linkage_observations(
-                                        extension_groups,
-                                        maximum_per_group=max(6, min(120, count)),
-                                    )
-                                )
-                                # First correct the secular phase terms while
-                                # holding the already verified osculating state
-                                # fixed.  If state and A1/A2/DT are released at
-                                # once, a wrong period can be absorbed into a
-                                # displaced state and the fit remains on the
-                                # adjacent revolution branch.
-                                if hold_secular_parameters:
-                                    extension_prefit = (
-                                        extension_seed, np.inf, 0
-                                    )
-                                else:
-                                    extension_prefit = fit_once(
-                                        extension_observations, extension_seed,
-                                        constraints, truncate_years,
-                                        extension_parameters,
-                                        maximum_observations=None,
-                                        max_nfev=12,
-                                        robust_loss=True,
-                                        robust_scale=(
-                                            50.0 if count <= 24 else 12.0
-                                        ),
-                                        screening=False,
-                                        fit_state=False,
-                                    )
-                                    extension_parameters = fitted_nongrav(
-                                        extension_prefit[0]
-                                    )
-                                extension_trial = fit_once(
-                                    extension_observations, extension_prefit[0],
-                                    constraints, truncate_years,
-                                    None if hold_secular_parameters
-                                    else extension_parameters,
-                                    fixed_nongravitational=(
-                                        held_parameters
-                                        if hold_secular_parameters else None
-                                    ),
-                                    maximum_observations=None,
-                                    max_nfev=20,
-                                    robust_loss=True,
-                                    robust_scale=50.0 if count <= 12 else 12.0,
-                                    screening=False,
-                                )
-                                extension_seed = extension_trial[0]
-                                extension_parameters = fitted_nongrav(
-                                    extension_seed
-                                )
-                                if (
-                                    not np.isfinite(extension_trial[1])
-                                    or extension_trial[1] > 200.0
-                                ):
-                                    raise OrbitFitError(
-                                        "postupné rozšíření se vzdálilo od "
-                                        "astrometrie"
-                                    )
-                            if extension_trial is not None:
-                                extension_normalized = (
-                                    extension_trial[0].fit_normalized_rms
-                                )
-                                if (
-                                    extension_trial[1] <= 60.0
-                                    and extension_normalized is not None
-                                    and np.isfinite(extension_normalized)
-                                    and extension_normalized <= 8.0
-                                ):
-                                    candidate = extension_trial
-                                    candidate_source = "arc_extension"
-                                    linked_parameter_names.update(
-                                        extension_parameters
-                                    )
-                                else:
-                                    remember_failed_trial(extension_trial)
-                                    normalized_text = (
-                                        "nedostupné"
-                                        if extension_normalized is None
-                                        or not np.isfinite(extension_normalized)
-                                        else f"{extension_normalized:.2f}σ"
-                                    )
-                                    failures.append(
-                                        "postupné rozšíření oblouku: RMS "
-                                        f"{extension_trial[1]:.2f}″; "
-                                        f"{normalized_text}"
-                                    )
-                        except (
-                            OrbitFitError, ValueError, RuntimeError,
-                            FloatingPointError,
-                        ) as exc:
-                            failures.append(
-                                f"postupné rozšíření oblouku: {exc}"
-                            )
                     # A robust loss is essential while choosing a branch, but
                     # once both apparitions are only a few arcseconds apart it
                     # can freeze the older one as a coherent "outlier" and
@@ -3428,13 +3407,7 @@ def fit_orbit(
                             forced_normalized = (
                                 forced_trial[0].fit_normalized_rms
                             )
-                            if (
-                                np.isfinite(forced_trial[1])
-                                and forced_trial[1] <= 60.0
-                                and forced_normalized is not None
-                                and np.isfinite(forced_normalized)
-                                and forced_normalized <= 8.0
-                            ):
+                            if _linkage_trial_is_acceptable(forced_trial):
                                 candidate = forced_trial
                                 candidate_source = "balanced_forcing"
                                 linked_parameter_names.update(

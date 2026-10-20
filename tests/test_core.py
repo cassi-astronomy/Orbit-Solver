@@ -7,13 +7,15 @@ from unittest.mock import patch
 
 import numpy as np
 
-from orbit_app.domain import Observation, OrbitSolution
+from orbit_app.domain import Observation, OrbitSolution, is_comet_designation
 from orbit_app.main_window import (
     CONSTELLATION_LABELS, CONSTELLATION_LINES, ElementsPanel, MpcNetworkClient, ObservationModel,
     PlaybackBar, SkyPanel, SolarSystemPanel,
+)
+from orbit_app.presentation import (
     apparition_linkage_summary, apparition_observation_count_text,
     datetime_from_jd, equatorial_ra_ticks, format_dec_sexagesimal, format_ra_sexagesimal,
-    is_comet_designation, observation_residual_score, observations_to_tsv, parse_output_epoch,
+    observation_residual_score, observations_to_tsv, parse_output_epoch,
     perihelion_jd_from_solution, project_ecliptic_camera,
     SKY_TRACK_HORIZONS, sky_track_sample_count, solar_orbit_clip_radius,
     trajectory_return_masks,
@@ -47,6 +49,7 @@ from orbit_app.orbit_fit import (
     _formal_element_uncertainties,
     _is_automatic_rejection_candidate,
     _local_light_time_states,
+    _linkage_trial_is_acceptable,
     _observation_offsets_gcrs, _observation_sigma_arcsec, _observation_sigmas,
     _perihelion_offset_days_from_state,
     _latest_observing_apparition, _prefer_parabolic_short_arc,
@@ -661,6 +664,17 @@ class PreviewGeometryTests(unittest.TestCase):
 
 
 class OrbitFitSelectionTests(unittest.TestCase):
+    def test_linkage_quality_gate_has_named_physical_and_normalized_limits(self):
+        accepted = OrbitSolution("X", 2460000.5, 2.0, .2, 0, 0, 0, 0)
+        accepted.fit_normalized_rms = 8.0
+        self.assertTrue(_linkage_trial_is_acceptable((accepted, 60.0, 6)))
+
+        poor_normalized = replace(accepted, fit_normalized_rms=8.01)
+        self.assertFalse(
+            _linkage_trial_is_acceptable((poor_normalized, 1.0, 6))
+        )
+        self.assertFalse(_linkage_trial_is_acceptable((accepted, 60.01, 6)))
+
     def test_fit_can_be_cancelled_before_numerical_work_starts(self):
         with self.assertRaises(OrbitFitCancelled):
             fit_orbit([], None, cancel_callback=lambda: True)
@@ -962,18 +976,27 @@ class OrbitFitSelectionTests(unittest.TestCase):
             nongravitational_parameters={"A1": 1e-8},
         )
         row_counts = []
+        call_trace = []
 
-        failed_joint = False
+        failed_joint = 0
 
         def fake_fit(rows, *_args, **kwargs):
             nonlocal failed_joint
             row_counts.append(len(rows))
+            call_trace.append((
+                len(rows), kwargs.get("max_nfev"),
+                kwargs.get("screening", False),
+            ))
             if (
                 len(rows) == 12
                 and kwargs.get("fixed_nongravitational")
-                and not failed_joint
+                # Reject both the direct bridge and its first incremental
+                # continuation so this test reaches the independent local-
+                # astrometry fallback.  Incremental extension now correctly
+                # precedes that more weakly constrained alternative basin.
+                and failed_joint < 2
             ):
-                failed_joint = True
+                failed_joint += 1
                 return bad, 100.0, len(rows)
             return seed, 1.0, len(rows)
 
@@ -984,8 +1007,14 @@ class OrbitFitSelectionTests(unittest.TestCase):
             result = fit_orbit(
                 observations, seed, nongravitational={"A1": 0.0},
             )
-        self.assertTrue(failed_joint)
+        self.assertEqual(failed_joint, 2)
         self.assertIn(6, row_counts[2:])
+        extension_index = call_trace.index((12, 16, True))
+        local_index = next(
+            index for index, call in enumerate(call_trace)
+            if index > 0 and call[0] == 6
+        )
+        self.assertLess(extension_index, local_index)
         self.assertEqual(
             [item["status"] for item in result[0].apparition_linkage or ()],
             ["linked", "linked"],

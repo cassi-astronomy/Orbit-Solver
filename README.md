@@ -48,7 +48,9 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
   kroky numerických derivací průběžně přizpůsobují skutečné změně O−C, podobně
   jako při `Full step` ve Find_Orbu, aby se neztratil úzký směr změny fáze;
   vzdálený návrat se navíc připojuje od nejbližších měření po geometricky
-  rostoucích úsecích místo jediného skoku přes celou aparici; první most drží
+  rostoucích úsecích místo jediného skoku přes celou aparici; tento levný
+  screening přes nejvýše 24 časově a staničně rozložených míst na návrat se
+  provede před zkoušením nezávislé lokální nebo katalogové větve; první most drží
   katalogové A/DT pevné, delší oblouk je teprve potom uvolní a při ztrátě
   konvergence se prověří i korelované kombinace A1/A2 obou větví;
   husté dávky jedné stanice a noci se převáží pravidlem `sqrt(N/4)` podle
@@ -267,6 +269,26 @@ python -m unittest discover -s tests -v
 
 V Linuxu lze místo `python` použít `python3`.
 
+Pro vývoj lze projekt nainstalovat v editovatelném režimu včetně statické
+kontroly Ruff:
+
+```bash
+python -m pip install -e ".[dev]"
+python -m ruff check .
+python -m unittest discover -s tests -v
+```
+
+Stejné kontroly automaticky spouští GitHub Actions pro každý push a pull
+request. Testy nepoužívají živé dotazy do MPC/JPL ani nestahují DE440; síťová
+rozhraní a nákladné numerické větve jsou podle potřeby nahrazeny testovacími
+daty nebo mocky. Čisté formátovací a projekční funkce jsou odděleny v modulu
+`orbit_app/presentation.py`, který nemá závislost na Qt ani Matplotlibu.
+Na systému bez PySide6 lze spustit alespoň oddělenou kontrolu jádra:
+
+```bash
+python -m unittest tests.test_headless -v
+```
+
 ## Struktura projektu
 
 ```text
@@ -280,10 +302,13 @@ Orbit-Solver/
 │   ├── orbit_evolution.py   # návraty a planetární přiblížení
 │   ├── comet_dynamics.py    # original/future barycentrická dráha komet
 │   ├── observatories.py     # stanice, paralaxa a obzorové souřadnice
+│   ├── presentation.py      # čisté formátování a projekce bez závislosti na Qt
 │   ├── preview_orbit.py     # geometrie efemerid a náhledů
 │   ├── photometry.py        # modely jasnosti
 │   └── data/                # offline katalogy hvězd, souhvězdí a stanic
+├── .github/workflows/       # automatické kontroly Ruff a unittest
 ├── tests/
+├── pyproject.toml           # metadata projektu a konfigurace vývojových nástrojů
 ├── run.py
 ├── Orbit.cmd
 └── requirements.txt
