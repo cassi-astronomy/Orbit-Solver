@@ -47,12 +47,12 @@ from orbit_app.orbit_fit import (
     _branch_preserving_backtrack,
     _coherent_secondary_track_candidates,
     _calibrate_fitted_photometry,
+    _apparition_orbit_similarity,
     _formal_element_uncertainties,
-    _interpolate_identification_states,
     _is_automatic_rejection_candidate,
     _local_light_time_states,
     _linkage_trial_is_acceptable,
-    _needs_historical_identification_bridge,
+    _needs_historical_identification,
     _normal_place_observations,
     _observation_offsets_gcrs, _observation_sigma_arcsec, _observation_sigmas,
     _perihelion_offset_days_from_state,
@@ -1743,7 +1743,7 @@ class OrbitFitSelectionTests(unittest.TestCase):
         self.assertEqual(_arc_extension_counts(5), (5,))
         self.assertEqual(_arc_extension_counts(41), (6, 24, 41))
 
-    def test_historical_identification_bridge_uses_two_same_epoch_states(self):
+    def test_historical_identification_compares_independent_orbits(self):
         modern = OrbitSolution(
             "206P", 2412450.5, 3.4, .6, 31.0, 208.0, 170.0, 0.0,
             position_au=(1.4, .1, .05),
@@ -1755,35 +1755,24 @@ class OrbitFitSelectionTests(unittest.TestCase):
             position_au=(1.39, .11, .052),
             velocity_au_per_day=(-.0021, .0199, .0041),
         )
-        candidates = _interpolate_identification_states(
-            modern, historical, (0.0, 0.5, 1.0),
-        )
-        np.testing.assert_allclose(
-            candidates[0].position_au, modern.position_au,
-        )
-        np.testing.assert_allclose(
-            candidates[1].position_au, (1.395, .105, .051),
-        )
-        np.testing.assert_allclose(
-            candidates[2].velocity_au_per_day,
-            historical.velocity_au_per_day,
-        )
-        self.assertIsNone(candidates[1].nongravitational_parameters)
+        similar, metrics = _apparition_orbit_similarity(modern, historical)
+        self.assertTrue(similar)
+        self.assertLess(metrics["plane_deg"], 1.0)
+        self.assertLess(metrics["apsidal_deg"], 5.0)
         with self.assertRaises(OrbitFitError):
-            _interpolate_identification_states(
+            _apparition_orbit_similarity(
                 modern, replace(historical, epoch_jd=historical.epoch_jd + 1.0),
-                (0.5,),
             )
 
-    def test_identification_bridge_threshold_follows_orbital_period(self):
+    def test_historical_identification_threshold_follows_orbital_period(self):
         six_year_comet = OrbitSolution(
             "321P/Test", 2459000.5, 6.0 ** (2.0 / 3.0), .5,
             10.0, 20.0, 30.0, 0.0,
         )
-        self.assertFalse(_needs_historical_identification_bridge(
+        self.assertFalse(_needs_historical_identification(
             2459000.5 - 6.0 * 365.25, 2459000.5, six_year_comet,
         ))
-        self.assertTrue(_needs_historical_identification_bridge(
+        self.assertTrue(_needs_historical_identification(
             2459000.5 - 12.0 * 365.25, 2459000.5, six_year_comet,
         ))
 
@@ -1810,24 +1799,25 @@ class OrbitFitSelectionTests(unittest.TestCase):
             nongravitational_parameters=None,
         )
         local = replace(local_initial, fit_normalized_rms=1.0)
-        bridge = replace(local, position_au=(1.41, .09, .05))
-        linked = replace(bridge, fit_normalized_rms=1.0)
+        linked = replace(local, fit_normalized_rms=1.0)
         bad = replace(modern, fit_normalized_rms=100.0)
-        bridge_force = None
+        identity_initial_parameters = None
 
         def fake_fit(rows, seed, *_args, **kwargs):
-            nonlocal bridge_force
+            nonlocal identity_initial_parameters
             if seed is local_initial:
                 return local, 1.0, len(rows)
-            if seed is bridge:
-                bridge_force = kwargs.get("fixed_nongravitational")
+            if len(rows) == 12 and kwargs.get("fit_state") is False:
+                identity_initial_parameters = dict(_args[2] or {})
+                return local, 100.0, len(rows)
+            if len(rows) == 12 and kwargs.get("max_nfev") == 48:
                 return linked, 1.0, len(rows)
             if len(rows) == 12 and kwargs.get("max_nfev") in (6, 16):
                 return bad, 100.0, len(rows)
             return modern, 1.0, len(rows)
 
-        def fake_appraisal(rows, solution, *_args, **_kwargs):
-            value = 1.0 if solution is bridge else 100.0
+        def fake_appraisal(rows, _solution, *_args, **_kwargs):
+            value = 100.0
             for observation in rows:
                 observation.residual_ra_arcsec = value
                 observation.residual_dec_arcsec = value
@@ -1845,8 +1835,11 @@ class OrbitFitSelectionTests(unittest.TestCase):
                 return_value=local,
             ),
             patch(
-                "orbit_app.orbit_fit._interpolate_identification_states",
-                return_value=[bridge],
+                "orbit_app.orbit_fit._apparition_orbit_similarity",
+                return_value=(True, {
+                    "plane_deg": 1.0, "apsidal_deg": 2.0,
+                    "q_fraction": .01, "e_difference": .02,
+                }),
             ),
             patch(
                 "orbit_app.orbit_fit._evaluate_solution_observations",
@@ -1858,9 +1851,12 @@ class OrbitFitSelectionTests(unittest.TestCase):
                 observations, modern,
                 nongravitational={"A1": 1.01e-8, "A2": 6.684e-10},
             )
-        self.assertEqual(bridge_force, {})
+        self.assertEqual(
+            identity_initial_parameters,
+            {"A1": 0.0, "A2": 0.0},
+        )
         self.assertIn(
-            "A1/A2 nebyly pro identifikaci použity",
+            "fitovala A1/A2 od nulových hodnot",
             result[0].apparition_linkage[0]["reason"],
         )
 
