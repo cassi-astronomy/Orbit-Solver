@@ -1207,6 +1207,58 @@ class OrbitFitSelectionTests(unittest.TestCase):
             ["linked", "linked"],
         )
 
+    def test_acceptable_exact_propagation_skips_unstable_linkage_branches(self):
+        observations = [
+            Observation(
+                time=f"{year}-03-{day:02d}T00:00:00Z",
+                ra_deg=10.0, dec_deg=20.0,
+            )
+            for year in (1892, 2008)
+            for day in range(1, 7)
+        ]
+        solution = OrbitSolution(
+            "206P", 2454759.0, 3.24, .647, 32.9, 204.1, 181.4, 359.0,
+            position_au=(2.0, 0.0, 0.0),
+            velocity_au_per_day=(0.0, .01, 0.0),
+            fit_normalized_rms=.6,
+            nongravitational_parameters={"A1": 1.01e-8, "A2": 6.684e-10},
+        )
+        calls = []
+
+        def fake_fit(rows, *_args, **kwargs):
+            calls.append((len(rows), kwargs.get("max_nfev")))
+            return solution, 0.8, len(rows)
+
+        def acceptable_propagation(rows, *_args, **_kwargs):
+            for observation in rows:
+                observation.residual_ra_arcsec = 1.0
+                observation.residual_dec_arcsec = 1.0
+                observation.used_in_fit = False
+            return 1.0, 1.0, len(rows)
+
+        with (
+            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit),
+            patch(
+                "orbit_app.orbit_fit._evaluate_solution_observations",
+                side_effect=acceptable_propagation,
+            ),
+            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
+        ):
+            result = fit_orbit(
+                observations, solution,
+                nongravitational={"A1": 1.01e-8, "A2": 6.684e-10},
+            )
+
+        self.assertNotIn((12, 6), calls)
+        self.assertEqual(
+            [item["status"] for item in result[0].apparition_linkage or ()],
+            ["linked", "linked"],
+        )
+        self.assertIn(
+            "přesnou propagací",
+            result[0].apparition_linkage[0]["reason"],
+        )
+
     def test_known_comet_can_use_catalogue_state_only_as_verified_third_seed(self):
         observations = [
             Observation(

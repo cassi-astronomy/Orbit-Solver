@@ -3243,6 +3243,109 @@ def fit_orbit(
                 candidate_source = "propagated"
                 best_failed_trial = None
                 failures: list[str] = []
+                return_year = apparition_linkage[first_group].get(
+                    "return_year", "?"
+                )
+
+                # The newer-return fit can already be the correct common
+                # dynamical branch.  In that case an encounter-sensitive
+                # differential correction is optional refinement, not a
+                # prerequisite for accepting the linkage.  Validate the
+                # exact propagation on every original row before launching
+                # alternative local/catalogue branches.  This is the 206P
+                # case: the propagated 1892 return is about 44 arcsec (3.7σ),
+                # comfortably inside the named linkage limits, while an
+                # unconstrained correction leaves that basin entirely.
+                validation_rows = [
+                    observation
+                    for group in stage_groups
+                    for observation in group
+                ]
+                validation_report = [
+                    (
+                        observation.residual_ra_arcsec,
+                        observation.residual_dec_arcsec,
+                        observation.used_in_fit,
+                    )
+                    for observation in validation_rows
+                ]
+                try:
+                    validation_rms, validation_normalized, validation_count = (
+                        _evaluate_solution_observations(
+                            validation_rows, last_good[0], all_parameters,
+                            cancel_callback,
+                        )
+                    )
+                    validation_appraisals = [
+                        _robust_apparition_appraisal(group)[:2]
+                        for group in stage_groups
+                    ]
+                    propagation_is_acceptable = bool(
+                        validation_rms <= LINKAGE_ACCEPT_RMS_ARCSEC
+                        and validation_normalized
+                        <= LINKAGE_ACCEPT_NORMALIZED_RMS
+                        and all(
+                            rms <= LINKAGE_ACCEPT_RMS_ARCSEC
+                            and normalized
+                            <= LINKAGE_ACCEPT_NORMALIZED_RMS
+                            for rms, normalized in validation_appraisals
+                        )
+                    )
+                except (
+                    OrbitFitError, ValueError, RuntimeError,
+                    FloatingPointError,
+                ):
+                    propagation_is_acceptable = False
+                if not propagation_is_acceptable:
+                    # A rejected read-only appraisal must not leak its O-C
+                    # values into the subsequent independent branch trials.
+                    for observation, report_values in zip(
+                        validation_rows, validation_report,
+                    ):
+                        (
+                            observation.residual_ra_arcsec,
+                            observation.residual_dec_arcsec,
+                            observation.used_in_fit,
+                        ) = report_values
+                if propagation_is_acceptable:
+                    validated_solution = replace(
+                        last_good[0],
+                        fit_rms_arcsec=validation_rms,
+                        fit_normalized_rms=validation_normalized,
+                        fit_available_observation_count=validation_count,
+                    )
+                    last_good = (
+                        validated_solution, validation_rms, validation_count,
+                    )
+                    linked_count += 1
+                    linked_parameter_names.update(all_parameters)
+                    for group_index in range(
+                        first_group, len(apparition_groups)
+                    ):
+                        apparition_linkage[group_index]["status"] = "linked"
+                        apparition_linkage[group_index]["reason"] = (
+                            "Společná N-body větev byla potvrzena přesnou "
+                            "propagací na astrometrii tohoto návratu ještě "
+                            "před diferenciální korekcí."
+                        )
+                        _update_apparition_linkage_metrics(
+                            apparition_linkage[group_index],
+                            apparition_groups[group_index],
+                        )
+                    last_good_report = [
+                        (
+                            observation.residual_ra_arcsec,
+                            observation.residual_dec_arcsec,
+                            observation.used_in_fit,
+                        )
+                        for observation in observations
+                    ]
+                    result = last_good
+                    report_progress(
+                        f"Návrat {return_year}: přesná propagace společnou "
+                        "větev potvrdila; pokračuji bezpečným zpřesněním…"
+                    )
+                    continue
 
                 def remember_failed_trial(trial_result) -> None:
                     nonlocal best_failed_trial
@@ -3259,10 +3362,6 @@ def fit_orbit(
                         return
                     if score < best_failed_trial[0]:
                         best_failed_trial = (score, trial_result)
-
-                return_year = apparition_linkage[first_group].get(
-                    "return_year", "?"
-                )
 
                 def attempt_arc_extension():
                     """Grow the old arc before trying unrelated full-fit basins."""
@@ -4156,6 +4255,7 @@ def fit_orbit(
                         exact_linkage_parameters,
                         maximum_observations=None,
                         max_nfev=28, robust_loss=True, robust_scale=8.0,
+                        preserve_linkage_branch=True,
                     )
                     exact_seed = bridge[0]
                 apparition_weights = None
@@ -4181,6 +4281,7 @@ def fit_orbit(
                     robust_loss=True, robust_scale=8.0,
                     strict_polish=True,
                     observation_weights=apparition_weights,
+                    preserve_linkage_branch=True,
                 )
                 if (
                     catalogue_seed_verified
