@@ -1800,8 +1800,32 @@ class OrbitFitSelectionTests(unittest.TestCase):
                 progress_callback=progress,
             )
         self.assertIs(result[0], seed)
-        self.assertIsNone(observations[0].residual_ra_arcsec)
-        self.assertAlmostEqual(observations[-1].residual_ra_arcsec or 0.0, .2)
+        self.assertIsNotNone(observations[0].residual_ra_arcsec)
+        self.assertFalse(observations[0].used_in_fit)
+        historical_components = np.asarray([
+            component
+            for observation in observations[:6]
+            for component in (
+                observation.residual_ra_arcsec,
+                observation.residual_dec_arcsec,
+            )
+        ], dtype=float)
+        self.assertAlmostEqual(
+            result[0].apparition_linkage[0]["rms_arcsec"],
+            float(np.sqrt(np.mean(np.square(historical_components)))),
+        )
+        modern_components = np.asarray([
+            component
+            for observation in observations[6:]
+            for component in (
+                observation.residual_ra_arcsec,
+                observation.residual_dec_arcsec,
+            )
+        ], dtype=float)
+        self.assertAlmostEqual(
+            result[0].apparition_linkage[1]["rms_arcsec"],
+            float(np.sqrt(np.mean(np.square(modern_components)))),
+        )
         self.assertIn("neprošel kontrolou kvality", seed.fit_model_note or "")
         self.assertIn(
             "přímá propagace",

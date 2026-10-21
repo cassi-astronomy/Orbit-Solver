@@ -3241,7 +3241,7 @@ def fit_orbit(
                 )
                 candidate = None
                 candidate_source = "propagated"
-                best_failed_trial = None
+                best_failed_trial: dict[str, object] | None = None
                 failures: list[str] = []
                 return_year = apparition_linkage[first_group].get(
                     "return_year", "?"
@@ -3270,6 +3270,9 @@ def fit_orbit(
                     for observation in validation_rows
                 ]
                 validation_diagnostic = ""
+                validation_evaluated_report: list[
+                    tuple[float | None, float | None, bool | None]
+                ] = []
                 try:
                     # Integrate each apparition independently from the same
                     # osculating state.  Besides matching the per-return audit
@@ -3290,6 +3293,14 @@ def fit_orbit(
                         validation_appraisals.append(
                             _robust_apparition_appraisal(group)[:2]
                         )
+                    validation_evaluated_report = [
+                        (
+                            observation.residual_ra_arcsec,
+                            observation.residual_dec_arcsec,
+                            observation.used_in_fit,
+                        )
+                        for observation in observations
+                    ]
                     validation_count = sum(
                         item[2] for item in validation_results
                     )
@@ -3310,7 +3321,7 @@ def fit_orbit(
                     validation_diagnostic = (
                         "přímá propagace po návratech: "
                         + ", ".join(
-                            f"{apparition_linkage[first_group + offset].get('return_year', '?')} "
+                            f"{apparition_linkage[first_group + offset].get('year_start', '?')} "
                             f"{rms:.2f}″/{normalized:.2f}σ"
                             for offset, (rms, normalized) in enumerate(
                                 validation_appraisals
@@ -3385,11 +3396,71 @@ def fit_orbit(
                         else np.inf,
                         float(trial_result[1]),
                     )
+                    entry: dict[str, object] = {
+                        "score": score,
+                        "trial": trial_result,
+                        "appraisals": [],
+                        "report": [],
+                    }
+                    if (
+                        best_failed_trial is None
+                        or score < best_failed_trial["score"]
+                    ):
+                        best_failed_trial = entry
+
+                def appraise_best_failed_trial() -> None:
+                    """Exactly score only the best cheap candidate by return."""
                     if best_failed_trial is None:
-                        best_failed_trial = (score, trial_result)
                         return
-                    if score < best_failed_trial[0]:
-                        best_failed_trial = (score, trial_result)
+                    trial_result = best_failed_trial["trial"]
+                    if (
+                        not np.isfinite(trial_result[1])
+                        or trial_result[1] > 5000.0
+                    ):
+                        return
+                    previous_report = [
+                        (
+                            observation.residual_ra_arcsec,
+                            observation.residual_dec_arcsec,
+                            observation.used_in_fit,
+                        )
+                        for observation in observations
+                    ]
+                    try:
+                        trial_parameters = fitted_nongrav(trial_result[0])
+                        appraisals: list[tuple[float, float]] = []
+                        for group in stage_groups:
+                            _evaluate_solution_observations(
+                                group, trial_result[0], trial_parameters,
+                                cancel_callback,
+                            )
+                            appraisals.append(
+                                _robust_apparition_appraisal(group)[:2]
+                            )
+                        best_failed_trial["appraisals"] = appraisals
+                        best_failed_trial["report"] = [
+                            (
+                                observation.residual_ra_arcsec,
+                                observation.residual_dec_arcsec,
+                                observation.used_in_fit,
+                            )
+                            for observation in observations
+                        ]
+                    except (
+                        OrbitFitError, ValueError, RuntimeError,
+                        FloatingPointError, OverflowError,
+                    ):
+                        best_failed_trial["appraisals"] = []
+                        best_failed_trial["report"] = []
+                    finally:
+                        for observation, values in zip(
+                            observations, previous_report,
+                        ):
+                            (
+                                observation.residual_ra_arcsec,
+                                observation.residual_dec_arcsec,
+                                observation.used_in_fit,
+                            ) = values
 
                 def attempt_arc_extension():
                     """Grow the old arc before trying unrelated full-fit basins."""
@@ -3749,7 +3820,8 @@ def fit_orbit(
                                     f"Návrat {return_year}: zpřesňuji fázi "
                                     "řídké historické aparice přes A1/A2…"
                                 )
-                                sparse_seed = best_failed_trial[1][0]
+                                sparse_trial_record = best_failed_trial["trial"]
+                                sparse_seed = sparse_trial_record[0]
                                 sparse_parameters = {
                                     name: value for name, value in
                                     fitted_nongrav(sparse_seed).items()
@@ -4042,8 +4114,27 @@ def fit_orbit(
                     # nevertheless fitted and validated against all stage
                     # astrometry, never accepted from a catalogue value alone.
                     if candidate is None and best_failed_trial is not None:
+                        appraise_best_failed_trial()
+                        best_appraisals = best_failed_trial["appraisals"]
+                        if best_appraisals and all(
+                            rms <= LINKAGE_ACCEPT_RMS_ARCSEC
+                            and normalized <= LINKAGE_ACCEPT_NORMALIZED_RMS
+                            for rms, normalized in best_appraisals
+                        ):
+                            candidate = best_failed_trial["trial"]
+                            candidate_source = "balanced_appraisal"
+                            for observation, values in zip(
+                                observations, best_failed_trial["report"],
+                            ):
+                                (
+                                    observation.residual_ra_arcsec,
+                                    observation.residual_dec_arcsec,
+                                    observation.used_in_fit,
+                                ) = values
+                    if candidate is None and best_failed_trial is not None:
+                        failed_trial = best_failed_trial["trial"]
                         expanded_parameters = fitted_nongrav(
-                            best_failed_trial[1][0]
+                            failed_trial[0]
                         )
                         extra_parameters = (
                             set(expanded_parameters) - set(linkage_parameters)
@@ -4057,7 +4148,7 @@ def fit_orbit(
                                 )
                                 expanded_prefit = fit_once(
                                     stage_observations,
-                                    best_failed_trial[1][0], constraints,
+                                    failed_trial[0], constraints,
                                     truncate_years, expanded_parameters,
                                     maximum_observations=min(
                                         320, 80 * stage_count
@@ -4114,8 +4205,9 @@ def fit_orbit(
                     # every apparition in the final differential correction;
                     # it is attempted only after the safer robust branches.
                     if candidate is None and best_failed_trial is not None:
+                        failed_trial = best_failed_trial["trial"]
                         forcing_parameters = fitted_nongrav(
-                            best_failed_trial[1][0]
+                            failed_trial[0]
                         )
                         try:
                             report_progress(
@@ -4124,7 +4216,7 @@ def fit_orbit(
                             )
                             forced_trial = fit_once(
                                 stage_observations,
-                                best_failed_trial[1][0], constraints,
+                                failed_trial[0], constraints,
                                 truncate_years,
                                 None if hold_secular_parameters
                                 else forcing_parameters,
@@ -4166,9 +4258,29 @@ def fit_orbit(
                             )
                     if candidate is None:
                         displayed_failures = failures[-2:]
+                        best_appraisals = (
+                            best_failed_trial["appraisals"]
+                            if best_failed_trial is not None else []
+                        )
+                        best_diagnostic = ""
+                        if best_appraisals:
+                            best_diagnostic = (
+                                "nejlepší mezivětev po návratech: "
+                                + ", ".join(
+                                    f"{apparition_linkage[first_group + offset].get('year_start', '?')} "
+                                    f"{rms:.2f}″/{normalized:.2f}σ"
+                                    for offset, (rms, normalized) in enumerate(
+                                        best_appraisals
+                                    )
+                                )
+                            )
                         if validation_diagnostic:
                             displayed_failures = [
                                 validation_diagnostic, *displayed_failures,
+                            ]
+                        if best_diagnostic:
+                            displayed_failures = [
+                                *displayed_failures, best_diagnostic,
                             ]
                         detail = (
                             "; ".join(displayed_failures)
@@ -4182,10 +4294,6 @@ def fit_orbit(
                     if apparition_linkage:
                         apparition_linkage[first_group]["status"] = "failed"
                         apparition_linkage[first_group]["reason"] = str(exc)
-                        _update_apparition_linkage_metrics(
-                            apparition_linkage[first_group],
-                            apparition_groups[first_group],
-                        )
                         for older_index in range(first_group):
                             apparition_linkage[older_index]["status"] = "not_attempted"
                             apparition_linkage[older_index]["reason"] = (
@@ -4213,6 +4321,32 @@ def fit_orbit(
                             observation.residual_dec_arcsec,
                             observation.used_in_fit,
                         ) = report_values
+                    # Recompute O-C for the orbit which is actually returned.
+                    # Previously the linkage table retained residuals from the
+                    # last rejected trial (44 arcsec for 206P) beside the
+                    # restored modern-only orbit whose true 1892 miss was
+                    # 2336 arcsec.
+                    if validation_evaluated_report:
+                        for observation, evaluated, retained in zip(
+                            observations, validation_evaluated_report,
+                            last_good_report,
+                        ):
+                            observation.residual_ra_arcsec = evaluated[0]
+                            observation.residual_dec_arcsec = evaluated[1]
+                            observation.used_in_fit = retained[2]
+                    else:
+                        for observation, report_values in zip(
+                            observations, last_good_report,
+                        ):
+                            (
+                                observation.residual_ra_arcsec,
+                                observation.residual_dec_arcsec,
+                                observation.used_in_fit,
+                            ) = report_values
+                    for group_index, group in enumerate(apparition_groups):
+                        _update_apparition_linkage_metrics(
+                            apparition_linkage[group_index], group,
+                        )
                     result[0].fit_model_note = (
                         f"Společná korekce pro {linked_count} z "
                         f"{len(apparition_groups)} pozorovaných návratů prošla; "
@@ -4243,6 +4377,10 @@ def fit_orbit(
                         "Společný N-body fit byl potvrzen vyváženou lineární "
                         "korekcí všech připojených aparic."
                         if candidate_source == "balanced_forcing" else
+                        "Společná N-body větev byla přijata podle samostatné "
+                        "přesné kontroly každé aparice; souhrnné RMS ji "
+                        "původně neprávem skrylo."
+                        if candidate_source == "balanced_appraisal" else
                         "Společný N-body fit byl nalezen postupným rozšířením "
                         "pozorovacího oblouku do starší aparice."
                         if candidate_source == "arc_extension" else
