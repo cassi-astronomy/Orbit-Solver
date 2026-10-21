@@ -3994,7 +3994,16 @@ def fit_orbit(
                                             )
                                             for observation in observations
                                         ]
-                                        period_seed = old_seed
+                                        # Search the accumulated phase from
+                                        # the well-fitted modern apparition.
+                                        # Starting from the independent old
+                                        # orbit would preserve 1892 while a
+                                        # tiny period change could miss 2008
+                                        # by tens of degrees.  The old orbit
+                                        # is used above to identify the branch,
+                                        # not as the phase-search origin.
+                                        period_base = last_good[0]
+                                        period_seed = period_base
                                         period_diagnostic = ""
                                         try:
                                             phase_groups = [
@@ -4034,7 +4043,7 @@ def fit_orbit(
                                                 try:
                                                     trial_seed = (
                                                         _transverse_period_candidate(
-                                                            old_seed,
+                                                            period_base,
                                                             period_change,
                                                         )
                                                     )
@@ -4139,7 +4148,7 @@ def fit_orbit(
                                             )
                                             old_period = (
                                                 2.0 * np.pi * np.sqrt(
-                                                    old_seed.semi_major_axis_au
+                                                    period_base.semi_major_axis_au
                                                     ** 3 / MU_SUN
                                                 )
                                             )

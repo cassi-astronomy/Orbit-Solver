@@ -1832,13 +1832,14 @@ class OrbitFitSelectionTests(unittest.TestCase):
         )
         local = replace(local_initial, fit_normalized_rms=1.0)
         period_best = replace(
-            local,
-            velocity_au_per_day=(-.002, .0200002, .004),
+            modern,
+            velocity_au_per_day=(0.0, .0100001, 0.0),
         )
         linked = replace(local, fit_normalized_rms=1.0)
         bad = replace(modern, fit_normalized_rms=100.0)
         identity_initial_parameters = None
         identity_started_from_period_branch = False
+        period_search_started_from_modern_apparition = False
 
         def fake_fit(rows, seed, *_args, **kwargs):
             nonlocal identity_initial_parameters, identity_started_from_period_branch
@@ -1861,6 +1862,14 @@ class OrbitFitSelectionTests(unittest.TestCase):
                 observation.residual_dec_arcsec = value
                 observation.used_in_fit = False
             return value, value, len(rows)
+
+        def fake_period_candidate(solution, change):
+            nonlocal period_search_started_from_modern_apparition
+            period_search_started_from_modern_apparition = (
+                period_search_started_from_modern_apparition
+                or solution is modern
+            )
+            return period_best if change == 1e-5 else solution
 
         with (
             patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit),
@@ -1885,9 +1894,7 @@ class OrbitFitSelectionTests(unittest.TestCase):
             ),
             patch(
                 "orbit_app.orbit_fit._transverse_period_candidate",
-                side_effect=lambda solution, change: (
-                    period_best if change == 1e-5 else solution
-                ),
+                side_effect=fake_period_candidate,
             ),
             patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
         ):
@@ -1900,6 +1907,7 @@ class OrbitFitSelectionTests(unittest.TestCase):
             {"A1": 0.0, "A2": 0.0},
         )
         self.assertTrue(identity_started_from_period_branch)
+        self.assertTrue(period_search_started_from_modern_apparition)
         self.assertIn(
             "fitovala A1/A2 od nulových hodnot",
             result[0].apparition_linkage[0]["reason"],
