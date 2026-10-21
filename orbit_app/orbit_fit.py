@@ -41,6 +41,67 @@ ProgressCallback = Callable[[str, int, int], None]
 CancelCallback = Callable[[], bool]
 
 
+def _branch_preserving_backtrack(
+    initial: np.ndarray,
+    proposed: np.ndarray,
+    residual_evaluator: Callable[[np.ndarray], np.ndarray],
+    component_groups: list[np.ndarray],
+    sigmas: np.ndarray,
+    minimum_scale: float = 1.0 / 256.0,
+) -> tuple[np.ndarray, float]:
+    """Shorten a correction step until it remains on the propagated branch.
+
+    Residuals and ``sigmas`` use the same two-components-per-observation
+    layout.  The joint normalized objective must improve, while no already
+    linked apparition may become materially worse.  Scale zero deliberately
+    preserves the verified state when even a short step leaves its basin.
+    """
+    start = np.asarray(initial, dtype=float)
+    target = np.asarray(proposed, dtype=float)
+    baseline = np.asarray(residual_evaluator(start), dtype=float)
+    sigma_values = np.asarray(sigmas, dtype=float)
+    if (
+        baseline.shape != sigma_values.shape
+        or not np.all(np.isfinite(baseline))
+        or not np.all(np.isfinite(sigma_values))
+        or np.any(sigma_values <= 0.0)
+    ):
+        return start.copy(), 0.0
+    baseline_normalized = baseline / sigma_values
+    baseline_cost = float(np.dot(baseline_normalized, baseline_normalized))
+    nonempty_groups = [indices for indices in component_groups if indices.size]
+    baseline_group_rms = [
+        float(np.sqrt(np.mean(np.square(baseline[indices]))))
+        for indices in nonempty_groups
+    ]
+    scale = 1.0
+    while scale >= minimum_scale:
+        candidate = start + scale * (target - start)
+        try:
+            residual = np.asarray(residual_evaluator(candidate), dtype=float)
+        except (RuntimeError, ValueError, FloatingPointError, OverflowError):
+            scale *= 0.5
+            continue
+        if residual.shape != baseline.shape or not np.all(np.isfinite(residual)):
+            scale *= 0.5
+            continue
+        normalized = residual / sigma_values
+        cost = float(np.dot(normalized, normalized))
+        groups_ok = True
+        for indices, starting_rms in zip(nonempty_groups, baseline_group_rms):
+            candidate_rms = float(np.sqrt(np.mean(np.square(residual[indices]))))
+            # Allow only sampling/numerical-scale movement in a good return;
+            # the remote return must supply the real decrease in joint cost.
+            permitted = max(starting_rms * 1.02, starting_rms + 0.05)
+            if candidate_rms > permitted:
+                groups_ok = False
+                break
+        if groups_ok and cost < baseline_cost * (1.0 - 1e-10):
+            return candidate, scale
+        scale *= 0.5
+    return start.copy(), 0.0
+
+
 def _linkage_trial_is_acceptable(
     trial: tuple[OrbitSolution, float, int],
 ) -> bool:
@@ -1146,6 +1207,7 @@ def _fit_orbit_once(
     fit_state: bool = True,
     observation_weights: dict[int, float] | None = None,
     strict_polish: bool = False,
+    preserve_linkage_branch: bool = False,
     cancel_callback: CancelCallback | None = None,
 ) -> tuple[OrbitSolution, float, int]:
     def check_cancelled() -> None:
@@ -1655,11 +1717,49 @@ def _fit_orbit_once(
             max_nfev=min(8, max_nfev or 8), verbose=0,
         )
         result_vector = expand_fit_vector(result.x)
+    if preserve_linkage_branch:
+        # Encounter-sensitive century-scale mappings can turn one nominal TRF
+        # step into a jump to another phase branch.  Test fractions of that
+        # step with the strict force model before allowing it to replace the
+        # already verified propagated solution.
+        group_ids = {
+            id(observation): group_index
+            for group_index, group in enumerate(
+                _observing_apparition_groups(
+                    [item[0] for item in usable], initial,
+                )
+            )
+            for observation in group
+        }
+        grouped_components: list[list[int]] = []
+        for row_index, item in enumerate(usable):
+            group_index = group_ids.get(id(item[0]), 0)
+            while len(grouped_components) <= group_index:
+                grouped_components.append([])
+            grouped_components[group_index].extend(
+                (2 * row_index, 2 * row_index + 1)
+            )
+        safe_vector, accepted_scale = _branch_preserving_backtrack(
+            optimizer_initial,
+            result.x,
+            lambda vector: astrometric_residuals(
+                expand_fit_vector(vector), exact_full_engine,
+            ),
+            [np.asarray(indices, dtype=int) for indices in grouped_components],
+            astrometric_sigmas,
+        )
+        if accepted_scale < 1.0:
+            result.x = safe_vector
+            result_vector = expand_fit_vector(safe_vector)
+            result.jac = optimizer_jacobian(safe_vector)
     if not result.success and result.nfev < 2:
         raise OrbitFitError(result.message)
     check_cancelled()
     elements = cartesian_to_elements(result_vector[:3], result_vector[3:6])
-    reporting_engine = optimizer_engine if screening else full_engine
+    reporting_engine = (
+        full_engine if preserve_linkage_branch or not screening
+        else optimizer_engine
+    )
     try:
         final_astrometric_residual = astrometric_residuals(result_vector, reporting_engine)
     except (RuntimeError, ValueError, FloatingPointError, OverflowError) as exc:
@@ -3306,7 +3406,7 @@ def fit_orbit(
                         ),
                         maximum_observations=min(240, 60 * stage_count),
                         max_nfev=6, robust_loss=True, robust_scale=25.0,
-                        screening=True,
+                        screening=True, preserve_linkage_branch=True,
                     )
                     normalized = trial[0].fit_normalized_rms
                     if (

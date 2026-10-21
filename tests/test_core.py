@@ -44,6 +44,7 @@ from orbit_app.orbit_fit import (
     _arc_extension_counts,
     _automatic_orbit_score, _InterpolatedPlanetEphemeris,
     _attach_multi_apparition_elements, _balanced_linkage_observations,
+    _branch_preserving_backtrack,
     _coherent_secondary_track_candidates,
     _calibrate_fitted_photometry,
     _formal_element_uncertainties,
@@ -665,6 +666,46 @@ class PreviewGeometryTests(unittest.TestCase):
 
 
 class OrbitFitSelectionTests(unittest.TestCase):
+    def test_branch_backtracking_rejects_step_that_ruins_one_apparition(self):
+        initial = np.array([0.0])
+        proposed = np.array([1.0])
+        groups = [np.array([0, 1]), np.array([2, 3])]
+
+        def residuals(vector):
+            step = float(vector[0])
+            return np.array([
+                0.8 + 20.0 * step,
+                0.8 + 20.0 * step,
+                44.2 - 60.0 * step,
+                44.2 - 60.0 * step,
+            ])
+
+        accepted, scale = _branch_preserving_backtrack(
+            initial, proposed, residuals, groups, np.ones(4),
+        )
+        self.assertEqual(scale, 0.0)
+        np.testing.assert_array_equal(accepted, initial)
+
+    def test_branch_backtracking_accepts_short_joint_improvement(self):
+        initial = np.array([0.0])
+        proposed = np.array([1.0])
+        groups = [np.array([0, 1]), np.array([2, 3])]
+
+        def residuals(vector):
+            step = float(vector[0])
+            return np.array([
+                0.8 + 0.1 * step,
+                0.8 + 0.1 * step,
+                44.2 - 80.0 * step,
+                44.2 - 80.0 * step,
+            ])
+
+        accepted, scale = _branch_preserving_backtrack(
+            initial, proposed, residuals, groups, np.ones(4),
+        )
+        self.assertEqual(scale, 0.5)
+        np.testing.assert_allclose(accepted, [0.5])
+
     def test_linkage_quality_gate_has_named_physical_and_normalized_limits(self):
         accepted = OrbitSolution("X", 2460000.5, 2.0, .2, 0, 0, 0, 0)
         accepted.fit_normalized_rms = 8.0
