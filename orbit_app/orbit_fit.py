@@ -2322,6 +2322,54 @@ def _apparition_orbit_similarity(
     return similar, metrics
 
 
+def _transverse_period_candidate(
+    solution: OrbitSolution,
+    fractional_transverse_change: float,
+) -> OrbitSolution:
+    """Perturb mean motion while preserving epoch position and radial speed.
+
+    The dimensionless change applies only to the transverse velocity in the
+    heliocentric J2000-ecliptic orbital plane.  It is a branch-finding seed for
+    a period/phase search, not a fitted solution.
+    """
+    if solution.position_au is None or solution.velocity_au_per_day is None:
+        raise OrbitFitError("Periodové korekci chybí kartézský stav.")
+    position = np.asarray(solution.position_au, dtype=float)
+    velocity = np.asarray(solution.velocity_au_per_day, dtype=float)
+    radius = float(np.linalg.norm(position))
+    angular_momentum = np.cross(position, velocity)
+    h_norm = float(np.linalg.norm(angular_momentum))
+    if radius <= 0.0 or h_norm <= 0.0:
+        raise OrbitFitError("Periodová korekce dostala degenerovaný stav.")
+    radial_direction = position / radius
+    normal_direction = angular_momentum / h_norm
+    transverse_direction = np.cross(normal_direction, radial_direction)
+    radial_speed = float(np.dot(velocity, radial_direction))
+    transverse_speed = float(np.dot(velocity, transverse_direction))
+    corrected_velocity = (
+        radial_speed * radial_direction
+        + transverse_speed
+        * (1.0 + float(fractional_transverse_change))
+        * transverse_direction
+    )
+    elements = cartesian_to_elements(position, corrected_velocity)
+    return replace(
+        solution,
+        semi_major_axis_au=elements[0],
+        eccentricity=elements[1],
+        inclination_deg=elements[2],
+        node_deg=elements[3],
+        arg_peri_deg=elements[4],
+        mean_anomaly_deg=elements[5],
+        velocity_au_per_day=tuple(
+            float(value) for value in corrected_velocity
+        ),
+        state_covariance=None,
+        element_uncertainties=None,
+        nongravitational_parameters=None,
+    )
+
+
 def _needs_historical_identification(
     earlier_epoch_jd: float,
     later_epoch_jd: float,
@@ -3936,7 +3984,198 @@ def fit_orbit(
                                         report_progress(
                                             f"Návrat {return_year}: dráhy jsou "
                                             f"dynamicky podobné ({similarity_text}); "
-                                            "koriguji společnou dráhu…"
+                                            "hledám periodovou větev…"
+                                        )
+                                        phase_report = [
+                                            (
+                                                observation.residual_ra_arcsec,
+                                                observation.residual_dec_arcsec,
+                                                observation.used_in_fit,
+                                            )
+                                            for observation in observations
+                                        ]
+                                        period_seed = old_seed
+                                        period_diagnostic = ""
+                                        try:
+                                            phase_groups = [
+                                                _balanced_linkage_observations(
+                                                    [group],
+                                                    maximum_per_group=8,
+                                                )
+                                                for group in stage_groups
+                                            ]
+                                            phase_rows = [
+                                                observation
+                                                for group in phase_groups
+                                                for observation in group
+                                            ]
+                                            period_changes = (
+                                                0.0,
+                                                -1e-6, 1e-6,
+                                                -3e-6, 3e-6,
+                                                -1e-5, 1e-5,
+                                                -3e-5, 3e-5,
+                                                -1e-4, 1e-4,
+                                                -3e-4, 3e-4,
+                                                -1e-3, 1e-3,
+                                                -3e-3, 3e-3,
+                                            )
+                                            period_trials: list[
+                                                tuple[
+                                                    tuple[float, float],
+                                                    float,
+                                                    OrbitSolution,
+                                                    list[tuple[float, float]],
+                                                ]
+                                            ] = []
+                                            def evaluate_period_change(
+                                                period_change: float,
+                                            ) -> None:
+                                                try:
+                                                    trial_seed = (
+                                                        _transverse_period_candidate(
+                                                            old_seed,
+                                                            period_change,
+                                                        )
+                                                    )
+                                                    (
+                                                        _, trial_normalized, _,
+                                                    ) = (
+                                                        _evaluate_solution_observations(
+                                                            phase_rows,
+                                                            trial_seed,
+                                                            identification_force,
+                                                            cancel_callback,
+                                                        )
+                                                    )
+                                                    appraisals = [
+                                                        _robust_apparition_appraisal(
+                                                            group
+                                                        )[:2]
+                                                        for group in phase_groups
+                                                    ]
+                                                    score = (
+                                                        max(
+                                                            item[1]
+                                                            for item in appraisals
+                                                        ),
+                                                        trial_normalized,
+                                                    )
+                                                    if not np.all(np.isfinite(score)):
+                                                        return
+                                                    period_trials.append((
+                                                        score,
+                                                        period_change,
+                                                        trial_seed,
+                                                        appraisals,
+                                                    ))
+                                                except OrbitFitCancelled:
+                                                    raise
+                                                except (
+                                                    OrbitFitError, ValueError,
+                                                    RuntimeError,
+                                                    FloatingPointError,
+                                                    OverflowError,
+                                                ):
+                                                    # A failed period hypothesis
+                                                    # is not a failure of the
+                                                    # independently verified
+                                                    # identity branch.
+                                                    return
+
+                                            for period_change in period_changes:
+                                                evaluate_period_change(
+                                                    period_change
+                                                )
+                                            if period_trials:
+                                                # Refine once on both sides of
+                                                # the best logarithmic-grid
+                                                # hypothesis.  This resolves
+                                                # the small phase correction
+                                                # without turning the branch
+                                                # search into another costly
+                                                # multidimensional fit.
+                                                ordered_trials = sorted(
+                                                    period_trials,
+                                                    key=lambda item: item[1],
+                                                )
+                                                best_trial = min(
+                                                    period_trials,
+                                                    key=lambda item: item[0],
+                                                )
+                                                best_index = ordered_trials.index(
+                                                    best_trial
+                                                )
+                                                if 0 < best_index < (
+                                                    len(ordered_trials) - 1
+                                                ):
+                                                    best_change = best_trial[1]
+                                                    evaluate_period_change(
+                                                        0.5 * (
+                                                            ordered_trials[
+                                                                best_index - 1
+                                                            ][1] + best_change
+                                                        )
+                                                    )
+                                                    evaluate_period_change(
+                                                        0.5 * (
+                                                            best_change
+                                                            + ordered_trials[
+                                                                best_index + 1
+                                                            ][1]
+                                                        )
+                                                    )
+                                            if not period_trials:
+                                                raise OrbitFitError(
+                                                    "Hledání periodové větve "
+                                                    "neposkytlo konečný stav."
+                                                )
+                                            (
+                                                _, best_period_change,
+                                                period_seed, period_appraisals,
+                                            ) = min(
+                                                period_trials,
+                                                key=lambda item: item[0],
+                                            )
+                                            old_period = (
+                                                2.0 * np.pi * np.sqrt(
+                                                    old_seed.semi_major_axis_au
+                                                    ** 3 / MU_SUN
+                                                )
+                                            )
+                                            best_period = (
+                                                2.0 * np.pi * np.sqrt(
+                                                    period_seed.semi_major_axis_au
+                                                    ** 3 / MU_SUN
+                                                )
+                                            )
+                                            period_diagnostic = (
+                                                "periodová větev "
+                                                f"Δvₜ/vₜ={best_period_change:+.1e}, "
+                                                f"ΔP={best_period - old_period:+.4f} d: "
+                                                + ", ".join(
+                                                    f"{apparition_linkage[first_group + offset].get('year_start', '?')} "
+                                                    f"{rms:.2f}″/{normalized:.2f}σ"
+                                                    for offset, (
+                                                        rms, normalized,
+                                                    ) in enumerate(
+                                                        period_appraisals
+                                                    )
+                                                )
+                                            )
+                                        finally:
+                                            for observation, values in zip(
+                                                observations, phase_report,
+                                            ):
+                                                (
+                                                    observation.residual_ra_arcsec,
+                                                    observation.residual_dec_arcsec,
+                                                    observation.used_in_fit,
+                                                ) = values
+                                        report_progress(
+                                            f"Návrat {return_year}: "
+                                            f"{period_diagnostic}; koriguji "
+                                            "společnou dráhu…"
                                         )
                                         # The published A terms are not used
                                         # to establish the identity.  Start
@@ -3952,13 +4191,17 @@ def fit_orbit(
                                             for name, value in
                                             linkage_parameters.items()
                                         }
-                                        identity_prefit = local_solutions[0]
+                                        identity_prefit = (
+                                            period_seed,
+                                            np.inf,
+                                            len(stage_observations),
+                                        )
                                         if any(
                                             name in identity_parameters
                                             for name in ("A1", "A2", "A3", "DT")
                                         ):
                                             identity_prefit = fit_once(
-                                                stage_observations, old_seed,
+                                                stage_observations, period_seed,
                                                 constraints, truncate_years,
                                                 identity_parameters,
                                                 maximum_observations=min(
@@ -4008,7 +4251,8 @@ def fit_orbit(
                                                 "společná korekce po potvrzení "
                                                 "identity: RMS "
                                                 f"{identity_trial[1]:.2f}″; "
-                                                f"{similarity_text}"
+                                                f"{similarity_text}; "
+                                                f"{period_diagnostic}"
                                             )
                                             failures.append(
                                                 identification_diagnostic

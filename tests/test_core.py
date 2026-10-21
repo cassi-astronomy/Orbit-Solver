@@ -59,6 +59,7 @@ from orbit_app.orbit_fit import (
     _latest_observing_apparition, _prefer_parabolic_short_arc,
     _representative_indices, _truncate_rows_to_recent_years,
     _robust_apparition_appraisal, _update_apparition_linkage_metrics,
+    _transverse_period_candidate,
     fit_orbit, fit_selection_count, parse_observation_time,
 )
 from orbit_app.photometry import estimate_absolute_magnitude, power_law_magnitude
@@ -1776,6 +1777,37 @@ class OrbitFitSelectionTests(unittest.TestCase):
             2459000.5 - 12.0 * 365.25, 2459000.5, six_year_comet,
         ))
 
+    def test_period_candidate_changes_only_transverse_velocity(self):
+        solution = OrbitSolution(
+            "206P", 2412450.5, 3.4, .6, 31.0, 208.0, 170.0, 0.0,
+            position_au=(1.4, .1, .05),
+            velocity_au_per_day=(-.002, .020, .004),
+            state_covariance=np.eye(6),
+            element_uncertainties={"a": .01},
+            nongravitational_parameters={"A1": 1e-8},
+        )
+        candidate = _transverse_period_candidate(solution, 2e-4)
+        position = np.asarray(solution.position_au)
+        original_velocity = np.asarray(solution.velocity_au_per_day)
+        corrected_velocity = np.asarray(candidate.velocity_au_per_day)
+        radial_direction = position / np.linalg.norm(position)
+        normal_direction = np.cross(position, original_velocity)
+        normal_direction /= np.linalg.norm(normal_direction)
+        transverse_direction = np.cross(normal_direction, radial_direction)
+
+        self.assertEqual(candidate.position_au, solution.position_au)
+        self.assertAlmostEqual(
+            float(np.dot(corrected_velocity, radial_direction)),
+            float(np.dot(original_velocity, radial_direction)),
+        )
+        self.assertAlmostEqual(
+            float(np.dot(corrected_velocity, transverse_direction)),
+            1.0002 * float(np.dot(original_velocity, transverse_direction)),
+        )
+        self.assertIsNone(candidate.state_covariance)
+        self.assertIsNone(candidate.element_uncertainties)
+        self.assertIsNone(candidate.nongravitational_parameters)
+
     def test_century_linkage_identifies_branch_before_releasing_a_terms(self):
         observations = [
             Observation(
@@ -1799,16 +1831,22 @@ class OrbitFitSelectionTests(unittest.TestCase):
             nongravitational_parameters=None,
         )
         local = replace(local_initial, fit_normalized_rms=1.0)
+        period_best = replace(
+            local,
+            velocity_au_per_day=(-.002, .0200002, .004),
+        )
         linked = replace(local, fit_normalized_rms=1.0)
         bad = replace(modern, fit_normalized_rms=100.0)
         identity_initial_parameters = None
+        identity_started_from_period_branch = False
 
         def fake_fit(rows, seed, *_args, **kwargs):
-            nonlocal identity_initial_parameters
+            nonlocal identity_initial_parameters, identity_started_from_period_branch
             if seed is local_initial:
                 return local, 1.0, len(rows)
             if len(rows) == 12 and kwargs.get("fit_state") is False:
                 identity_initial_parameters = dict(_args[2] or {})
+                identity_started_from_period_branch = seed is period_best
                 return local, 100.0, len(rows)
             if len(rows) == 12 and kwargs.get("max_nfev") == 48:
                 return linked, 1.0, len(rows)
@@ -1816,8 +1854,8 @@ class OrbitFitSelectionTests(unittest.TestCase):
                 return bad, 100.0, len(rows)
             return modern, 1.0, len(rows)
 
-        def fake_appraisal(rows, _solution, *_args, **_kwargs):
-            value = 100.0
+        def fake_appraisal(rows, solution, *_args, **_kwargs):
+            value = 1.0 if solution is period_best else 100.0
             for observation in rows:
                 observation.residual_ra_arcsec = value
                 observation.residual_dec_arcsec = value
@@ -1845,6 +1883,12 @@ class OrbitFitSelectionTests(unittest.TestCase):
                 "orbit_app.orbit_fit._evaluate_solution_observations",
                 side_effect=fake_appraisal,
             ),
+            patch(
+                "orbit_app.orbit_fit._transverse_period_candidate",
+                side_effect=lambda solution, change: (
+                    period_best if change == 1e-5 else solution
+                ),
+            ),
             patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
         ):
             result = fit_orbit(
@@ -1855,6 +1899,7 @@ class OrbitFitSelectionTests(unittest.TestCase):
             identity_initial_parameters,
             {"A1": 0.0, "A2": 0.0},
         )
+        self.assertTrue(identity_started_from_period_branch)
         self.assertIn(
             "fitovala A1/A2 od nulových hodnot",
             result[0].apparition_linkage[0]["reason"],

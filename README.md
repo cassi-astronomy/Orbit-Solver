@@ -46,7 +46,11 @@ uživatelské rozhraní a běží ve Windows i Linuxu.
   při hledání větve se husté dávky jedné stanice a noci převádějí na sférická
   normální místa, zatímco řídká historická měření zůstávají jednotlivě; starší
   návrat vytváří vlastní nezávislé předběžné dráhy místo opětovného použití
-  moderního stavu; pokud robustní hledání skončí těsně
+  moderního stavu; u ztracené periodické komety se tato dráha porovná se zpětně
+  integrovanou moderní dráhou podle perihelové vzdálenosti, excentricity, roviny
+  a směru apsid; po potvrzení identity se před společným fitem samostatně hledá
+  správná periodová větev malou korekcí příčné rychlosti a teprve potom se od
+  nuly uvolní požadované A1/A2/A3/DT; pokud robustní hledání skončí těsně
   vedle společného řešení, následuje vyvážená lineární korekce, která nedovolí
   odepsat celý starší návrat jako jeden souvislý outlier; až následná přesná
   korekce používá všechna měření s jejich vahami; na víceletých obloucích se
