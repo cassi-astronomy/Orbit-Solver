@@ -48,9 +48,11 @@ from orbit_app.orbit_fit import (
     _coherent_secondary_track_candidates,
     _calibrate_fitted_photometry,
     _formal_element_uncertainties,
+    _interpolate_identification_states,
     _is_automatic_rejection_candidate,
     _local_light_time_states,
     _linkage_trial_is_acceptable,
+    _needs_historical_identification_bridge,
     _normal_place_observations,
     _observation_offsets_gcrs, _observation_sigma_arcsec, _observation_sigmas,
     _perihelion_offset_days_from_state,
@@ -1740,6 +1742,127 @@ class OrbitFitSelectionTests(unittest.TestCase):
         self.assertEqual(_arc_extension_counts(0), ())
         self.assertEqual(_arc_extension_counts(5), (5,))
         self.assertEqual(_arc_extension_counts(41), (6, 24, 41))
+
+    def test_historical_identification_bridge_uses_two_same_epoch_states(self):
+        modern = OrbitSolution(
+            "206P", 2412450.5, 3.4, .6, 31.0, 208.0, 170.0, 0.0,
+            position_au=(1.4, .1, .05),
+            velocity_au_per_day=(-.002, .020, .004),
+            nongravitational_parameters={"A1": 1e-8},
+        )
+        historical = replace(
+            modern,
+            position_au=(1.39, .11, .052),
+            velocity_au_per_day=(-.0021, .0199, .0041),
+        )
+        candidates = _interpolate_identification_states(
+            modern, historical, (0.0, 0.5, 1.0),
+        )
+        np.testing.assert_allclose(
+            candidates[0].position_au, modern.position_au,
+        )
+        np.testing.assert_allclose(
+            candidates[1].position_au, (1.395, .105, .051),
+        )
+        np.testing.assert_allclose(
+            candidates[2].velocity_au_per_day,
+            historical.velocity_au_per_day,
+        )
+        self.assertIsNone(candidates[1].nongravitational_parameters)
+        with self.assertRaises(OrbitFitError):
+            _interpolate_identification_states(
+                modern, replace(historical, epoch_jd=historical.epoch_jd + 1.0),
+                (0.5,),
+            )
+
+    def test_identification_bridge_threshold_follows_orbital_period(self):
+        six_year_comet = OrbitSolution(
+            "321P/Test", 2459000.5, 6.0 ** (2.0 / 3.0), .5,
+            10.0, 20.0, 30.0, 0.0,
+        )
+        self.assertFalse(_needs_historical_identification_bridge(
+            2459000.5 - 6.0 * 365.25, 2459000.5, six_year_comet,
+        ))
+        self.assertTrue(_needs_historical_identification_bridge(
+            2459000.5 - 12.0 * 365.25, 2459000.5, six_year_comet,
+        ))
+
+    def test_century_linkage_identifies_branch_before_releasing_a_terms(self):
+        observations = [
+            Observation(
+                time=f"{year}-03-{day:02d}T00:00:00Z",
+                ra_deg=10.0, dec_deg=20.0,
+            )
+            for year in (1892, 2008)
+            for day in range(1, 7)
+        ]
+        modern = OrbitSolution(
+            "206P", 2454759.0, 3.24, .647, 32.9, 204.1, 181.4, 359.0,
+            position_au=(2.0, 0.0, 0.0),
+            velocity_au_per_day=(0.0, .01, 0.0),
+            fit_normalized_rms=.6,
+            nongravitational_parameters={"A1": 1.01e-8, "A2": 6.684e-10},
+        )
+        local_initial = replace(
+            modern, epoch_jd=2412450.5,
+            position_au=(1.4, .1, .05),
+            velocity_au_per_day=(-.002, .020, .004),
+            nongravitational_parameters=None,
+        )
+        local = replace(local_initial, fit_normalized_rms=1.0)
+        bridge = replace(local, position_au=(1.41, .09, .05))
+        linked = replace(bridge, fit_normalized_rms=1.0)
+        bad = replace(modern, fit_normalized_rms=100.0)
+        bridge_force = None
+
+        def fake_fit(rows, seed, *_args, **kwargs):
+            nonlocal bridge_force
+            if seed is local_initial:
+                return local, 1.0, len(rows)
+            if seed is bridge:
+                bridge_force = kwargs.get("fixed_nongravitational")
+                return linked, 1.0, len(rows)
+            if len(rows) == 12 and kwargs.get("max_nfev") in (6, 16):
+                return bad, 100.0, len(rows)
+            return modern, 1.0, len(rows)
+
+        def fake_appraisal(rows, solution, *_args, **_kwargs):
+            value = 1.0 if solution is bridge else 100.0
+            for observation in rows:
+                observation.residual_ra_arcsec = value
+                observation.residual_dec_arcsec = value
+                observation.used_in_fit = False
+            return value, value, len(rows)
+
+        with (
+            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit),
+            patch(
+                "orbit_app.orbit_fit.initial_orbit_from_observations",
+                return_value=[local_initial],
+            ),
+            patch(
+                "orbit_app.orbit_fit._propagate_solution_to_epoch",
+                return_value=local,
+            ),
+            patch(
+                "orbit_app.orbit_fit._interpolate_identification_states",
+                return_value=[bridge],
+            ),
+            patch(
+                "orbit_app.orbit_fit._evaluate_solution_observations",
+                side_effect=fake_appraisal,
+            ),
+            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
+        ):
+            result = fit_orbit(
+                observations, modern,
+                nongravitational={"A1": 1.01e-8, "A2": 6.684e-10},
+            )
+        self.assertEqual(bridge_force, {})
+        self.assertIn(
+            "A1/A2 nebyly pro identifikaci použity",
+            result[0].apparition_linkage[0]["reason"],
+        )
 
     def test_catastrophic_linked_comet_fit_falls_back_to_latest_apparition(self):
         observations = [

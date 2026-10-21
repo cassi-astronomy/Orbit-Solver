@@ -2193,6 +2193,135 @@ def _evaluate_solution_observations(
     )
 
 
+def _propagate_solution_to_epoch(
+    solution: OrbitSolution,
+    target_jd: float,
+    nongravitational: dict[str, float] | None = None,
+) -> OrbitSolution:
+    """Return the heliocentric J2000-ecliptic state at ``target_jd``.
+
+    This is used only to construct an identification seed between independently
+    fitted apparitions.  It does not fit observations and it deliberately
+    clears formal uncertainties, which do not transform by merely copying the
+    original covariance to another epoch.
+    """
+    if solution.position_au is None or solution.velocity_au_per_day is None:
+        raise OrbitFitError("Chybí počáteční kartézský stav dráhy.")
+    epoch = float(target_jd)
+    cache_start = min(epoch, float(solution.epoch_jd)) - 2.0
+    cache_end = max(epoch, float(solution.epoch_jd)) + 2.0
+    ephemeris = (
+        _InterpolatedPlanetEphemeris(PLANETS, cache_start, cache_end)
+        if cache_end - cache_start <= 730.0 else
+        SplinePlanetEphemeris(PLANETS, _PLANET_NAMES, cache_start, cache_end)
+    )
+    force = dict(nongravitational or {})
+    engine = NBodyIntegrator(
+        ephemeris, relative_tolerance=3e-11, absolute_tolerance=2e-13,
+        nongravitational_parameters=force,
+    )
+    source = StateVector(
+        solution.epoch_jd,
+        np.asarray(solution.position_au, dtype=float),
+        np.asarray(solution.velocity_au_per_day, dtype=float),
+    )
+    try:
+        state = engine.propagate(source, np.asarray([epoch], dtype=float))[0]
+        elements = cartesian_to_elements(state[:3], state[3:6])
+    except (RuntimeError, ValueError, FloatingPointError, OverflowError) as exc:
+        raise OrbitFitError(
+            "Identifikační propagace mezi návraty skončila numerickou chybou."
+        ) from exc
+    return replace(
+        solution,
+        epoch_jd=epoch,
+        semi_major_axis_au=elements[0],
+        eccentricity=elements[1],
+        inclination_deg=elements[2],
+        node_deg=elements[3],
+        arg_peri_deg=elements[4],
+        mean_anomaly_deg=elements[5],
+        position_au=tuple(float(value) for value in state[:3]),
+        velocity_au_per_day=tuple(float(value) for value in state[3:6]),
+        state_covariance=None,
+        element_uncertainties=None,
+        nongravitational_parameters=force or None,
+    )
+
+
+def _interpolate_identification_states(
+    propagated_new: OrbitSolution,
+    independently_old: OrbitSolution,
+    fractions: tuple[float, ...],
+) -> list[OrbitSolution]:
+    """Interpolate same-epoch Cartesian states for apparition identification.
+
+    The endpoints are two observationally determined hypotheses: the modern
+    orbit propagated back and an orbit fitted only to the historical return.
+    Intermediate states are *seeds*, never accepted solutions.  Every seed
+    must subsequently survive a full N-body astrometric correction.
+    """
+    if abs(propagated_new.epoch_jd - independently_old.epoch_jd) > 1e-7:
+        raise OrbitFitError(
+            "Identifikační stavy nejsou vztaženy ke stejné epoše."
+        )
+    if (
+        propagated_new.position_au is None
+        or propagated_new.velocity_au_per_day is None
+        or independently_old.position_au is None
+        or independently_old.velocity_au_per_day is None
+    ):
+        raise OrbitFitError("Identifikačnímu mostu chybí kartézský stav.")
+    modern = np.asarray(
+        (*propagated_new.position_au, *propagated_new.velocity_au_per_day),
+        dtype=float,
+    )
+    historical = np.asarray(
+        (*independently_old.position_au, *independently_old.velocity_au_per_day),
+        dtype=float,
+    )
+    candidates: list[OrbitSolution] = []
+    for fraction in fractions:
+        weight = float(fraction)
+        if not 0.0 <= weight <= 1.0:
+            raise ValueError("Váha identifikačního mostu musí být od 0 do 1.")
+        state = modern + weight * (historical - modern)
+        elements = cartesian_to_elements(state[:3], state[3:6])
+        candidates.append(replace(
+            independently_old,
+            semi_major_axis_au=elements[0],
+            eccentricity=elements[1],
+            inclination_deg=elements[2],
+            node_deg=elements[3],
+            arg_peri_deg=elements[4],
+            mean_anomaly_deg=elements[5],
+            position_au=tuple(float(value) for value in state[:3]),
+            velocity_au_per_day=tuple(float(value) for value in state[3:6]),
+            state_covariance=None,
+            element_uncertainties=None,
+            nongravitational_parameters=None,
+        ))
+    return candidates
+
+
+def _needs_historical_identification_bridge(
+    earlier_epoch_jd: float,
+    later_epoch_jd: float,
+    solution: OrbitSolution,
+) -> bool:
+    """Return whether the gap spans roughly two or more orbital revolutions."""
+    semi_major = float(solution.semi_major_axis_au)
+    if not np.isfinite(semi_major) or semi_major <= 0.0:
+        return False
+    period_days = 2.0 * np.pi * np.sqrt(semi_major ** 3 / MU_SUN)
+    gap_days = abs(float(later_epoch_jd) - float(earlier_epoch_jd))
+    # Apparition epochs need not coincide exactly with perihelion and the
+    # osculating period changes at encounters.  A small margin below two lets
+    # a genuinely two-revolution gap enter the identification path without
+    # imposing the cost on ordinary adjacent-return corrections.
+    return bool(gap_days >= 1.75 * period_days)
+
+
 def _robust_apparition_appraisal(
     observations: list[Observation],
 ) -> tuple[float, float, list[Observation], list[Observation]]:
@@ -3667,9 +3796,15 @@ def fit_orbit(
                         candidate is None
                         and len(apparition_groups[first_group]) >= 6
                     ):
-                        local_force = {
+                        # Identification must not depend on non-gravitational
+                        # coefficients learned only after the recovery.  Meyer
+                        # could recognise the 1892 orbit from a backwards
+                        # integration of the short 2008 orbit; A1/A2 belong to
+                        # the subsequent linked correction.  Retain only force
+                        # law metadata here (it has no effect while A=0).
+                        identification_force = {
                             name: value for name, value in all_parameters.items()
-                            if name != "DT"
+                            if name == "R_EXPONENT"
                         }
                         try:
                             return_year = apparition_linkage[first_group].get(
@@ -3698,7 +3833,9 @@ def fit_orbit(
                                     local_trial = fit_once(
                                         local_rows, local_initial, constraints,
                                         truncate_years, None,
-                                        fixed_nongravitational=local_force,
+                                        fixed_nongravitational=(
+                                            identification_force
+                                        ),
                                         maximum_observations=None, max_nfev=28,
                                         robust_loss=True, robust_scale=8.0,
                                     )
@@ -3719,6 +3856,117 @@ def fit_orbit(
                                 "nejlepší nezávislá lokální dráha: "
                                 f"RMS {local_solutions[0][1]:.2f}″"
                             )
+                            # A local least-squares step cannot normally cross
+                            # the phase folds produced by twenty revolutions
+                            # and several Jovian encounters.  For a genuinely
+                            # historical gap, construct a small deterministic
+                            # bridge between the two independently observed
+                            # hypotheses at one epoch.  Its points are only
+                            # starting guesses; astrometry still decides.
+                            if (
+                                candidate is None
+                                and _needs_historical_identification_bridge(
+                                    local_solutions[0][0].epoch_jd,
+                                    last_good[0].epoch_jd,
+                                    last_good[0],
+                                )
+                            ):
+                                report_progress(
+                                    f"Návrat {return_year}: hledám gravitační "
+                                    "identifikační most mezi aparicemi…"
+                                )
+                                bridge_report = [
+                                    (
+                                        observation.residual_ra_arcsec,
+                                        observation.residual_dec_arcsec,
+                                        observation.used_in_fit,
+                                    )
+                                    for observation in observations
+                                ]
+                                try:
+                                    old_seed = local_solutions[0][0]
+                                    modern_at_old = _propagate_solution_to_epoch(
+                                        last_good[0], old_seed.epoch_jd,
+                                        identification_force,
+                                    )
+                                    fractions = (
+                                        0.0, 0.0625, 0.125, 0.25, 0.375,
+                                        0.5, 0.625, 0.75, 0.875, 0.9375, 1.0,
+                                    )
+                                    bridge_rows = _balanced_linkage_observations(
+                                        stage_groups, maximum_per_group=12,
+                                    )
+                                    bridge_scores: list[
+                                        tuple[float, float, OrbitSolution]
+                                    ] = []
+                                    for bridge_seed in (
+                                        _interpolate_identification_states(
+                                            modern_at_old, old_seed, fractions,
+                                        )
+                                    ):
+                                        bridge_rms, bridge_normalized, _ = (
+                                            _evaluate_solution_observations(
+                                                bridge_rows, bridge_seed,
+                                                identification_force,
+                                                cancel_callback,
+                                            )
+                                        )
+                                        bridge_scores.append((
+                                            bridge_normalized,
+                                            bridge_rms,
+                                            bridge_seed,
+                                        ))
+                                    _, direct_bridge_rms, direct_bridge_seed = min(
+                                        bridge_scores,
+                                        key=lambda item: (item[0], item[1]),
+                                    )
+                                    failures.append(
+                                        "gravitační identifikační most před "
+                                        f"korekcí: RMS {direct_bridge_rms:.2f}″"
+                                    )
+                                    bridge_trial = fit_once(
+                                        stage_observations,
+                                        direct_bridge_seed,
+                                        constraints, truncate_years, None,
+                                        fixed_nongravitational=(
+                                            identification_force
+                                        ),
+                                        maximum_observations=min(
+                                            320, 80 * stage_count
+                                        ),
+                                        max_nfev=28,
+                                        robust_loss=True,
+                                        robust_scale=25.0,
+                                        screening=True,
+                                    )
+                                    if _linkage_trial_is_acceptable(bridge_trial):
+                                        candidate = bridge_trial
+                                        candidate_source = (
+                                            "historical_identification"
+                                        )
+                                    else:
+                                        remember_failed_trial(bridge_trial)
+                                        failures.append(
+                                            "gravitační identifikační most po "
+                                            f"korekci: RMS {bridge_trial[1]:.2f}″"
+                                        )
+                                except (
+                                    OrbitFitError, ValueError, RuntimeError,
+                                    FloatingPointError, OverflowError,
+                                ) as bridge_exc:
+                                    failures.append(
+                                        "gravitační identifikační most: "
+                                        f"{bridge_exc}"
+                                    )
+                                finally:
+                                    for observation, values in zip(
+                                        observations, bridge_report,
+                                    ):
+                                        (
+                                            observation.residual_ra_arcsec,
+                                            observation.residual_dec_arcsec,
+                                            observation.used_in_fit,
+                                        ) = values
                             for local_seed in local_solutions[:3]:
                                 if candidate is not None:
                                     break
@@ -4384,6 +4632,11 @@ def fit_orbit(
                         "Společný N-body fit byl nalezen postupným rozšířením "
                         "pozorovacího oblouku do starší aparice."
                         if candidate_source == "arc_extension" else
+                        "Společný N-body fit byl nalezen gravitačním "
+                        "identifikačním mostem mezi nezávislými drahami "
+                        "staršího a novějšího návratu; A1/A2 nebyly pro "
+                        "identifikaci použity."
+                        if candidate_source == "historical_identification" else
                         "Společný N-body fit řídkého historického návratu byl "
                         "nalezen korekcí nahromaděné fáze přes A1/A2 a následně "
                         "potvrzen jeho astrometrií."
