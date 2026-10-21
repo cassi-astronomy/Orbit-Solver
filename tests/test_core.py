@@ -1803,6 +1803,10 @@ class OrbitFitSelectionTests(unittest.TestCase):
         self.assertIsNone(observations[0].residual_ra_arcsec)
         self.assertAlmostEqual(observations[-1].residual_ra_arcsec or 0.0, .2)
         self.assertIn("neprošel kontrolou kvality", seed.fit_model_note or "")
+        self.assertIn(
+            "přímá propagace",
+            seed.apparition_linkage[0]["reason"],
+        )
         self.assertEqual(
             [item["status"] for item in seed.apparition_linkage or ()],
             ["failed", "seed_only"],

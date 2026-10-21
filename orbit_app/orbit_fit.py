@@ -3269,33 +3269,60 @@ def fit_orbit(
                     )
                     for observation in validation_rows
                 ]
+                validation_diagnostic = ""
                 try:
-                    validation_rms, validation_normalized, validation_count = (
-                        _evaluate_solution_observations(
-                            validation_rows, last_good[0], all_parameters,
-                            cancel_callback,
+                    # Integrate each apparition independently from the same
+                    # osculating state.  Besides matching the per-return audit
+                    # shown to the user, this avoids letting one problematic
+                    # timestamp invalidate an otherwise verified century-long
+                    # branch as one opaque all-epochs integration failure.
+                    validation_results: list[
+                        tuple[float, float, int]
+                    ] = []
+                    validation_appraisals: list[tuple[float, float]] = []
+                    for group in stage_groups:
+                        validation_results.append(
+                            _evaluate_solution_observations(
+                                group, last_good[0], all_parameters,
+                                cancel_callback,
+                            )
                         )
+                        validation_appraisals.append(
+                            _robust_apparition_appraisal(group)[:2]
+                        )
+                    validation_count = sum(
+                        item[2] for item in validation_results
                     )
-                    validation_appraisals = [
-                        _robust_apparition_appraisal(group)[:2]
-                        for group in stage_groups
-                    ]
-                    propagation_is_acceptable = bool(
-                        validation_rms <= LINKAGE_ACCEPT_RMS_ARCSEC
-                        and validation_normalized
-                        <= LINKAGE_ACCEPT_NORMALIZED_RMS
-                        and all(
+                    validation_rms = float(np.sqrt(sum(
+                        item[0] ** 2 * item[2]
+                        for item in validation_results
+                    ) / max(1, validation_count)))
+                    validation_normalized = float(np.sqrt(sum(
+                        item[1] ** 2 * item[2]
+                        for item in validation_results
+                    ) / max(1, validation_count)))
+                    propagation_is_acceptable = all(
                             rms <= LINKAGE_ACCEPT_RMS_ARCSEC
                             and normalized
                             <= LINKAGE_ACCEPT_NORMALIZED_RMS
                             for rms, normalized in validation_appraisals
+                    )
+                    validation_diagnostic = (
+                        "přímá propagace po návratech: "
+                        + ", ".join(
+                            f"{apparition_linkage[first_group + offset].get('return_year', '?')} "
+                            f"{rms:.2f}″/{normalized:.2f}σ"
+                            for offset, (rms, normalized) in enumerate(
+                                validation_appraisals
+                            )
                         )
                     )
                 except (
                     OrbitFitError, ValueError, RuntimeError,
-                    FloatingPointError,
-                ):
+                    FloatingPointError, OverflowError,
+                ) as exc:
                     propagation_is_acceptable = False
+                    validation_diagnostic = f"přímá propagace selhala: {exc}"
                 if not propagation_is_acceptable:
                     # A rejected read-only appraisal must not leak its O-C
                     # values into the subsequent independent branch trials.
@@ -3307,6 +3334,7 @@ def fit_orbit(
                             observation.residual_dec_arcsec,
                             observation.used_in_fit,
                         ) = report_values
+                    failures.append(validation_diagnostic)
                 if propagation_is_acceptable:
                     validated_solution = replace(
                         last_good[0],
@@ -4137,7 +4165,15 @@ def fit_orbit(
                                 f"vyvážená lineární korekce: {exc}"
                             )
                     if candidate is None:
-                        detail = "; ".join(failures[-3:]) or "bez použitelného pokusu"
+                        displayed_failures = failures[-2:]
+                        if validation_diagnostic:
+                            displayed_failures = [
+                                validation_diagnostic, *displayed_failures,
+                            ]
+                        detail = (
+                            "; ".join(displayed_failures)
+                            or "bez použitelného pokusu"
+                        )
                         raise OrbitFitError(
                             "Vícefázové připojení staršího návratu neprošlo "
                             f"kontrolou kvality ({detail})."
