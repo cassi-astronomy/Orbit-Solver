@@ -1,5 +1,11 @@
 """Small numerical/presentation smoke suite that does not import PySide6."""
 
+import os
+
+# These suites assert the Czech source texts; English is covered by
+# tests/test_i18n.py.  Must be set before orbit_app modules are imported.
+os.environ["ORBIT_SOLVER_LANGUAGE"] = "cs"
+
 import math
 import subprocess
 import sys

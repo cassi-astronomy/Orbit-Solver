@@ -12,17 +12,22 @@ if __name__ == "__main__":
     native_log = log_file.open("a", encoding="utf-8", buffering=1)
     faulthandler.enable(native_log, all_threads=True)
 
+    from orbit_app.i18n import load_saved_language, tr
+
+    # Several labels are created when the GUI modules are imported, so the
+    # saved interface language must be applied first.
+    load_saved_language()
+
     def report_exception(exc_type, exc_value, exc_traceback) -> None:
         details = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
         with log_file.open("a", encoding="utf-8") as stream:
             stream.write(details)
-        message = (
-            f"Orbit Solver narazil na chybu:\n\n{exc_value}\n\n"
-            f"Podrobnosti: {log_file}"
+        message = tr(
+            "Orbit Solver narazil na chybu:\n\n{0}\n\nPodrobnosti: {1}", exc_value, log_file,
         )
         if sys.platform == "win32":
             ctypes.windll.user32.MessageBoxW(
-                0, message, "Orbit Solver — chyba", 0x10,
+                0, message, tr("Orbit Solver — chyba"), 0x10,
             )
         else:
             print(message, file=sys.stderr)

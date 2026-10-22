@@ -7,8 +7,11 @@ import re
 import numpy as np
 
 from .domain import OrbitSolution, is_comet_designation
+from .i18n import tr
 from .mpc_orbit import cartesian_to_elements
-from .orbit_engine import DEFAULT_PERTURBERS, MU_SUN, NBodyIntegrator, StateVector
+from .orbit_engine import (
+    DEFAULT_PERTURBERS, MU_SUN, NBodyIntegrator, StateVector, tolerances_for_span,
+)
 from .planetary import PLANETS, SplinePlanetEphemeris
 
 
@@ -21,11 +24,11 @@ HILL_RADII_AU = {
     "jupiter": .355, "saturn": .436, "uranus": .468, "neptune": .769,
 }
 PLANET_LABELS = {
-    "mercury": "Merkur", "venus": "Venuše", "earth": "Země", "mars": "Mars",
-    "jupiter": "Jupiter", "saturn": "Saturn", "uranus": "Uran", "neptune": "Neptun",
+    "mercury": tr("Merkur"), "venus": tr("Venuše"), "earth": tr("Země"), "mars": "Mars",
+    "jupiter": "Jupiter", "saturn": "Saturn", "uranus": tr("Uran"), "neptune": tr("Neptun"),
 }
 PLANET_MU = {item.name: item.mu_au3_day2 for item in DEFAULT_PERTURBERS}
-ELEMENT_CENTERS = (("sun", "Slunce"),) + tuple(PLANET_LABELS.items())
+ELEMENT_CENTERS = (("sun", tr("Slunce")),) + tuple(PLANET_LABELS.items())
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,7 +114,7 @@ def centered_snapshot(
             getattr(item, "phase", ""), item.epoch_jd, np.asarray(item.state, dtype=float)
         )
     if center not in PLANET_MU:
-        raise ValueError(f"Neznámý střed elementů: {center}")
+        raise ValueError(tr("Neznámý střed elementů: {0}", center))
     state = np.asarray(item.state, dtype=float).copy()
     state[:3] -= PLANETS.position(center, item.epoch_jd)
     state[3:] -= planet_velocity(center, item.epoch_jd)
@@ -136,9 +139,9 @@ def centered_solution(source: OrbitSolution, center: str) -> OrbitSolution:
     if center == "sun":
         return source
     if source.position_au is None or source.velocity_au_per_day is None:
-        raise ValueError("Planetocentrické elementy vyžadují kartézský stav.")
+        raise ValueError(tr("Planetocentrické elementy vyžadují kartézský stav."))
     if center not in PLANET_MU:
-        raise ValueError(f"Neznámý střed elementů: {center}")
+        raise ValueError(tr("Neznámý střed elementů: {0}", center))
     position = np.asarray(source.position_au, dtype=float) - PLANETS.position(
         center, source.epoch_jd
     )
@@ -173,16 +176,22 @@ def format_evolution_report(
     """Create a chronological, tab-separated text export of an evolution run."""
     name = solution.display_name or solution.designation
     lines = [
-        "ORBIT SOLVER — VÝVOJ DRÁHY",
-        f"Objekt:\t{name}",
-        f"Rozsah UTC:\t{_format_jd_utc(result.start_jd)}\t{_format_jd_utc(result.end_jd)}",
-        f"Krok vyhledávání událostí [dny]:\t{result.sample_step_days:.6f}",
+        tr("ORBIT SOLVER — VÝVOJ DRÁHY"),
+        tr("Objekt:\t{0}", name),
+        tr(
+            "Rozsah UTC:\t{0}\t{1}",
+            _format_jd_utc(result.start_jd),
+            _format_jd_utc(result.end_jd),
+        ),
+        tr("Krok vyhledávání událostí [dny]:\t{0:.6f}", result.sample_step_days),
         f"Model:\t{result.model_note}",
         "",
-        "Chronologický přehled (elementy jsou oskulační v uvedené epoše)",
-        "Typ\tDatum UTC\tFáze / návrat / planeta\tq [AU]\te\ta [AU]\tP [roky]\t1/a [AU^-1]"
-        "\ti [deg]\tOmega [deg]\tomega [deg]\tVzdálenost [AU]\tHillovy poloměry"
-        "\tv rel. [km/s]\tDelta(1/a) [AU^-1]",
+        tr("Chronologický přehled (elementy jsou oskulační v uvedené epoše)"),
+        tr(
+            "Typ\tDatum UTC\tFáze / návrat / planeta\tq [AU]\te\ta [AU]\tP [roky]\t1/a "
+            "[AU^-1]\ti [deg]\tOmega [deg]\tomega [deg]\tVzdálenost [AU]\tHillovy "
+            "poloměry\tv rel. [km/s]\tDelta(1/a) [AU^-1]",
+        ),
     ]
     events: list[tuple[float, int, EvolutionReturn | EvolutionSnapshot | PlanetEncounter]] = []
     orbital_states = result.snapshots or result.returns
@@ -191,7 +200,7 @@ def format_evolution_report(
     for _epoch, _event_type, item in sorted(events, key=lambda row: (row[0], row[1])):
         if isinstance(item, (EvolutionReturn, EvolutionSnapshot)):
             period = "" if item.period_years is None else f"{item.period_years:.8f}"
-            marker = item.phase if isinstance(item, EvolutionSnapshot) else f"{item.index:+d}"
+            marker = tr(item.phase) if isinstance(item, EvolutionSnapshot) else f"{item.index:+d}"
             lines.append(
                 f"{'STAV' if isinstance(item, EvolutionSnapshot) else 'PERIHELIUM'}\t"
                 f"{_format_jd_utc(item.epoch_jd)}\t{marker}\t"
@@ -203,25 +212,32 @@ def format_evolution_report(
         else:
             delta = "" if item.delta_reciprocal_a is None else f"{item.delta_reciprocal_a:+.10e}"
             lines.append(
-                "SETKÁNÍ\t"
-                f"{_format_jd_utc(item.epoch_jd)}\t{PLANET_LABELS.get(item.planet, item.planet)}\t"
-                "\t\t\t\t\t\t\t\t"
-                f"{item.distance_au:.9f}\t{item.hill_radii:.6f}\t"
-                f"{item.relative_velocity_kms:.5f}\t{delta}"
+                tr(
+                    "SETKÁNÍ\t{0}\t{1}\t\t\t\t\t\t\t\t\t{2:.9f}\t{3:.6f}\t{4:.5f}\t{5}",
+                    _format_jd_utc(item.epoch_jd),
+                    PLANET_LABELS.get(item.planet, item.planet),
+                    item.distance_au,
+                    item.hill_radii,
+                    item.relative_velocity_kms,
+                    delta,
+                )
             )
     if not events:
-        lines.append("Žádné perihelové průchody ani planetární setkání nebyly nalezeny.")
+        lines.append(tr("Žádné perihelové průchody ani planetární setkání nebyly nalezeny."))
     if result.captures:
-        lines.extend(("", "Dočasná planetocentrická zachycení"))
+        lines.extend(("", tr("Dočasná planetocentrická zachycení")))
         for capture in result.captures:
             lines.append(
-                f"ZACHYCENÍ\t{_format_jd_utc(capture.start_jd)}\t"
-                f"{_format_jd_utc(capture.end_jd)}\t"
-                f"{PLANET_LABELS.get(capture.planet, capture.planet)}\t"
-                f"minimum {capture.minimum_distance_au:.9f} AU\t"
-                f"{capture.minimum_hill_radii:.5f} Hillova poloměru"
+                tr(
+                    "ZACHYCENÍ\t{0}\t{1}\t{2}\tminimum {3:.9f} AU\t{4:.5f} Hillova poloměru",
+                    _format_jd_utc(capture.start_jd),
+                    _format_jd_utc(capture.end_jd),
+                    PLANET_LABELS.get(capture.planet, capture.planet),
+                    capture.minimum_distance_au,
+                    capture.minimum_hill_radii,
+                )
             )
-    lines.extend(("", "Vytvořeno programem Orbit Solver 1.0 — Martin Mašek"))
+    lines.extend(("", tr("Vytvořeno programem Orbit Solver 1.0 — Martin Mašek")))
     return "\n".join(lines) + "\n"
 
 
@@ -260,7 +276,10 @@ def _mpc_return_line(solution: OrbitSolution, item: EvolutionReturn) -> str:
                 days=item.epoch_jd - 2451545.0
             )
         except (OverflowError, ValueError):
-            return f"# Návrat {item.index:+d}: kalendářní datum je mimo podporovaný rozsah."
+            return tr(
+                "# Návrat {0:+d}: kalendářní datum je mimo podporovaný rozsah.",
+                item.index,
+            )
         day_fraction = perihelion.day + (
             perihelion.hour * 3600 + perihelion.minute * 60 + perihelion.second
             + perihelion.microsecond / 1e6
@@ -292,10 +311,14 @@ def format_evolution_mpc_report(
     """Return chronological MPC-style element lines plus commented encounters."""
     name = solution.display_name or solution.designation
     lines = [
-        f"# Orbit Solver 1.0 — vývoj dráhy: {name}",
-        f"# Rozsah UTC: {_format_jd_utc(result.start_jd)} až {_format_jd_utc(result.end_jd)}",
-        "# Elementy jsou oskulační v okamžiku příslušného perihelu.",
-        "# Řádky začínající # jsou komentáře a planetární setkání.",
+        tr("# Orbit Solver 1.0 — vývoj dráhy: {0}", name),
+        tr(
+            "# Rozsah UTC: {0} až {1}",
+            _format_jd_utc(result.start_jd),
+            _format_jd_utc(result.end_jd),
+        ),
+        tr("# Elementy jsou oskulační v okamžiku příslušného perihelu."),
+        tr("# Řádky začínající # jsou komentáře a planetární setkání."),
         f"# {result.model_note}",
     ]
     events: list[tuple[float, int, EvolutionReturn | EvolutionSnapshot | PlanetEncounter]] = []
@@ -305,32 +328,55 @@ def format_evolution_mpc_report(
     for _epoch, _kind, item in sorted(events, key=lambda row: (row[0], row[1])):
         if isinstance(item, EvolutionSnapshot):
             lines.append(
-                f"# STAV {item.phase} — {_format_jd_utc(item.epoch_jd)} UTC; "
-                f"q={item.perihelion_au:.9f} AU; e={item.eccentricity:.10f}; "
-                f"a={item.semi_major_axis_au:.9f} AU; 1/a={item.reciprocal_a:+.10e} AU^-1; "
-                f"i={item.inclination_deg:.7f}; Omega={item.node_deg:.7f}; "
-                f"omega={item.arg_peri_deg:.7f}"
+                tr(
+                    "# STAV {0} — {1} UTC; q={2:.9f} AU; e={3:.10f}; a={4:.9f} AU; "
+                    "1/a={5:+.10e} AU^-1; i={6:.7f}; Omega={7:.7f}; omega={8:.7f}",
+                    tr(item.phase),
+                    _format_jd_utc(item.epoch_jd),
+                    item.perihelion_au,
+                    item.eccentricity,
+                    item.semi_major_axis_au,
+                    item.reciprocal_a,
+                    item.inclination_deg,
+                    item.node_deg,
+                    item.arg_peri_deg,
+                )
             )
         elif isinstance(item, EvolutionReturn):
-            lines.append(f"# Návrat {item.index:+d} — {_format_jd_utc(item.epoch_jd)} UTC")
+            lines.append(tr(
+                "# Návrat {0:+d} — {1} UTC",
+                item.index,
+                _format_jd_utc(item.epoch_jd),
+            ))
             lines.append(_mpc_return_line(solution, item))
         else:
             delta = (
-                "neuvedeno" if item.delta_reciprocal_a is None
+                tr("neuvedeno") if item.delta_reciprocal_a is None
                 else f"{item.delta_reciprocal_a:+.6e} AU^-1"
             )
             lines.append(
-                f"# SETKÁNÍ {_format_jd_utc(item.epoch_jd)} UTC — "
-                f"{PLANET_LABELS.get(item.planet, item.planet)}; "
-                f"d={item.distance_au:.6f} AU = {item.hill_radii:.3f} Hillova poloměru; "
-                f"v_rel={item.relative_velocity_kms:.2f} km/s; Delta(1/a)={delta}"
+                tr(
+                    "# SETKÁNÍ {0} UTC — {1}; d={2:.6f} AU = {3:.3f} Hillova poloměru; "
+                    "v_rel={4:.2f} km/s; Delta(1/a)={5}",
+                    _format_jd_utc(item.epoch_jd),
+                    PLANET_LABELS.get(item.planet, item.planet),
+                    item.distance_au,
+                    item.hill_radii,
+                    item.relative_velocity_kms,
+                    delta,
+                )
             )
     for capture in result.captures:
         lines.append(
-            f"# ZACHYCENÍ {PLANET_LABELS.get(capture.planet, capture.planet)}: "
-            f"{_format_jd_utc(capture.start_jd)} až {_format_jd_utc(capture.end_jd)} UTC; "
-            f"minimum={capture.minimum_distance_au:.6f} AU "
-            f"({capture.minimum_hill_radii:.3f} Hillova poloměru)"
+            tr(
+                "# ZACHYCENÍ {0}: {1} až {2} UTC; minimum={3:.6f} AU ({4:.3f} Hillova "
+                "poloměru)",
+                PLANET_LABELS.get(capture.planet, capture.planet),
+                _format_jd_utc(capture.start_jd),
+                _format_jd_utc(capture.end_jd),
+                capture.minimum_distance_au,
+                capture.minimum_hill_radii,
+            )
         )
     return "\n".join(lines) + "\n"
 
@@ -356,7 +402,7 @@ def _parabolic_vertex_time(times: np.ndarray, values: np.ndarray, index: int) ->
 def _solution_state(solution: OrbitSolution) -> StateVector:
     if solution.position_au is None or solution.velocity_au_per_day is None:
         raise ValueError(
-            "Vývoj dráhy vyžaduje kartézský stav z MPC nebo z vlastního fitu."
+            tr("Vývoj dráhy vyžaduje kartézský stav z MPC nebo z vlastního fitu.")
         )
     return StateVector(
         solution.epoch_jd,
@@ -370,16 +416,16 @@ def evolution_span(
 ) -> tuple[float, float]:
     """Translate the UI range choice to absolute Julian dates."""
     if past < 0 or future < 0 or (past == 0 and future == 0):
-        raise ValueError("Rozsah integrace musí být větší než nula.")
+        raise ValueError(tr("Rozsah integrace musí být větší než nula."))
     if mode == "years":
         return (
             solution.epoch_jd - float(past) * JULIAN_YEAR_DAYS,
             solution.epoch_jd + float(future) * JULIAN_YEAR_DAYS,
         )
     if mode != "returns":
-        raise ValueError("Neznámý způsob zadání rozsahu integrace.")
+        raise ValueError(tr("Neznámý způsob zadání rozsahu integrace."))
     if not (solution.eccentricity < 1.0 and solution.semi_major_axis_au > 0.0):
-        raise ValueError("Počet návratů lze zadat jen pro uzavřenou eliptickou dráhu.")
+        raise ValueError(tr("Počet návratů lze zadat jen pro uzavřenou eliptickou dráhu."))
     period_days = 2.0 * np.pi * solution.semi_major_axis_au ** 1.5 / np.sqrt(MU_SUN)
     # The half-period margin makes the requested outer perihelia fall inside
     # the interval even when the fitted epoch is not itself at perihelion.
@@ -402,48 +448,64 @@ def _return_from_state(index: int, epoch: float, state: np.ndarray) -> Evolution
     )
 
 
+# Planet positions are cached as a daily spline for spans up to this length
+# (days); a longer exploratory integration reads the kernel directly.
+SPLINE_CACHE_MAXIMUM_DAYS = 400.0 * JULIAN_YEAR_DAYS
+# Tolerance of the direct-kernel engine for exploratory multi-century runs.
+EXPLORATORY_TOLERANCES = (2e-11, 2e-13)
+
+
+def _evolution_engine(
+    solution: OrbitSolution, start_jd: float, end_jd: float,
+) -> NBodyIntegrator:
+    """Force model for an evolution run (heliocentric J2000 ecliptic, TDB).
+
+    Spans that a fit can cover use the fit's planetary cache and accuracy
+    profile, so the tables of a linked comet agree with the fitted model across
+    the same encounters.  Longer, exploratory spans keep the cheaper historical
+    settings because their result is dominated by chaos, not integration error.
+    """
+    span = max(end_jd, solution.epoch_jd) - min(start_jd, solution.epoch_jd)
+    if span <= SPLINE_CACHE_MAXIMUM_DAYS:
+        ephemeris = SplinePlanetEphemeris(
+            PLANETS, tuple(item.name for item in DEFAULT_PERTURBERS),
+            min(start_jd, solution.epoch_jd) - 2.0, max(end_jd, solution.epoch_jd) + 2.0,
+        )
+        rtol, atol = tolerances_for_span(span)
+    else:
+        ephemeris, (rtol, atol) = PLANETS, EXPLORATORY_TOLERANCES
+    return NBodyIntegrator(
+        ephemeris, relative_tolerance=rtol, absolute_tolerance=atol,
+        nongravitational_parameters=solution.nongravitational_parameters,
+    )
+
+
+def _states_near_samples(
+    engine: NBodyIntegrator, epochs: np.ndarray, states: np.ndarray,
+    targets: np.ndarray,
+) -> np.ndarray:
+    """States at ``targets``, each integrated from the nearest stored sample.
+
+    Refining a perihelion or an encounter needs only a few days of motion; a
+    new integration from the solution epoch would repeat the whole span.
+    """
+    output = np.empty((len(targets), 6), dtype=float)
+    for row, target in enumerate(np.asarray(targets, dtype=float)):
+        index = int(np.argmin(np.abs(epochs - target)))
+        start = StateVector(float(epochs[index]), states[index, :3], states[index, 3:])
+        output[row] = engine.propagate(start, np.array([target]))[0]
+    return output
+
+
 def perihelion_returns_between(
     solution: OrbitSolution, start_jd: float, end_jd: float,
     *, maximum_samples: int = 40001,
 ) -> tuple[EvolutionReturn, ...]:
-    """Integrate once and extract osculating elements at every perihelion."""
-    if end_jd <= start_jd:
-        raise ValueError("Konec přehledu návratů musí následovat po začátku.")
-    initial = _solution_state(solution)
-    if solution.eccentricity < 1.0 and solution.semi_major_axis_au > 0.0:
-        period_days = 2.0 * np.pi * solution.semi_major_axis_au ** 1.5 / np.sqrt(MU_SUN)
-        desired_step = float(np.clip(period_days / 500.0, .25, 5.0))
-    else:
-        desired_step = 2.0
-    count = min(
-        maximum_samples,
-        max(401, int(np.ceil((end_jd - start_jd) / desired_step)) + 1),
-    )
-    epochs = np.linspace(start_jd, end_jd, count)
-    ephemeris = SplinePlanetEphemeris(
-        PLANETS, tuple(item.name for item in DEFAULT_PERTURBERS),
-        start_jd - 2.0, end_jd + 2.0,
-    )
-    engine = NBodyIntegrator(
-        ephemeris, relative_tolerance=2e-10, absolute_tolerance=2e-12,
-        nongravitational_parameters=solution.nongravitational_parameters,
-    )
-    states = engine.propagate(initial, epochs)
-    radius = np.linalg.norm(states[:, :3], axis=1)
-    minima = np.flatnonzero(
-        (radius[1:-1] < radius[:-2]) & (radius[1:-1] <= radius[2:])
-    ) + 1
-    refined_epochs = np.asarray([
-        _parabolic_vertex_time(epochs, radius, int(index)) for index in minima
-    ], dtype=float)
-    if refined_epochs.size == 0:
-        return ()
-    refined_states = engine.propagate(initial, refined_epochs)
-    zero = int(np.argmin(np.abs(refined_epochs - solution.epoch_jd)))
-    return tuple(
-        _return_from_state(index - zero, float(epoch), state)
-        for index, (epoch, state) in enumerate(zip(refined_epochs, refined_states))
-    )
+    """Osculating elements at every perihelion between two TDB Julian dates."""
+    return calculate_orbit_evolution_between(
+        solution, start_jd, end_jd, maximum_samples=maximum_samples,
+        include_encounters=False,
+    ).returns
 
 
 def _snapshot_from_state(phase: str, epoch: float, state: np.ndarray) -> EvolutionSnapshot:
@@ -462,18 +524,32 @@ def calculate_orbit_evolution(
     solution: OrbitSolution, mode: str, past: int, future: int,
     *, maximum_samples: int = 80001,
 ) -> EvolutionResult:
-    """Integrate an orbit and extract perihelion returns and close encounters.
+    """Integrate over a UI-selected range of returns or years."""
+    start_jd, end_jd = evolution_span(solution, mode, past, future)
+    result = calculate_orbit_evolution_between(
+        solution, start_jd, end_jd, maximum_samples=maximum_samples,
+    )
+    if mode == "returns":
+        result = replace(result, returns=tuple(
+            item for item in result.returns if -past <= item.index <= future
+        ))
+    return result
 
-    This first implementation deliberately depends only on the application's
-    current planet provider.  Replacing PLANETS with a DE440-backed provider
-    later does not change the event/result API or the user interface.
+
+def calculate_orbit_evolution_between(
+    solution: OrbitSolution, start_jd: float, end_jd: float,
+    *, maximum_samples: int = 80001, include_encounters: bool = True,
+) -> EvolutionResult:
+    """Integrate once and extract perihelia, planetary encounters and captures.
+
+    ``start_jd``/``end_jd`` are TDB Julian dates.  Return index 0 is the
+    perihelion nearest to the solution epoch.  The complete sampled trajectory
+    is kept for the Solar System animation.
     """
     initial = _solution_state(solution)
-    start_jd, end_jd = evolution_span(solution, mode, past, future)
     span_days = end_jd - start_jd
     if span_days <= 0.0:
-        raise ValueError("Neplatný rozsah integrace.")
-
+        raise ValueError(tr("Neplatný rozsah integrace."))
     if solution.eccentricity < 1.0 and solution.semi_major_axis_au > 0.0:
         period_days = 2.0 * np.pi * solution.semi_major_axis_au ** 1.5 / np.sqrt(MU_SUN)
         desired_step = float(np.clip(period_days / 360.0, .25, 5.0))
@@ -482,33 +558,27 @@ def calculate_orbit_evolution(
     sample_count = min(maximum_samples, max(401, int(np.ceil(span_days / desired_step)) + 1))
     sample_epochs = np.linspace(start_jd, end_jd, sample_count)
     sample_step = float(sample_epochs[1] - sample_epochs[0])
-    engine = NBodyIntegrator(
-        PLANETS, relative_tolerance=2e-11, absolute_tolerance=2e-13,
-        nongravitational_parameters=solution.nongravitational_parameters,
-    )
+    engine = _evolution_engine(solution, start_jd, end_jd)
     states = engine.propagate(initial, sample_epochs)
 
     radius = np.linalg.norm(states[:, :3], axis=1)
     minima = np.flatnonzero((radius[1:-1] < radius[:-2]) & (radius[1:-1] <= radius[2:])) + 1
     refined_epochs = [_parabolic_vertex_time(sample_epochs, radius, int(index)) for index in minima]
+    returns: tuple[EvolutionReturn, ...] = ()
     if refined_epochs:
-        refined_states = engine.propagate(initial, np.asarray(refined_epochs, dtype=float))
+        refined_states = _states_near_samples(
+            engine, sample_epochs, states, np.asarray(refined_epochs, dtype=float),
+        )
         zero_position = int(np.argmin(np.abs(np.asarray(refined_epochs) - solution.epoch_jd)))
         returns = tuple(
             _return_from_state(position - zero_position, epoch, state)
             for position, (epoch, state) in enumerate(zip(refined_epochs, refined_states))
         )
-        if mode == "returns":
-            returns = tuple(item for item in returns if -past <= item.index <= future)
-    else:
-        returns = ()
 
     encounters: list[PlanetEncounter] = []
     captures: list[CaptureInterval] = []
-    for planet, hill_radius in HILL_RADII_AU.items():
-        planet_positions = np.stack([
-            PLANETS.position(planet, float(epoch)) for epoch in sample_epochs
-        ])
+    for planet, hill_radius in (HILL_RADII_AU.items() if include_encounters else ()):
+        planet_positions = np.asarray(PLANETS.position_series(planet, sample_epochs), dtype=float)
         distances = np.linalg.norm(states[:, :3] - planet_positions, axis=1)
         planet_velocities = np.gradient(planet_positions, sample_epochs, axis=0)
         relative_velocities = states[:, 3:] - planet_velocities
@@ -526,8 +596,7 @@ def calculate_orbit_evolution(
             # multiple samples and are robust under this criterion.
             if stop - first < 2:
                 continue
-            local = distances[first:stop]
-            minimum = float(np.min(local))
+            minimum = float(np.min(distances[first:stop]))
             captures.append(CaptureInterval(
                 planet=planet, start_jd=float(sample_epochs[first]),
                 end_jd=float(sample_epochs[stop - 1]), minimum_distance_au=minimum,
@@ -542,14 +611,11 @@ def calculate_orbit_evolution(
             encounter_jd = _parabolic_vertex_time(sample_epochs, distances, int(sample_index))
             influence_window = max(30.0, 3.0 * sample_step)
             evaluation = np.array([
-                encounter_jd - influence_window, encounter_jd,
-                encounter_jd + influence_window,
+                encounter_jd - influence_window, encounter_jd, encounter_jd + influence_window,
             ])
-            encounter_states = engine.propagate(initial, evaluation)
+            encounter_states = _states_near_samples(engine, sample_epochs, states, evaluation)
             planet_at_encounter = PLANETS.position(planet, encounter_jd)
-            separation = float(np.linalg.norm(
-                encounter_states[1, :3] - planet_at_encounter
-            ))
+            separation = float(np.linalg.norm(encounter_states[1, :3] - planet_at_encounter))
             # Central difference is adequate for the displayed encounter speed
             # and avoids requiring a velocity API from the planet provider.
             velocity_step = .02
@@ -613,9 +679,11 @@ def calculate_orbit_evolution(
         returns=returns, encounters=tuple(encounters), start_jd=start_jd, end_jd=end_jd,
         sample_step_days=sample_step,
         model_note=(
-            "Orientační výpočet: planetární perturbace a zvolený model "
-            "A1/A2/A3 jsou zahrnuty, "
-            f"polohy planet používají model {PLANETS.model_name}."
+            tr(
+                "Orientační výpočet: planetární perturbace a zvolený model A1/A2/A3 jsou "
+                "zahrnuty, polohy planet používají model {0}.",
+                PLANETS.model_name,
+            )
         ),
         snapshots=snapshots,
         timeline=timeline,

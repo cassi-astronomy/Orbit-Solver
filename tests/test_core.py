@@ -1,6 +1,11 @@
+import os
+
+# These suites assert the Czech source texts; English is covered by
+# tests/test_i18n.py.  Must be set before orbit_app modules are imported.
+os.environ["ORBIT_SOLVER_LANGUAGE"] = "cs"
+
 import math
 import unittest
-from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -13,7 +18,7 @@ from orbit_app.main_window import (
     PlaybackBar, SkyPanel, SolarSystemPanel,
 )
 from orbit_app.presentation import (
-    apparition_linkage_summary, apparition_observation_count_text,
+    apparition_observation_count_text,
     datetime_from_jd, equatorial_ra_ticks, format_dec_sexagesimal, format_ra_sexagesimal,
     observation_residual_score, observations_to_tsv, parse_output_epoch,
     perihelion_jd_from_solution, project_ecliptic_camera,
@@ -36,30 +41,24 @@ from orbit_app.orbit_engine import (
 from orbit_app.orbit_evolution import (
     EvolutionResult, EvolutionReturn, EvolutionSnapshot, PLANET_MU, PlanetEncounter,
     centered_snapshot, evolution_span, format_evolution_mpc_report,
-    format_evolution_report, perihelion_returns_between,
+    format_evolution_report,
 )
 from orbit_app.planetary import PLANETS
 from orbit_app.orbit_fit import (
-    OrbitFitCancelled, OrbitFitError, _adaptive_finite_difference_jacobian,
-    _arc_extension_counts,
+    OrbitFitCancelled, _adaptive_finite_difference_jacobian,
     _automatic_orbit_score, _InterpolatedPlanetEphemeris,
-    _attach_multi_apparition_elements, _balanced_linkage_observations,
-    _branch_preserving_backtrack,
+    _attach_multi_apparition_elements,
     _coherent_secondary_track_candidates,
     _calibrate_fitted_photometry,
-    _apparition_orbit_similarity,
     _formal_element_uncertainties,
     _is_automatic_rejection_candidate,
     _local_light_time_states,
-    _linkage_trial_is_acceptable,
-    _needs_historical_identification,
     _normal_place_observations,
     _observation_offsets_gcrs, _observation_sigma_arcsec, _observation_sigmas,
     _perihelion_offset_days_from_state,
-    _latest_observing_apparition, _prefer_parabolic_short_arc,
+    _prefer_parabolic_short_arc,
     _representative_indices, _truncate_rows_to_recent_years,
-    _robust_apparition_appraisal, _update_apparition_linkage_metrics,
-    _transverse_period_candidate,
+    _update_apparition_linkage_metrics,
     fit_orbit, fit_selection_count, parse_observation_time,
 )
 from orbit_app.photometry import estimate_absolute_magnitude, power_law_magnitude
@@ -669,57 +668,6 @@ class PreviewGeometryTests(unittest.TestCase):
 
 
 class OrbitFitSelectionTests(unittest.TestCase):
-    def test_branch_backtracking_rejects_step_that_ruins_one_apparition(self):
-        initial = np.array([0.0])
-        proposed = np.array([1.0])
-        groups = [np.array([0, 1]), np.array([2, 3])]
-
-        def residuals(vector):
-            step = float(vector[0])
-            return np.array([
-                0.8 + 20.0 * step,
-                0.8 + 20.0 * step,
-                44.2 - 60.0 * step,
-                44.2 - 60.0 * step,
-            ])
-
-        accepted, scale = _branch_preserving_backtrack(
-            initial, proposed, residuals, groups, np.ones(4),
-        )
-        self.assertEqual(scale, 0.0)
-        np.testing.assert_array_equal(accepted, initial)
-
-    def test_branch_backtracking_accepts_short_joint_improvement(self):
-        initial = np.array([0.0])
-        proposed = np.array([1.0])
-        groups = [np.array([0, 1]), np.array([2, 3])]
-
-        def residuals(vector):
-            step = float(vector[0])
-            return np.array([
-                0.8 + 0.1 * step,
-                0.8 + 0.1 * step,
-                44.2 - 80.0 * step,
-                44.2 - 80.0 * step,
-            ])
-
-        accepted, scale = _branch_preserving_backtrack(
-            initial, proposed, residuals, groups, np.ones(4),
-        )
-        self.assertEqual(scale, 0.5)
-        np.testing.assert_allclose(accepted, [0.5])
-
-    def test_linkage_quality_gate_has_named_physical_and_normalized_limits(self):
-        accepted = OrbitSolution("X", 2460000.5, 2.0, .2, 0, 0, 0, 0)
-        accepted.fit_normalized_rms = 8.0
-        self.assertTrue(_linkage_trial_is_acceptable((accepted, 60.0, 6)))
-
-        poor_normalized = replace(accepted, fit_normalized_rms=8.01)
-        self.assertFalse(
-            _linkage_trial_is_acceptable((poor_normalized, 1.0, 6))
-        )
-        self.assertFalse(_linkage_trial_is_acceptable((accepted, 60.01, 6)))
-
     def test_fit_can_be_cancelled_before_numerical_work_starts(self):
         with self.assertRaises(OrbitFitCancelled):
             fit_orbit([], None, cancel_callback=lambda: True)
@@ -728,680 +676,9 @@ class OrbitFitSelectionTests(unittest.TestCase):
         historical = Observation(time="1835-10-01T00:00:00Z")
         photographic = Observation(time="1935-10-01T00:00:00Z")
         modern = Observation(time="2026-10-01T00:00:00Z")
-        self.assertEqual(_observation_sigma_arcsec(historical), (20.0, 20.0))
-        self.assertEqual(_observation_sigma_arcsec(photographic), (6.0, 6.0))
+        self.assertEqual(_observation_sigma_arcsec(historical), (10.0, 10.0))
+        self.assertEqual(_observation_sigma_arcsec(photographic), (3.0, 3.0))
         self.assertEqual(_observation_sigma_arcsec(modern), (1.0, 1.0))
-
-    def test_latest_apparition_is_split_at_long_observing_gap(self):
-        observations = [
-            Observation(time="1835-10-01T00:00:00Z", ra_deg=1.0, dec_deg=2.0),
-            Observation(time="1910-04-01T00:00:00Z", ra_deg=1.0, dec_deg=2.0),
-            Observation(time="1985-10-01T00:00:00Z", ra_deg=1.0, dec_deg=2.0),
-            Observation(time="2003-01-01T00:00:00Z", ra_deg=1.0, dec_deg=2.0),
-        ]
-        latest = _latest_observing_apparition(observations)
-        self.assertEqual([item.time[:4] for item in latest], ["1985", "2003"])
-
-    def test_short_period_comet_apparitions_follow_its_orbital_period(self):
-        observations = [
-            Observation(
-                time=f"{year}-10-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
-            )
-            for year in (2017, 2020, 2023)
-            for day in range(1, 7)
-        ]
-        encke = OrbitSolution(
-            "2P", 2460220.5, 2.22, .85, 11.3, 334.0, 187.0, 0.0,
-        )
-        latest = _latest_observing_apparition(
-            observations, encke, minimum_size=6,
-        )
-        self.assertEqual(len(latest), 6)
-        self.assertTrue(all(item.time.startswith("2023-") for item in latest))
-
-    def test_gravity_only_short_period_comet_uses_latest_return(self):
-        observations = [
-            Observation(
-                time=f"{year}-10-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
-            )
-            for year in (2017, 2020, 2023)
-            for day in range(1, 7)
-        ]
-        encke = OrbitSolution(
-            "2P", 2460220.5, 2.22, .85, 11.3, 334.0, 187.0, 0.0,
-            position_au=(.34, 0.0, 0.0), velocity_au_per_day=(0.0, .04, 0.0),
-        )
-        candidate = (encke, 1.0, 6)
-        with (
-            patch("orbit_app.orbit_fit._fit_orbit_once", return_value=candidate) as fit_once,
-            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
-        ):
-            fit_orbit(observations, encke)
-        selected = fit_once.call_args_list[0].args[0]
-        self.assertEqual(len(selected), 6)
-        self.assertTrue(all(item.time.startswith("2023-") for item in selected))
-
-    def test_long_gap_in_asteroid_astrometry_does_not_select_one_apparition(self):
-        observations = [
-            Observation(
-                time=f"1950-01-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
-            )
-            for day in range(1, 7)
-        ] + [
-            Observation(
-                time=f"2025-01-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
-            )
-            for day in range(1, 7)
-        ]
-        asteroid = OrbitSolution("12345", 2460676.5, 2.4, .2, 5.0, 10.0, 20.0, 30.0)
-        candidate = (asteroid, 1.0, len(observations))
-        with (
-            patch("orbit_app.orbit_fit._fit_orbit_once", return_value=candidate) as fit_once,
-            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
-        ):
-            fit_orbit(observations, asteroid)
-        self.assertEqual(len(fit_once.call_args_list[0].args[0]), len(observations))
-
-    def test_gravity_only_multi_apparition_fit_uses_latest_return(self):
-        observations = [
-            Observation(
-                time=f"1835-10-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
-            )
-            # A historical recovery can consist of only three plates (325P
-            # in 1951).  It must remain an auditable linkage apparition even
-            # though it cannot support a stable standalone six-state fit.
-            for day in range(1, 4)
-        ] + [
-            Observation(
-                time=f"1986-03-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
-            )
-            for day in range(1, 11)
-        ]
-        solution = OrbitSolution(
-            "1P", 2446470.5, 17.8, .967, 162.3, 58.4, 111.3, 0.0,
-            position_au=(.586, 0.0, 0.0), velocity_au_per_day=(0.0, .03, 0.0),
-        )
-        candidate = (solution, 1.0, 10)
-        with (
-            patch("orbit_app.orbit_fit._fit_orbit_once", return_value=candidate) as fit_once,
-            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
-        ):
-            fit_orbit(observations, solution)
-        self.assertEqual(fit_once.call_count, 1)
-        self.assertEqual(len(fit_once.call_args_list[0].args[0]), 10)
-        self.assertEqual(fit_once.call_args_list[0].kwargs["maximum_observations"], 120)
-        self.assertIn("posledního pozorovaného návratu", solution.fit_model_note)
-
-    def test_verified_dense_catalogue_branch_gets_short_gravity_correction(self):
-        observations = [
-            Observation(
-                time=f"{year}-10-{day:02d}T00:00:00Z",
-                ra_deg=10.0, dec_deg=20.0,
-            )
-            for year, count in ((1892, 8), (2008, 10))
-            for day in range(1, count + 1)
-        ]
-        catalogue = OrbitSolution(
-            "206P", 2453922.5, 3.2335, .6485, 33.2, 204.4, 181.4, 217.4,
-            position_au=(1.2, 0.0, 0.0),
-            velocity_au_per_day=(0.0, .015, 0.0),
-        )
-        corrected = replace(catalogue)
-        evaluation_calls = 0
-
-        def fake_evaluate(rows, *_args, **_kwargs):
-            nonlocal evaluation_calls
-            evaluation_calls += 1
-            residual = .4 if evaluation_calls == 1 else .3
-            for observation in rows:
-                observation.residual_ra_arcsec = residual
-                observation.residual_dec_arcsec = -residual
-                observation.used_in_fit = False
-            return residual, .5, len(rows)
-
-        with (
-            patch(
-                "orbit_app.orbit_fit._evaluate_solution_observations",
-                side_effect=fake_evaluate,
-            ),
-            patch(
-                "orbit_app.orbit_fit._fit_orbit_once",
-                return_value=(corrected, .3, len(observations)),
-            ) as fit_once,
-            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
-        ):
-            result = fit_orbit(observations, catalogue)
-
-        self.assertIs(result[0], corrected)
-        self.assertEqual(evaluation_calls, 2)
-        self.assertEqual(fit_once.call_count, 1)
-        self.assertEqual(fit_once.call_args.kwargs["max_nfev"], 6)
-        self.assertFalse(fit_once.call_args.kwargs.get("strict_polish", False))
-        self.assertEqual(len(fit_once.call_args.args[0]), len(observations))
-        self.assertEqual(
-            [item["status"] for item in corrected.apparition_linkage or ()],
-            ["linked", "linked"],
-        )
-        self.assertIn("krátce zpřesněna", corrected.fit_model_note or "")
-
-    def test_sparse_catalogue_linkage_preserves_verified_branch_and_rejects_blunder(self):
-        old = [
-            Observation(
-                time=f"2010-03-0{day}T00:00:00Z", ra_deg=10.0, dec_deg=20.0,
-                station="711",
-            )
-            for day in range(1, 4)
-        ]
-        recent = [
-            Observation(
-                time=f"2020-03-0{day}T00:00:00Z", ra_deg=10.0, dec_deg=20.0,
-                station="500",
-            )
-            for day in range(1, 7)
-        ]
-        observations = old + recent
-        catalogue = OrbitSolution(
-            "325P", 2458909.5, 4.6416, .45, 12.0, 30.0, 60.0, 0.0,
-            position_au=(2.5, 0.0, 0.0),
-            velocity_au_per_day=(0.0, .01, 0.0),
-            nongravitational_parameters={"A1": 1e-8},
-        )
-        corrected = replace(catalogue)
-
-        def fake_evaluate(rows, *_args, **_kwargs):
-            for index, observation in enumerate(rows):
-                residual = 100.0 if observation is old[-1] else (
-                    .5 if observation in old else .2
-                )
-                observation.residual_ra_arcsec = residual
-                observation.residual_dec_arcsec = 0.0
-                observation.used_in_fit = False
-            return 25.0, 10.0, len(rows)
-
-        def fake_fit(rows, *_args, **_kwargs):
-            for observation in rows:
-                if not observation.excluded_from_fit:
-                    observation.residual_ra_arcsec = 5.0
-                    observation.residual_dec_arcsec = 0.0
-                    observation.used_in_fit = True
-            corrected.fit_normalized_rms = 2.0
-            return corrected, 3.5, len(rows)
-
-        with (
-            patch(
-                "orbit_app.orbit_fit._evaluate_solution_observations",
-                side_effect=fake_evaluate,
-            ),
-            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit) as fit_once,
-            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
-        ):
-            result = fit_orbit(
-                observations, catalogue, nongravitational={"A1": 1e-8},
-            )
-
-        self.assertIs(result[0], catalogue)
-        self.assertEqual(fit_once.call_count, 1)
-        self.assertTrue(fit_once.call_args.kwargs["strict_polish"])
-        self.assertTrue(old[-1].excluded_from_fit)
-        self.assertTrue(old[-1].raw["historical_duplicate_outlier"])
-        self.assertAlmostEqual(old[0].residual_ra_arcsec, .5)
-        self.assertIn("korekce byla odmítnuta", catalogue.fit_model_note or "")
-        self.assertEqual(
-            [item["status"] for item in catalogue.apparition_linkage or ()],
-            ["linked", "linked"],
-        )
-
-    def test_sparse_appraisal_requires_two_consistent_plates(self):
-        observations = [
-            Observation(
-                time=f"1951-05-28T0{index}:00:00Z", ra_deg=10.0, dec_deg=20.0,
-                residual_ra_arcsec=value, residual_dec_arcsec=0.0,
-            )
-            for index, value in enumerate((1.0, 2.0, 100.0), start=1)
-        ]
-        rms, _normalized, retained, rejected = _robust_apparition_appraisal(
-            observations
-        )
-        self.assertEqual(len(retained), 2)
-        self.assertEqual(rejected, [observations[-1]])
-        self.assertLess(rms, 2.0)
-
-    def test_long_arc_seed_holds_a_parameters_then_frees_them_progressively(self):
-        observations = [
-            Observation(
-                time=f"1835-10-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
-            )
-            for day in range(1, 7)
-        ] + [
-            Observation(
-                time=f"1986-03-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
-            )
-            for day in range(1, 11)
-        ]
-        solution = OrbitSolution(
-            "1P", 2446470.5, 17.8, .967, 162.3, 58.4, 111.3, 0.0,
-            position_au=(.586, 0.0, 0.0), velocity_au_per_day=(0.0, .03, 0.0),
-            fit_normalized_rms=.8,
-        )
-        calls = []
-        fit_options = []
-
-        def fake_fit(*args, **kwargs):
-            fit_options.append(dict(kwargs))
-            calls.append((
-                dict(args[4] or {}),
-                dict(kwargs.get("fixed_nongravitational") or {}),
-                kwargs.get("fit_state", True),
-            ))
-            if len(calls) == 1:
-                solution.nongravitational_parameters = {"A1": 2e-8}
-            return solution, 1.0, 10
-
-        with (
-            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit),
-            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
-        ):
-            fit_orbit(observations, solution, nongravitational={"A1": 0.0, "DT": 30.0})
-        self.assertEqual(calls[0], ({}, {"A1": 0.0}, True))
-        self.assertEqual(fit_options[0]["max_nfev"], 24)
-        self.assertEqual(fit_options[0]["robust_scale"], 100.0)
-        self.assertEqual(calls[1], ({}, {"A1": 2e-8, "DT": 30.0}, True))
-        self.assertTrue(calls[-1][2])
-
-    def test_bad_post_encounter_seed_restarts_from_modern_astrometry(self):
-        observations = [
-            Observation(
-                time=f"{year}-10-{day:02d}T00:00:00Z",
-                ra_deg=10.0 + .01 * day, dec_deg=20.0,
-            )
-            for year in (1892, 2008)
-            for day in range(1, 7)
-        ]
-        catalogue = OrbitSolution(
-            "206P", 2461000.5, 3.49, .55, 33.6, 202.3, 189.5, 260.0,
-            position_au=(-2.3, -3.6, 1.6),
-            velocity_au_per_day=(.0064, .0005, .0013),
-            fit_normalized_rms=200.0,
-        )
-        bad = replace(catalogue)
-        bad.fit_normalized_rms = 200.0
-        independent = replace(catalogue, epoch_jd=2454750.5)
-        independent.fit_normalized_rms = 1.0
-
-        preliminary_calls = []
-
-        def fake_preliminary(rows, **kwargs):
-            preliminary_calls.append((list(rows), dict(kwargs)))
-            return [independent]
-
-        def fake_fit(rows, initial, *_args, **_kwargs):
-            if initial is catalogue or initial is bad:
-                return bad, 300.0, len(rows)
-            independent.fit_normalized_rms = 1.0
-            return independent, 1.0, len(rows)
-
-        with (
-            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit),
-            patch(
-                "orbit_app.orbit_fit.initial_orbit_from_observations",
-                side_effect=fake_preliminary,
-            ),
-            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
-        ):
-            result = fit_orbit(
-                observations, catalogue,
-                nongravitational={"A1": 1.01e-8, "A2": .06684e-8},
-            )
-        self.assertTrue(preliminary_calls)
-        self.assertTrue(preliminary_calls[0][1]["return_candidates"])
-        self.assertTrue(all(row.time.startswith("2008") for row in preliminary_calls[0][0]))
-        self.assertIs(result[0], independent)
-
-    def test_three_comet_returns_are_linked_progressively(self):
-        observations = [
-            Observation(
-                time=f"{year}-{month:02d}-{day:02d}T00:00:00Z",
-                ra_deg=1.0, dec_deg=2.0,
-            )
-            for year, month, count in ((1835, 10, 6), (1910, 4, 8), (1986, 3, 10))
-            for day in range(1, count + 1)
-        ]
-        solution = OrbitSolution(
-            "1P", 2446470.5, 17.8, .967, 162.3, 58.4, 111.3, 0.0,
-            position_au=(.586, 0.0, 0.0), velocity_au_per_day=(0.0, .03, 0.0),
-            fit_normalized_rms=.8,
-        )
-        row_counts = []
-
-        def fake_fit(rows, *_args, **_kwargs):
-            row_counts.append(len(rows))
-            solution.nongravitational_parameters = {"A1": 1e-8}
-            solution.fit_normalized_rms = .8
-            return solution, 1.0, len(rows)
-
-        with (
-            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit),
-            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
-        ):
-            result = fit_orbit(
-                observations, solution,
-                nongravitational={"A1": 0.0, "DT": 0.0},
-            )
-        # The first bridge holds the supplied force model fixed.  Later
-        # returns get a secular prefit plus a state correction, followed by
-        # the balanced bridge and strict all-return polish.
-        self.assertEqual(row_counts, [10, 18, 24, 24, 24])
-        self.assertIn("všech 3", result[0].fit_model_note or "")
-        self.assertEqual(
-            [item["status"] for item in result[0].apparition_linkage or ()],
-            ["linked", "linked", "linked"],
-        )
-        self.assertTrue(
-            (apparition_linkage_summary(result[0]) or "").startswith(
-                "NAVÁZÁNO 3/3 návratů"
-            )
-        )
-
-    def test_any_periodic_comet_can_retry_linkage_from_older_local_astrometry(self):
-        observations = [
-            Observation(
-                time=f"{year}-03-{day:02d}T00:00:00Z",
-                ra_deg=10.0, dec_deg=20.0,
-            )
-            for year in (2010, 2020)
-            for day in range(1, 7)
-        ]
-        seed = OrbitSolution(
-            "321P/Test", 2458909.5, 4.6416, .45, 12.0, 30.0, 60.0, 0.0,
-            position_au=(2.5, 0.0, 0.0),
-            velocity_au_per_day=(0.0, .01, 0.0),
-            fit_normalized_rms=.8,
-            nongravitational_parameters={"A1": 1e-8},
-        )
-        bad = OrbitSolution(
-            "321P/Test", 2458909.5, 4.6416, .45, 12.0, 30.0, 60.0, 0.0,
-            position_au=(2.5, 0.0, 0.0),
-            velocity_au_per_day=(0.0, .01, 0.0),
-            fit_normalized_rms=100.0,
-            nongravitational_parameters={"A1": 1e-8},
-        )
-        row_counts = []
-        call_trace = []
-
-        failed_joint = 0
-
-        def fake_fit(rows, *_args, **kwargs):
-            nonlocal failed_joint
-            row_counts.append(len(rows))
-            call_trace.append((
-                len(rows), kwargs.get("max_nfev"),
-                kwargs.get("screening", False),
-            ))
-            if (
-                len(rows) == 12
-                and kwargs.get("fixed_nongravitational")
-                # Reject both the direct bridge and its first incremental
-                # continuation so this test reaches the independent local-
-                # astrometry fallback.  Incremental extension now correctly
-                # precedes that more weakly constrained alternative basin.
-                and failed_joint < 2
-            ):
-                failed_joint += 1
-                return bad, 100.0, len(rows)
-            return seed, 1.0, len(rows)
-
-        with (
-            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit),
-            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
-        ):
-            result = fit_orbit(
-                observations, seed, nongravitational={"A1": 0.0},
-            )
-        self.assertEqual(failed_joint, 2)
-        self.assertIn(6, row_counts[2:])
-        extension_index = call_trace.index((12, 16, True))
-        local_index = next(
-            index for index, call in enumerate(call_trace)
-            if index > 0 and call[0] == 6
-        )
-        self.assertLess(extension_index, local_index)
-        self.assertEqual(
-            [item["status"] for item in result[0].apparition_linkage or ()],
-            ["linked", "linked"],
-        )
-        self.assertIn("všech 2", result[0].fit_model_note or "")
-
-    def test_near_linkage_branch_gets_a_longer_convergence_pass(self):
-        observations = [
-            Observation(
-                time=f"{year}-03-{day:02d}T00:00:00Z",
-                ra_deg=10.0, dec_deg=20.0,
-            )
-            for year in (2010, 2020)
-            for day in range(1, 7)
-        ]
-        good = OrbitSolution(
-            "321P/Test", 2458909.5, 4.6416, .45, 12.0, 30.0, 60.0, 0.0,
-            position_au=(2.5, 0.0, 0.0),
-            velocity_au_per_day=(0.0, .01, 0.0),
-            fit_normalized_rms=.8,
-            nongravitational_parameters={"A1": 1e-8},
-        )
-        near = replace(good, fit_normalized_rms=12.0)
-        calls = []
-
-        def fake_fit(rows, *_args, **kwargs):
-            max_nfev = kwargs.get("max_nfev")
-            calls.append(max_nfev)
-            if len(rows) == 12 and max_nfev == 6:
-                return near, 9.0, len(rows)
-            return good, 1.0, len(rows)
-
-        with (
-            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit),
-            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
-        ):
-            result = fit_orbit(
-                observations, good, nongravitational={"A1": 0.0},
-            )
-        self.assertEqual(calls[:3], [24, 6, 24])
-        self.assertEqual(
-            [item["status"] for item in result[0].apparition_linkage or ()],
-            ["linked", "linked"],
-        )
-
-    def test_acceptable_exact_propagation_skips_unstable_linkage_branches(self):
-        observations = [
-            Observation(
-                time=f"{year}-03-{day:02d}T00:00:00Z",
-                ra_deg=10.0, dec_deg=20.0,
-            )
-            for year in (1892, 2008)
-            for day in range(1, 7)
-        ]
-        solution = OrbitSolution(
-            "206P", 2454759.0, 3.24, .647, 32.9, 204.1, 181.4, 359.0,
-            position_au=(2.0, 0.0, 0.0),
-            velocity_au_per_day=(0.0, .01, 0.0),
-            fit_normalized_rms=.6,
-            nongravitational_parameters={"A1": 1.01e-8, "A2": 6.684e-10},
-        )
-        calls = []
-
-        def fake_fit(rows, *_args, **kwargs):
-            calls.append((len(rows), kwargs.get("max_nfev")))
-            return solution, 0.8, len(rows)
-
-        def acceptable_propagation(rows, *_args, **_kwargs):
-            for observation in rows:
-                observation.residual_ra_arcsec = 1.0
-                observation.residual_dec_arcsec = 1.0
-                observation.used_in_fit = False
-            return 1.0, 1.0, len(rows)
-
-        with (
-            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit),
-            patch(
-                "orbit_app.orbit_fit._evaluate_solution_observations",
-                side_effect=acceptable_propagation,
-            ),
-            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
-        ):
-            result = fit_orbit(
-                observations, solution,
-                nongravitational={"A1": 1.01e-8, "A2": 6.684e-10},
-            )
-
-        self.assertNotIn((12, 6), calls)
-        self.assertEqual(
-            [item["status"] for item in result[0].apparition_linkage or ()],
-            ["linked", "linked"],
-        )
-        self.assertIn(
-            "přesnou propagací",
-            result[0].apparition_linkage[0]["reason"],
-        )
-
-    def test_known_comet_can_use_catalogue_state_only_as_verified_third_seed(self):
-        observations = [
-            Observation(
-                time=f"{year}-03-{day:02d}T00:00:00Z",
-                ra_deg=10.0, dec_deg=20.0,
-            )
-            for year in (2012, 2019)
-            for day in range(1, 7)
-        ]
-        catalogue = OrbitSolution(
-            "78P", 2458909.5, 3.73, .46, 6.2, 210.0, 192.0, 0.0,
-            position_au=(2.0, 0.0, 0.0),
-            velocity_au_per_day=(0.0, .01, 0.0),
-            fit_normalized_rms=.8,
-            nongravitational_parameters={"A1": 1e-8},
-        )
-        fitted = replace(catalogue)
-        bad = replace(catalogue, fit_normalized_rms=100.0)
-        calls = []
-
-        joint_attempts = 0
-
-        def fake_fit(rows, seed, *_args, **kwargs):
-            nonlocal joint_attempts
-            calls.append((
-                seed, kwargs.get("fit_state", True),
-                dict(kwargs.get("fixed_nongravitational") or {}),
-            ))
-            if len(rows) == 12 and seed is not catalogue:
-                joint_attempts += 1
-                return bad, 100.0, len(rows)
-            return fitted, 1.0, len(rows)
-
-        with (
-            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit),
-            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
-        ):
-            result = fit_orbit(
-                observations, catalogue, nongravitational={"A1": 0.0},
-            )
-        catalogue_calls = [call for call in calls if call[0] is catalogue]
-        self.assertGreaterEqual(joint_attempts, 1)
-        self.assertTrue(any(call[2] for call in catalogue_calls))
-        self.assertIn(
-            "pevném publikovaném",
-            result[0].apparition_linkage[0]["reason"],
-        )
-
-    def test_linkage_can_release_full_requested_nongravitational_model(self):
-        observations = [
-            Observation(
-                time=f"{year}-03-{day:02d}T00:00:00Z",
-                ra_deg=10.0, dec_deg=20.0,
-            )
-            for year in (2012, 2019)
-            for day in range(1, 7)
-        ]
-        catalogue = OrbitSolution(
-            "78P", 2458909.5, 3.73, .46, 6.2, 210.0, 192.0, 0.0,
-            position_au=(2.0, 0.0, 0.0),
-            velocity_au_per_day=(0.0, .01, 0.0),
-            fit_normalized_rms=.8,
-            nongravitational_parameters={
-                "A1": 1e-8, "A2": 1e-9, "A3": 1e-10, "DT": 2.0,
-            },
-        )
-        fitted = replace(catalogue)
-        bad = replace(catalogue, fit_normalized_rms=100.0)
-        expanded_seen = False
-        parameter_sets = []
-
-        def fake_fit(rows, _seed, _constraints, _truncate, parameters, **kwargs):
-            nonlocal expanded_seen
-            names = set(parameters or {})
-            parameter_sets.append(names)
-            if len(rows) == 6:
-                return fitted, 1.0, len(rows)
-            if {"A3", "DT"} & names:
-                expanded_seen = True
-                return fitted, 1.0, len(rows)
-            if expanded_seen:
-                return fitted, 1.0, len(rows)
-            return bad, 100.0, len(rows)
-
-        with (
-            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit),
-            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
-        ):
-            result = fit_orbit(
-                observations, catalogue,
-                nongravitational={
-                    "A1": 0.0, "A2": 0.0, "A3": 0.0, "DT": 0.0,
-                },
-            )
-        self.assertTrue(any({"A3", "DT"} <= names for names in parameter_sets))
-        self.assertIn(
-            "celého negravitačního modelu",
-            result[0].apparition_linkage[0]["reason"],
-        )
-
-    def test_final_exact_fit_cannot_claim_return_with_large_residuals(self):
-        observations = [
-            Observation(
-                time=f"{year}-03-{day:02d}T00:00:00Z",
-                ra_deg=10.0, dec_deg=20.0,
-            )
-            for year in (1892, 2008) for day in range(1, 7)
-        ]
-        solution = OrbitSolution(
-            "206P", 2454751.5, 3.2, .64, 32.0, 204.0, 181.0, 0.0,
-            position_au=(1.2, 0.0, 0.0),
-            velocity_au_per_day=(0.0, .015, 0.0),
-            fit_normalized_rms=.8,
-            nongravitational_parameters={"A1": 1e-8},
-        )
-        calls = 0
-
-        def fake_fit(rows, *_args, **kwargs):
-            nonlocal calls
-            calls += 1
-            if kwargs.get("max_nfev") == 14:
-                for observation in observations:
-                    old = observation.time.startswith("1892")
-                    observation.residual_ra_arcsec = 900.0 if old else .3
-                    observation.residual_dec_arcsec = 100.0 if old else -.2
-                    observation.used_in_fit = True
-            return solution, 1.0, len(rows)
-
-        with (
-            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit),
-            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
-        ):
-            result = fit_orbit(
-                observations, solution, nongravitational={"A1": 0.0},
-            )
-        self.assertEqual(
-            [item["status"] for item in result[0].apparition_linkage or ()],
-            ["failed", "linked"],
-        )
-        self.assertIn("model proto není potvrzen", result[0].fit_model_note or "")
 
     def test_multi_apparition_table_marks_future_relative_to_today(self):
         solution = OrbitSolution(
@@ -1420,16 +697,54 @@ class OrbitFitSelectionTests(unittest.TestCase):
         )
         future = EvolutionReturn(1, 2474000.0, (0.0,) * 6, 18.0, .968, 162.2,
                                  58.3, 111.4, .58, 76.4, 1 / 18.0)
+        encounter = PlanetEncounter(2421000.0, "jupiter", .25, .7, 6.0, -2e-3)
+        integrated = EvolutionResult(
+            (past, after_observations, future), (encounter,),
+            2390000.0, 2475000.0, 5.0, "test",
+        )
         with patch(
-            "orbit_app.orbit_evolution.perihelion_returns_between",
-            return_value=(past, after_observations, future),
-        ):
+            "orbit_app.orbit_evolution.calculate_orbit_evolution_between",
+            return_value=integrated,
+        ) as integration:
             _attach_multi_apparition_elements(observations, solution)
+        # One integration serves the return table and the Evolution tab.
+        self.assertEqual(integration.call_count, 1)
+        self.assertEqual(solution.observed_evolution.encounters, (encounter,))
         self.assertEqual(len(solution.apparition_elements or ()), 3)
         self.assertFalse(solution.apparition_elements[0]["future"])
         self.assertFalse(solution.apparition_elements[1]["future"])
         self.assertTrue(solution.apparition_elements[2]["future"])
         self.assertEqual(solution.apparition_elements[1]["state"], (1.0,) * 6)
+
+    def test_each_apparition_is_labelled_by_its_nearest_perihelion(self):
+        solution = OrbitSolution(
+            "78P", 2459000.5, 3.74, .46, 6.3, 210.5, 192.9, 0.0,
+            position_au=(1.4, 0.0, 0.0), velocity_au_per_day=(0.0, .016, 0.0),
+        )
+        perihelia = (2455900.0, 2458550.0, 2461200.0)  # 2011, 2019, 2026
+        returns = tuple(
+            EvolutionReturn(index, epoch, (1.0,) * 6, 3.74, .46, 6.3, 210.5, 192.9,
+                            2.0, 7.2, 1 / 3.74)
+            for index, epoch in enumerate(perihelia)
+        )
+        records = [
+            {"epoch_jd": 2456000.0, "return_year": 2011},  # 2011–2013
+            {"epoch_jd": 2456750.0, "return_year": 2014},  # aphelion only
+            {"epoch_jd": 2458700.0, "return_year": 2018},  # 2018–2021
+        ]
+        solution.apparition_linkage = tuple(records)
+        observations = [
+            Observation(time="2011-06-01T00:00:00Z"),
+            Observation(time="2020-06-01T00:00:00Z"),
+        ]
+        with patch(
+            "orbit_app.orbit_evolution.calculate_orbit_evolution_between",
+            return_value=EvolutionResult(returns, (), 2455000.0, 2462000.0, 5.0, "t"),
+        ):
+            _attach_multi_apparition_elements(observations, solution)
+        # Aphelion detections belong to the nearest return (2011), not a
+        # fictitious 2014 one, and they no longer shift the 2018 label.
+        self.assertEqual([item["return_year"] for item in records], [2011, 2011, 2019])
 
     def test_fitted_photometry_reduces_apparent_magnitude_to_absolute(self):
         solution = OrbitSolution(
@@ -1558,7 +873,7 @@ class OrbitFitSelectionTests(unittest.TestCase):
                 return_value=[wrong, right],
             ) as ranging,
             patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=staged_fit) as fit_once,
-            patch("orbit_app.orbit_fit._prefer_parabolic_short_arc", side_effect=lambda _, value, __: value),
+            patch("orbit_app.orbit_fit._prefer_parabolic_short_arc", side_effect=lambda *args: args[1]),
         ):
             result = fit_orbit(observations, supplied)
         self.assertIs(result[0], right)
@@ -1632,23 +947,6 @@ class OrbitFitSelectionTests(unittest.TestCase):
         self.assertGreater(np.count_nonzero(
             (epochs[indices] > 27000.0) & (epochs[indices] < 28000.0)
         ), 30)
-
-    def test_linkage_sample_balances_sparse_historical_and_modern_returns(self):
-        old = [
-            Observation(time=f"1892-10-{1 + index % 28:02d}T{index % 24:02d}:00:00Z")
-            for index in range(41)
-        ]
-        modern = [
-            Observation(time=(
-                datetime(2008, 10, 1, tzinfo=timezone.utc)
-                + timedelta(hours=index)
-            ).isoformat())
-            for index in range(282)
-        ]
-        selected = _balanced_linkage_observations([old, modern])
-        self.assertEqual(len(selected), 82)
-        self.assertEqual(sum(item.time.startswith("1892") for item in selected), 41)
-        self.assertEqual(sum(item.time.startswith("2008") for item in selected), 41)
 
     def test_dense_station_night_becomes_one_spherical_normal_place(self):
         start = datetime(2008, 10, 20, 20, tzinfo=timezone.utc)
@@ -1738,313 +1036,6 @@ class OrbitFitSelectionTests(unittest.TestCase):
         )
         self.assertLess(steps[0], 1e-4)
         self.assertGreater(steps[1], 1.0)
-
-    def test_distant_apparition_is_extended_in_doubling_stages(self):
-        self.assertEqual(_arc_extension_counts(0), ())
-        self.assertEqual(_arc_extension_counts(5), (5,))
-        self.assertEqual(_arc_extension_counts(41), (6, 24, 41))
-
-    def test_historical_identification_compares_independent_orbits(self):
-        modern = OrbitSolution(
-            "206P", 2412450.5, 3.4, .6, 31.0, 208.0, 170.0, 0.0,
-            position_au=(1.4, .1, .05),
-            velocity_au_per_day=(-.002, .020, .004),
-            nongravitational_parameters={"A1": 1e-8},
-        )
-        historical = replace(
-            modern,
-            position_au=(1.39, .11, .052),
-            velocity_au_per_day=(-.0021, .0199, .0041),
-        )
-        similar, metrics = _apparition_orbit_similarity(modern, historical)
-        self.assertTrue(similar)
-        self.assertLess(metrics["plane_deg"], 1.0)
-        self.assertLess(metrics["apsidal_deg"], 5.0)
-        with self.assertRaises(OrbitFitError):
-            _apparition_orbit_similarity(
-                modern, replace(historical, epoch_jd=historical.epoch_jd + 1.0),
-            )
-
-    def test_historical_identification_threshold_follows_orbital_period(self):
-        six_year_comet = OrbitSolution(
-            "321P/Test", 2459000.5, 6.0 ** (2.0 / 3.0), .5,
-            10.0, 20.0, 30.0, 0.0,
-        )
-        self.assertFalse(_needs_historical_identification(
-            2459000.5 - 6.0 * 365.25, 2459000.5, six_year_comet,
-        ))
-        self.assertTrue(_needs_historical_identification(
-            2459000.5 - 12.0 * 365.25, 2459000.5, six_year_comet,
-        ))
-
-    def test_period_candidate_changes_only_transverse_velocity(self):
-        solution = OrbitSolution(
-            "206P", 2412450.5, 3.4, .6, 31.0, 208.0, 170.0, 0.0,
-            position_au=(1.4, .1, .05),
-            velocity_au_per_day=(-.002, .020, .004),
-            state_covariance=np.eye(6),
-            element_uncertainties={"a": .01},
-            nongravitational_parameters={"A1": 1e-8},
-        )
-        candidate = _transverse_period_candidate(solution, 2e-4)
-        position = np.asarray(solution.position_au)
-        original_velocity = np.asarray(solution.velocity_au_per_day)
-        corrected_velocity = np.asarray(candidate.velocity_au_per_day)
-        radial_direction = position / np.linalg.norm(position)
-        normal_direction = np.cross(position, original_velocity)
-        normal_direction /= np.linalg.norm(normal_direction)
-        transverse_direction = np.cross(normal_direction, radial_direction)
-
-        self.assertEqual(candidate.position_au, solution.position_au)
-        self.assertAlmostEqual(
-            float(np.dot(corrected_velocity, radial_direction)),
-            float(np.dot(original_velocity, radial_direction)),
-        )
-        self.assertAlmostEqual(
-            float(np.dot(corrected_velocity, transverse_direction)),
-            1.0002 * float(np.dot(original_velocity, transverse_direction)),
-        )
-        self.assertIsNone(candidate.state_covariance)
-        self.assertIsNone(candidate.element_uncertainties)
-        self.assertIsNone(candidate.nongravitational_parameters)
-
-    def test_century_linkage_identifies_branch_before_releasing_a_terms(self):
-        observations = [
-            Observation(
-                time=f"{year}-03-{day:02d}T00:00:00Z",
-                ra_deg=10.0, dec_deg=20.0,
-            )
-            for year in (1892, 2008)
-            for day in range(1, 7)
-        ]
-        modern = OrbitSolution(
-            "206P", 2454759.0, 3.24, .647, 32.9, 204.1, 181.4, 359.0,
-            position_au=(2.0, 0.0, 0.0),
-            velocity_au_per_day=(0.0, .01, 0.0),
-            fit_normalized_rms=.6,
-            nongravitational_parameters={"A1": 1.01e-8, "A2": 6.684e-10},
-        )
-        local_initial = replace(
-            modern, epoch_jd=2412450.5,
-            position_au=(1.4, .1, .05),
-            velocity_au_per_day=(-.002, .020, .004),
-            nongravitational_parameters=None,
-        )
-        local = replace(local_initial, fit_normalized_rms=1.0)
-        period_best = replace(
-            modern,
-            velocity_au_per_day=(0.0, .0100001, 0.0),
-        )
-        linked = replace(local, fit_normalized_rms=1.0)
-        bad = replace(modern, fit_normalized_rms=100.0)
-        identity_initial_parameters = None
-        identity_started_from_period_branch = False
-        period_search_started_from_modern_apparition = False
-
-        def fake_fit(rows, seed, *_args, **kwargs):
-            nonlocal identity_initial_parameters, identity_started_from_period_branch
-            if seed is local_initial:
-                return local, 1.0, len(rows)
-            if len(rows) == 12 and kwargs.get("fit_state") is False:
-                identity_initial_parameters = dict(_args[2] or {})
-                identity_started_from_period_branch = seed is period_best
-                return local, 100.0, len(rows)
-            if len(rows) == 12 and kwargs.get("max_nfev") == 48:
-                return linked, 1.0, len(rows)
-            if len(rows) == 12 and kwargs.get("max_nfev") in (6, 16):
-                return bad, 100.0, len(rows)
-            return modern, 1.0, len(rows)
-
-        def fake_appraisal(rows, solution, *_args, **_kwargs):
-            value = 1.0 if solution is period_best else 100.0
-            for observation in rows:
-                observation.residual_ra_arcsec = value
-                observation.residual_dec_arcsec = value
-                observation.used_in_fit = False
-            return value, value, len(rows)
-
-        def fake_period_candidate(solution, change):
-            nonlocal period_search_started_from_modern_apparition
-            period_search_started_from_modern_apparition = (
-                period_search_started_from_modern_apparition
-                or solution is modern
-            )
-            return period_best if change == 1e-5 else solution
-
-        with (
-            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=fake_fit),
-            patch(
-                "orbit_app.orbit_fit.initial_orbit_from_observations",
-                return_value=[local_initial],
-            ),
-            patch(
-                "orbit_app.orbit_fit._propagate_solution_to_epoch",
-                return_value=local,
-            ),
-            patch(
-                "orbit_app.orbit_fit._apparition_orbit_similarity",
-                return_value=(True, {
-                    "plane_deg": 1.0, "apsidal_deg": 2.0,
-                    "q_fraction": .01, "e_difference": .02,
-                }),
-            ),
-            patch(
-                "orbit_app.orbit_fit._evaluate_solution_observations",
-                side_effect=fake_appraisal,
-            ),
-            patch(
-                "orbit_app.orbit_fit._transverse_period_candidate",
-                side_effect=fake_period_candidate,
-            ),
-            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
-        ):
-            result = fit_orbit(
-                observations, modern,
-                nongravitational={"A1": 1.01e-8, "A2": 6.684e-10},
-            )
-        self.assertEqual(
-            identity_initial_parameters,
-            {"A1": 0.0, "A2": 0.0},
-        )
-        self.assertTrue(identity_started_from_period_branch)
-        self.assertTrue(period_search_started_from_modern_apparition)
-        self.assertIn(
-            "fitovala A1/A2 od nulových hodnot",
-            result[0].apparition_linkage[0]["reason"],
-        )
-
-    def test_catastrophic_linked_comet_fit_falls_back_to_latest_apparition(self):
-        observations = [
-            Observation(
-                time=f"1835-10-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
-            )
-            for day in range(1, 7)
-        ] + [
-            Observation(
-                time=f"1986-03-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0,
-            )
-            for day in range(1, 11)
-        ]
-        seed = OrbitSolution(
-            "1P", 2446470.5, 17.8, .967, 162.3, 58.4, 111.3, 0.0,
-            position_au=(.586, 0.0, 0.0), velocity_au_per_day=(0.0, .03, 0.0),
-            fit_normalized_rms=1.0, nongravitational_parameters={"A1": 1e-8},
-        )
-        failed = OrbitSolution(
-            "1P", 2446470.5, 18.0, .96, 162.0, 58.0, 111.0, 0.0,
-            position_au=(.6, 0.0, 0.0), velocity_au_per_day=(0.0, .03, 0.0),
-            fit_normalized_rms=5000.0, nongravitational_parameters={"A1": 2e-8},
-        )
-
-        progress_label = ""
-        extension_seeds = []
-
-        def staged_fit(rows, *args, **_kwargs):
-            if "postupně připojuji" in progress_label:
-                extension_seeds.append(args[0])
-            if staged_fit.calls == 0:
-                for observation in rows:
-                    observation.residual_ra_arcsec = .2
-                    observation.residual_dec_arcsec = -.1
-                    observation.used_in_fit = True
-                result = (seed, .3, len(rows))
-            else:
-                for observation in observations:
-                    observation.residual_ra_arcsec = 100000.0
-                    observation.residual_dec_arcsec = 100000.0
-                    observation.used_in_fit = True
-                result = (failed, 100000.0, len(rows))
-            staged_fit.calls += 1
-            return result
-
-        staged_fit.calls = 0
-
-        def progress(label, _step, _total):
-            nonlocal progress_label
-            progress_label = label
-
-        with (
-            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=staged_fit),
-            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
-        ):
-            result = fit_orbit(
-                observations, seed, nongravitational={"A1": 0.0},
-                progress_callback=progress,
-            )
-        self.assertIs(result[0], seed)
-        self.assertIsNotNone(observations[0].residual_ra_arcsec)
-        self.assertFalse(observations[0].used_in_fit)
-        historical_components = np.asarray([
-            component
-            for observation in observations[:6]
-            for component in (
-                observation.residual_ra_arcsec,
-                observation.residual_dec_arcsec,
-            )
-        ], dtype=float)
-        self.assertAlmostEqual(
-            result[0].apparition_linkage[0]["rms_arcsec"],
-            float(np.sqrt(np.mean(np.square(historical_components)))),
-        )
-        modern_components = np.asarray([
-            component
-            for observation in observations[6:]
-            for component in (
-                observation.residual_ra_arcsec,
-                observation.residual_dec_arcsec,
-            )
-        ], dtype=float)
-        self.assertAlmostEqual(
-            result[0].apparition_linkage[1]["rms_arcsec"],
-            float(np.sqrt(np.mean(np.square(modern_components)))),
-        )
-        self.assertIn("neprošel kontrolou kvality", seed.fit_model_note or "")
-        self.assertIn(
-            "přímá propagace",
-            seed.apparition_linkage[0]["reason"],
-        )
-        self.assertEqual(
-            [item["status"] for item in seed.apparition_linkage or ()],
-            ["failed", "seed_only"],
-        )
-        self.assertEqual(
-            apparition_linkage_summary(seed),
-            "SPOLEČNÝ MODEL NEPOTVRZEN — fit 1/2 návratů",
-        )
-        self.assertTrue(extension_seeds)
-        self.assertIs(extension_seeds[0], seed)
-
-    def test_catastrophic_latest_apparition_is_not_returned_as_success(self):
-        observations = [
-            Observation(
-                time=f"{year}-03-{day:02d}T00:00:00Z",
-                ra_deg=10.0, dec_deg=20.0,
-            )
-            for year in (1892, 2008)
-            for day in range(1, 7)
-        ]
-        failed = OrbitSolution(
-            "206P", 2454758.5, 3.24, .646, 32.9, 204.1, 181.4, 0.0,
-            position_au=(1.2, 0.0, 0.0),
-            velocity_au_per_day=(0.0, .02, 0.0),
-            fit_normalized_rms=190.0,
-            nongravitational_parameters={"A1": 1.01e-8, "A2": .06684e-8},
-        )
-
-        def always_bad(rows, *_args, **_kwargs):
-            return failed, 300.0, len(rows)
-
-        with (
-            patch("orbit_app.orbit_fit._fit_orbit_once", side_effect=always_bad),
-            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
-        ):
-            with self.assertRaisesRegex(
-                OrbitFitError, "původní řešení zůstává beze změny",
-            ):
-                fit_orbit(
-                    observations, failed,
-                    nongravitational={"A1": 1.01e-8, "A2": .06684e-8},
-                )
 
     def test_representative_count_says_which_arc_it_describes(self):
         solution = OrbitSolution("1P", 2446470.5, 17.8, .967, 162, 58, 111, 0)

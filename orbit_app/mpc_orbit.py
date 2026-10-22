@@ -5,6 +5,7 @@ import re
 import numpy as np
 
 from .domain import OrbitSolution, is_comet_designation
+from .i18n import tr
 from .orbit_engine import MU_SUN
 
 
@@ -95,11 +96,11 @@ def mpc_identifier_choices(identifier_data: object, fallback: str) -> list[tuple
         is_comet = "/" in primary or group.casefold() == "comets"
         if is_comet:
             caption = mpc_display_name(row, fallback)
-            kind = "kometa"
+            kind = tr("kometa")
         else:
             number = f"({permanent})" if permanent else primary
             caption = f"{number} {name}".strip()
-            kind = "planetka"
+            kind = tr("planetka")
         query = permanent or primary
         if query:
             discovery_designation = primary or iau_designation
@@ -129,13 +130,13 @@ def cartesian_to_elements(
     node_vector = np.cross(np.array([0.0, 0.0, 1.0]), h)
     node_norm = np.linalg.norm(node_vector)
     if not np.isfinite(mu) or mu <= 0.0:
-        raise OrbitParseError("Gravitační parametr středu musí být kladný.")
+        raise OrbitParseError(tr("Gravitační parametr středu musí být kladný."))
     e_vector = ((speed2 - mu / radius) * r - np.dot(r, v) * v) / mu
     eccentricity = float(np.linalg.norm(e_vector))
     energy = speed2 / 2.0 - mu / radius
     semi_major = -mu / (2.0 * energy)
     if not np.isfinite(semi_major) or eccentricity < 0:
-        raise OrbitParseError("Kartézský stav nevede na použitelnou kuželosečku.")
+        raise OrbitParseError(tr("Kartézský stav nevede na použitelnou kuželosečku."))
     inclination = np.degrees(np.arccos(np.clip(h[2] / h_norm, -1.0, 1.0)))
     node = np.degrees(np.arctan2(node_vector[1], node_vector[0])) % 360.0 if node_norm else 0.0
     if node_norm and eccentricity > 1e-12:
@@ -162,7 +163,7 @@ def cartesian_to_elements(
         hyperbolic_anomaly = 2.0 * np.arctanh(argument)
         mean_anomaly = np.degrees(eccentricity * np.sinh(hyperbolic_anomaly) - hyperbolic_anomaly)
     else:
-        raise OrbitParseError("Přesně parabolická dráha vyžaduje perihelový parametr.")
+        raise OrbitParseError(tr("Přesně parabolická dráha vyžaduje perihelový parametr."))
     return semi_major, eccentricity, inclination, node, arg_peri, mean_anomaly
 
 
@@ -183,7 +184,7 @@ def parse_mpc_orbit(body: object, designation: str) -> OrbitSolution:
         ]
         epoch = float(orbit["epoch_data"]["epoch"]) + 2400000.5
     except (IndexError, KeyError, TypeError, ValueError) as exc:
-        raise OrbitParseError("MPC nevrátil použitelné kartézské elementy dráhy.") from exc
+        raise OrbitParseError(tr("MPC nevrátil použitelné kartézské elementy dráhy.")) from exc
     elements = cartesian_to_elements(np.array(values[:3]), np.array(values[3:]))
     magnitude = orbit.get("magnitude_data", {})
     display_name = mpc_display_name(orbit.get("designation_data"), designation)

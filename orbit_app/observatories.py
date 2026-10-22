@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import warnings
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
@@ -17,6 +17,7 @@ from astropy.utils.exceptions import AstropyWarning
 import astropy.units as u
 from erfa import ErfaWarning
 
+from .i18n import tr
 from .planetary import PLANETS
 
 
@@ -88,7 +89,7 @@ def observatory_details(code: str) -> dict[str, object] | None:
         return None
     result: dict[str, object] = {
         "code": station_code,
-        "name": row.get("name_utf8") or row.get("name") or "Neznámá observatoř",
+        "name": row.get("name_utf8") or row.get("name") or tr("Neznámá observatoř"),
     }
     if location is not None:
         result.update({
@@ -161,10 +162,10 @@ def equatorial_to_horizontal(
     ra = np.atleast_1d(np.asarray(ra_deg, dtype=float))
     dec = np.atleast_1d(np.asarray(dec_deg, dtype=float))
     if ra.shape != dec.shape:
-        raise ValueError("Pole RA a Dec nemají stejný rozměr.")
+        raise ValueError(tr("Pole RA a Dec nemají stejný rozměr."))
     time_values = [times] if isinstance(times, datetime) else list(times)
     if len(time_values) not in (1, ra.size):
-        raise ValueError("Počet časů neodpovídá počtu souřadnic.")
+        raise ValueError(tr("Počet časů neodpovídá počtu souřadnic."))
     obstime = Time(time_values[0] if len(time_values) == 1 else time_values, scale="utc")
     target = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
     with warnings.catch_warnings():
@@ -179,7 +180,7 @@ def equatorial_to_horizontal(
 def station_offsets_gcrs(stations: list[str], times: list[datetime]) -> np.ndarray:
     """Return station vectors from the Earth's centre in GCRS/ICRS axes, in AU."""
     if len(stations) != len(times):
-        raise ValueError("Počet stanic neodpovídá počtu časů pozorování.")
+        raise ValueError(tr("Počet stanic neodpovídá počtu časů pozorování."))
     result = np.zeros((len(times), 3), dtype=float)
     active_indices: list[int] = []
     terrestrial_xyz: list[tuple[float, float, float]] = []
@@ -222,7 +223,7 @@ def geodetic_offsets_gcrs(
 ) -> np.ndarray:
     """Return per-observation WGS84 locations in geocentric celestial axes."""
     if len(coordinates) != len(times):
-        raise ValueError("Počet souřadnic neodpovídá počtu časů pozorování.")
+        raise ValueError(tr("Počet souřadnic neodpovídá počtu časů pozorování."))
     if not coordinates:
         return np.empty((0, 3), dtype=float)
     longitude, latitude, height = np.asarray(coordinates, dtype=float).T
@@ -239,14 +240,88 @@ def geodetic_offsets_gcrs(
         )
 
 
+# UTC is defined by ERFA only from 1960.  Earlier timestamps are Universal
+# Time, for which TT - UT must come from the historical Earth-rotation record.
+_UTC_START = datetime(1960, 1, 1, tzinfo=timezone.utc)
+
+
+def delta_t_seconds(year: float) -> float:
+    """Return TT - UT in seconds for a decimal year before 1960.
+
+    Polynomial expressions of Espenak & Meeus (NASA Five Millennium Canon of
+    Solar Eclipses, 2006).  They follow the Morrison & Stephenson
+    reconstruction to about a second in the telescopic era (after 1700).
+    """
+    y = float(year)
+    if y < 500.0:
+        u = y / 100.0
+        return (10583.6 - 1014.41 * u + 33.78311 * u**2 - 5.952053 * u**3
+                - 0.1798452 * u**4 + 0.022174192 * u**5 + 0.0090316521 * u**6)
+    if y < 1600.0:
+        u = (y - 1000.0) / 100.0
+        return (1574.2 - 556.01 * u + 71.23472 * u**2 + 0.319781 * u**3
+                - 0.8503463 * u**4 - 0.005050998 * u**5 + 0.0083572073 * u**6)
+    if y < 1700.0:
+        t = y - 1600.0
+        return 120.0 - 0.9808 * t - 0.01532 * t**2 + t**3 / 7129.0
+    if y < 1800.0:
+        t = y - 1700.0
+        return (8.83 + 0.1603 * t - 0.0059285 * t**2 + 0.00013336 * t**3
+                - t**4 / 1174000.0)
+    if y < 1860.0:
+        t = y - 1800.0
+        return (13.72 - 0.332447 * t + 0.0068612 * t**2 + 0.0041116 * t**3
+                - 0.00037436 * t**4 + 0.0000121272 * t**5
+                - 0.0000001699 * t**6 + 0.000000000875 * t**7)
+    if y < 1900.0:
+        t = y - 1860.0
+        return (7.62 + 0.5737 * t - 0.251754 * t**2 + 0.01680668 * t**3
+                - 0.0004473624 * t**4 + t**5 / 233174.0)
+    if y < 1920.0:
+        t = y - 1900.0
+        return (-2.79 + 1.494119 * t - 0.0598939 * t**2 + 0.0061966 * t**3
+                - 0.000197 * t**4)
+    if y < 1941.0:
+        t = y - 1920.0
+        return 21.20 + 0.84493 * t - 0.076100 * t**2 + 0.0020936 * t**3
+    t = y - 1950.0
+    return 29.07 + 0.407 * t - t**2 / 233.0 + t**3 / 2547.0
+
+
 def dynamical_jd(times: list[datetime]) -> np.ndarray:
-    """Convert UTC observation instants to the TDB time argument used by dynamics."""
+    """Convert observation instants to the TDB Julian dates used by dynamics.
+
+    From 1960 the instants are UTC and ERFA supplies TT - UTC (including the
+    1960-1972 rubber-second era).  Older MPC timestamps are Universal Time;
+    ERFA's pre-1960 fallback would silently use TT - UT = 32.184 s, which is
+    about 39 s wrong in 1892.  Those instants use :func:`delta_t_seconds`.
+    """
+    values = list(times)
+    if not values:
+        return np.empty(0, dtype=float)
+    aware = [
+        value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        for value in values
+    ]
+    result = np.empty(len(aware), dtype=float)
+    modern = [index for index, value in enumerate(aware) if value >= _UTC_START]
+    historical = [index for index, value in enumerate(aware) if value < _UTC_START]
     with warnings.catch_warnings():
-        # ERFA warns for pre-UTC visual observations. Astropy deliberately
-        # applies its documented historical approximation, which is adequate
-        # beside their multi-arcsecond astrometric uncertainty.
         warnings.simplefilter("ignore", ErfaWarning)
-        return np.asarray(Time(times, scale="utc").tdb.jd, dtype=float)
+        if modern:
+            result[modern] = Time(
+                [aware[index] for index in modern], scale="utc",
+            ).tdb.jd
+        if historical:
+            reference = datetime(2000, 1, 1, 12, tzinfo=timezone.utc)
+            ut_jd = np.asarray([
+                2451545.0 + (aware[index] - reference).total_seconds() / 86400.0
+                for index in historical
+            ])
+            years = 2000.0 + (ut_jd - 2451545.0) / 365.25
+            tt_jd = ut_jd + np.asarray([delta_t_seconds(year) for year in years]) / 86400.0
+            result[historical] = Time(tt_jd, format="jd", scale="tt").tdb.jd
+    return result
 
 
 def earth_heliocentric_ecliptic(jd_tdb: np.ndarray) -> np.ndarray:

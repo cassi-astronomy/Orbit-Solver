@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 from scipy.interpolate import CubicSpline
+from .i18n import tr
 
 J2000_JD = 2451545.0
 
@@ -149,7 +150,7 @@ class JplSpkPlanetEphemeris:
             from jplephem.spk import SPK
         except ImportError as exc:
             raise RuntimeError(
-                "Pro JPL DE440 chybí knihovna jplephem; nainstalujte requirements.txt."
+                tr("Pro JPL DE440 chybí knihovna jplephem; nainstalujte requirements.txt.")
             ) from exc
         self.path = Path(path)
         self.kernel = SPK.open(str(self.path))
@@ -160,12 +161,11 @@ class JplSpkPlanetEphemeris:
     def position(self, body: str, jd: float) -> np.ndarray:
         if not (DE440_COVERAGE[0] <= float(jd) <= DE440_COVERAGE[1]):
             raise ValueError(
-                "Požadovaná epocha leží mimo rozsah JPL DE440 "
-                "(1549-12-31 až 2650-01-25)."
+                tr("Požadovaná epocha leží mimo rozsah JPL DE440 (1549-12-31 až 2650-01-25).")
             )
         name = body.lower()
         if name != "moon" and name not in self._BARYCENTER_IDS:
-            raise KeyError(f"Těleso {body!r} není v poskytovateli DE440 podporováno.")
+            raise KeyError(tr("Těleso {0!r} není v poskytovateli DE440 podporováno.", body))
         target = 3 if name == "moon" else self._BARYCENTER_IDS[name]
         barycentric = self._ssb_position(0, target, jd)
         if name == "mercury":
@@ -184,8 +184,7 @@ class JplSpkPlanetEphemeris:
         epoch = float(jd)
         if not (DE440_COVERAGE[0] <= epoch <= DE440_COVERAGE[1]):
             raise ValueError(
-                "Požadovaná epocha leží mimo rozsah JPL DE440 "
-                "(1549-12-31 až 2650-01-25)."
+                tr("Požadovaná epocha leží mimo rozsah JPL DE440 (1549-12-31 až 2650-01-25).")
             )
         names = tuple(name.lower() for name in bodies)
         sun = self._ssb_position(0, 10, epoch)
@@ -204,7 +203,10 @@ class JplSpkPlanetEphemeris:
             else:
                 target = self._BARYCENTER_IDS.get(name)
                 if target is None:
-                    raise KeyError(f"Těleso {name!r} není v poskytovateli DE440 podporováno.")
+                    raise KeyError(tr(
+                        "Těleso {0!r} není v poskytovateli DE440 podporováno.",
+                        name,
+                    ))
                 barycentric = self._ssb_position(0, target, epoch)
                 if name == "mercury":
                     barycentric += self._ssb_position(1, 199, epoch)
@@ -218,8 +220,7 @@ class JplSpkPlanetEphemeris:
         jd = np.asarray(epochs, dtype=float)
         if np.any(jd < DE440_COVERAGE[0]) or np.any(jd > DE440_COVERAGE[1]):
             raise ValueError(
-                "Požadovaná epocha leží mimo rozsah JPL DE440 "
-                "(1549-12-31 až 2650-01-25)."
+                tr("Požadovaná epocha leží mimo rozsah JPL DE440 (1549-12-31 až 2650-01-25).")
             )
 
         def series(center: int, target: int) -> np.ndarray:
@@ -235,7 +236,7 @@ class JplSpkPlanetEphemeris:
         else:
             target = self._BARYCENTER_IDS.get(name)
             if target is None:
-                raise KeyError(f"Těleso {body!r} není v poskytovateli DE440 podporováno.")
+                raise KeyError(tr("Těleso {0!r} není v poskytovateli DE440 podporováno.", body))
             barycentric = series(0, target)
             if name == "mercury":
                 barycentric += series(1, 199)
@@ -291,22 +292,27 @@ class PlanetEphemerisProvider:
 
     @property
     def model_name(self) -> str:
-        return "JPL DE440" if self.jpl is not None else "analytický model"
+        return "JPL DE440" if self.jpl is not None else tr("analytický model")
 
     def status_text(self) -> str:
         if self.jpl is not None:
             size_mb = de440_path().stat().st_size / (1024 * 1024)
-            return f"JPL DE440 je aktivní ({size_mb:.0f} MB; 1549–2650)."
+            return tr("JPL DE440 je aktivní ({0:.0f} MB; 1549–2650).", size_mb)
         if self.load_error:
-            return f"Soubor DE440 nelze použít: {self.load_error}"
-        return "JPL DE440 chybí; používá se méně přesný analytický model planet."
+            return tr("Soubor DE440 nelze použít: {0}", self.load_error)
+        return tr("JPL DE440 chybí; používá se méně přesný analytický model planet.")
 
 
 PLANETS = PlanetEphemerisProvider()
 
 
 class SplinePlanetEphemeris:
-    """Vectorized, one-time planetary cache for repeated long integrations."""
+    """Vectorized, one-time planetary cache for repeated integrations.
+
+    ``step_days`` controls the sampling of the cubic spline.  One day keeps the
+    interpolation error of every planet (including Mercury and the Moon)
+    below 1e-7 AU, far below the effect of their perturbations on a comet.
+    """
 
     def __init__(
         self, source: PlanetEphemerisProvider, bodies: tuple[str, ...],
@@ -317,12 +323,27 @@ class SplinePlanetEphemeris:
         self.epochs = np.linspace(float(start_jd), float(end_jd), count)
         self.bodies = tuple(body.lower() for body in bodies)
         self.body_indices = {body: index for index, body in enumerate(self.bodies)}
+        self._index_cache: dict[tuple[str, ...], np.ndarray] = {}
         # One vector-valued spline is materially faster inside solve_ivp than
         # nine independent Python/CubicSpline calls for every force evaluation.
+        series = getattr(source, "position_series", None)
         values = np.stack([
-            source.position_series(body, self.epochs) for body in self.bodies
+            series(body, self.epochs) if callable(series) else np.stack([
+                np.asarray(source.position(body, float(epoch)), dtype=float)
+                for epoch in self.epochs
+            ])
+            for body in self.bodies
         ], axis=1)
         self.spline = CubicSpline(self.epochs, values, axis=0)
+
+    def _indices(self, bodies: tuple[str, ...]) -> np.ndarray:
+        indices = self._index_cache.get(bodies)
+        if indices is None:
+            indices = np.asarray(
+                [self.body_indices[body.lower()] for body in bodies], dtype=int,
+            )
+            self._index_cache[bodies] = indices
+        return indices
 
     def position(self, body: str, jd: float) -> np.ndarray:
         epoch = float(jd)
@@ -332,13 +353,14 @@ class SplinePlanetEphemeris:
             self.spline(epoch)[self.body_indices[body.lower()]], dtype=float,
         )
 
-    def positions(self, bodies: tuple[str, ...], jd: float) -> tuple[np.ndarray, ...]:
+    def positions_array(self, bodies: tuple[str, ...], jd: float) -> np.ndarray:
+        """Return heliocentric positions of ``bodies`` as an ``(N, 3)`` array."""
         epoch = float(jd)
         if epoch < self.epochs[0] or epoch > self.epochs[-1]:
-            return tuple(
-                np.asarray(self.source.position(body, epoch), dtype=float)
-                for body in bodies
+            return np.asarray(
+                [self.source.position(body, epoch) for body in bodies], dtype=float,
             )
-        values = np.asarray(self.spline(epoch), dtype=float)
-        return tuple(values[self.body_indices[body.lower()]] for body in bodies)
+        return np.asarray(self.spline(epoch), dtype=float)[self._indices(bodies)]
 
+    def positions(self, bodies: tuple[str, ...], jd: float) -> tuple[np.ndarray, ...]:
+        return tuple(self.positions_array(bodies, jd))

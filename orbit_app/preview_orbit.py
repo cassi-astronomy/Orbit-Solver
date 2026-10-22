@@ -7,6 +7,7 @@ from threading import Lock
 import numpy as np
 
 from .domain import OrbitSolution
+from .i18n import tr
 from .observatories import dynamical_jd
 from .orbit_engine import NBodyIntegrator, StateVector
 from .planetary import PLANETS
@@ -177,7 +178,7 @@ def heliocentric_xyz(solution: OrbitSolution, jd: np.ndarray) -> np.ndarray:
         x_orbit = scale * (e - np.cosh(hyperbolic))
         y_orbit = scale * np.sqrt(e * e - 1.0) * np.sinh(hyperbolic)
     else:
-        raise ValueError("Téměř parabolická dráha nemá stabilní parametrizaci pomocí a, e.")
+        raise ValueError(tr("Téměř parabolická dráha nemá stabilní parametrizaci pomocí a, e."))
     return _rotate_orbital_plane(solution, x_orbit, y_orbit)
 
 
@@ -189,7 +190,7 @@ def orbital_curve_xyz(
     e = solution.eccentricity
     p = a * (1.0 - e * e)
     if p <= 0.0:
-        raise ValueError("Neplatný parametr kuželosečky.")
+        raise ValueError(tr("Neplatný parametr kuželosečky."))
     if e < 1.0:
         anomaly = np.linspace(-np.pi, np.pi, samples, endpoint=True)
     else:
@@ -228,7 +229,7 @@ def apparent_geometry(
     if observer_offsets_equatorial is not None:
         offsets = np.asarray(observer_offsets_equatorial, dtype=float)
         if offsets.shape != earth.shape:
-            raise ValueError("Pole poloh pozorovatele neodpovídá epochám efemeridy.")
+            raise ValueError(tr("Pole poloh pozorovatele neodpovídá epochám efemeridy."))
         eps = np.radians(23.4392911)
         observer += np.column_stack((
             offsets[:, 0],
@@ -266,7 +267,7 @@ def apparent_geometry(
 
 def demo_solution() -> OrbitSolution:
     return OrbitSolution(
-        designation="Ukázková dráha (neřešená)",
+        designation=tr("Ukázková dráha (neřešená)"),
         epoch_jd=2460950.5,
         semi_major_axis_au=2.2,
         eccentricity=0.46,

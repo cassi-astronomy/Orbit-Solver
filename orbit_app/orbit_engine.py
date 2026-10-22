@@ -5,6 +5,7 @@ from typing import Protocol
 
 import numpy as np
 from scipy.integrate import solve_ivp
+from .i18n import tr
 
 # Units used throughout the engine: AU, day, solar mass.
 GAUSSIAN_K = 0.01720209895
@@ -26,7 +27,7 @@ def solar_post_newtonian_acceleration(
     v_vector = np.asarray(velocity, dtype=float)
     radius = float(np.linalg.norm(r_vector))
     if radius <= 0.0:
-        raise ValueError("Těleso nemůže být ve středu Slunce.")
+        raise ValueError(tr("Těleso nemůže být ve středu Slunce."))
     speed2 = float(np.dot(v_vector, v_vector))
     radial_product = float(np.dot(r_vector, v_vector))
     factor = MU_SUN / (C_AU_PER_DAY**2 * radius**3)
@@ -34,6 +35,15 @@ def solar_post_newtonian_acceleration(
         (4.0 * MU_SUN / radius - speed2) * r_vector
         + 4.0 * radial_product * v_vector
     )
+
+
+def _cross(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Cross product of two 3-vectors (numpy.cross costs ~20 µs per call)."""
+    return np.array((
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ))
 
 
 def marsden_water_ice_law(radius_au: float | np.ndarray) -> float | np.ndarray:
@@ -61,7 +71,7 @@ def _stumpff(z: float) -> tuple[float, float]:
     # retaining the original z (the former behaviour) violates the Stumpff
     # identities and can silently manufacture a plausible but wrong radius.
     if root > 50.0:
-        raise FloatingPointError("Hyperbolická univerzální anomálie přetekla.")
+        raise FloatingPointError(tr("Hyperbolická univerzální anomálie přetekla."))
     return (float((np.cosh(root) - 1.0) / root**2),
             float((np.sinh(root) - root) / root**3))
 
@@ -101,14 +111,14 @@ def delayed_heliocentric_radius(
             + (1.0 - alpha * r0) * anomaly**2 * c_value + r0
         )
         if not np.isfinite(function) or not np.isfinite(derivative) or abs(derivative) < 1e-14:
-            raise FloatingPointError("Výpočet zpožděné aktivity nekonverguje.")
+            raise FloatingPointError(tr("Výpočet zpožděné aktivity nekonverguje."))
         correction = function / derivative
         anomaly -= correction
         if abs(correction) < 1e-12:
             converged = True
             break
     if not converged:
-        raise FloatingPointError("Výpočet zpožděné aktivity nekonverguje.")
+        raise FloatingPointError(tr("Výpočet zpožděné aktivity nekonverguje."))
     z = alpha * anomaly * anomaly
     c_value, s_value = _stumpff(z)
     f_value = 1.0 - anomaly * anomaly / r0 * c_value
@@ -116,7 +126,7 @@ def delayed_heliocentric_radius(
     shifted = f_value * r0_vector + g_value * v0_vector
     radius = float(np.linalg.norm(shifted))
     if not np.isfinite(radius) or radius <= 0.0:
-        raise FloatingPointError("Výpočet zpožděné heliocentrické vzdálenosti selhal.")
+        raise FloatingPointError(tr("Výpočet zpožděné heliocentrické vzdálenosti selhal."))
     return radius
 
 
@@ -136,12 +146,12 @@ def nongravitational_acceleration(
     velocity = np.asarray(velocity, dtype=float)
     radius = float(np.linalg.norm(position))
     radial = position / radius
-    normal_vector = np.cross(position, velocity)
+    normal_vector = _cross(position, velocity)
     normal_norm = float(np.linalg.norm(normal_vector))
     if normal_norm <= 1e-18:
         return np.zeros(3, dtype=float)
     normal = normal_vector / normal_norm
-    transverse = np.cross(normal, radial)
+    transverse = _cross(normal, radial)
     direction = (
         float(parameters.get("A1", 0.0)) * radial +
         float(parameters.get("A2", 0.0)) * transverse +
@@ -150,11 +160,11 @@ def nongravitational_acceleration(
     if "R_EXPONENT" in parameters:
         exponent = float(parameters["R_EXPONENT"])
         if not np.isfinite(exponent) or exponent <= 0.0:
-            raise FloatingPointError("Exponent negravitačního modelu musí být kladný.")
+            raise FloatingPointError(tr("Exponent negravitačního modelu musí být kladný."))
         distance_factor = radius ** -exponent
     else:
         activity_radius = delayed_heliocentric_radius(
-            position, velocity, float(parameters.get("DT", 0.0)),
+            position, velocity, float(parameters.get(tr("DT"), 0.0)),
         )
         distance_factor = float(marsden_water_ice_law(activity_radius))
     return distance_factor * direction
@@ -195,11 +205,32 @@ DEFAULT_PERTURBERS = (
 )
 
 
+# Integration accuracy profiles (relative/absolute tolerance, AU and days).
+# A century-long comet linkage crosses many close Jupiter encounters, which
+# amplify any local truncation error.  For 206P/Barnard-Boattini (2008 → 1892,
+# 20 revolutions, three encounters inside 0.42 AU) DOP853 gives these errors
+# in the 1892 sky positions: rtol 1e-8 ≈ 1100″, 3e-11 ≈ 6″, 1e-12 ≈ 0.15″.
+# Only the PRECISE profile is therefore admissible for multi-decade arcs; the
+# STANDARD profile is ample within a single apparition.
+PRECISE_TOLERANCES = (1e-12, 1e-14)
+STANDARD_TOLERANCES = (3e-11, 2e-13)
+# Branch scanning only has to locate a basin a few arcseconds wide.
+SCAN_TOLERANCES = (1e-10, 1e-12)
+# Arcs longer than this (days) are integrated with PRECISE_TOLERANCES.
+LONG_ARC_DAYS = 730.0
+
+
+def tolerances_for_span(span_days: float) -> tuple[float, float]:
+    """Return the integration tolerances adequate for a time span in days."""
+    return PRECISE_TOLERANCES if abs(float(span_days)) > LONG_ARC_DAYS else STANDARD_TOLERANCES
+
+
 class NBodyIntegrator:
     """Heliocentric test-particle integration with planetary perturbations.
 
     Planet positions will normally come from a JPL DE kernel. The indirect term
-    keeps the heliocentric frame dynamically consistent.
+    keeps the heliocentric frame dynamically consistent.  Units: AU, days,
+    heliocentric J2000 ecliptic axes, TDB Julian dates.
     """
 
     def __init__(
@@ -217,34 +248,71 @@ class NBodyIntegrator:
         self.atol = absolute_tolerance
         self.nongravitational_parameters = dict(nongravitational_parameters or {})
         self.include_solar_relativity = bool(include_solar_relativity)
+        self._names = tuple(body.name for body in perturbers)
+        self._mu = np.asarray([body.mu_au3_day2 for body in perturbers], dtype=float)
+        self._has_nongravitational = any(
+            float(self.nongravitational_parameters.get(name, 0.0))
+            for name in ("A1", "A2", "A3")
+        )
+
+    def with_parameters(
+        self, nongravitational_parameters: dict[str, float] | None,
+    ) -> "NBodyIntegrator":
+        """Return an otherwise identical integrator with another force law."""
+        return NBodyIntegrator(
+            self.ephemeris, perturbers=self.perturbers,
+            relative_tolerance=self.rtol, absolute_tolerance=self.atol,
+            nongravitational_parameters=nongravitational_parameters,
+            include_solar_relativity=self.include_solar_relativity,
+        )
+
+    def _planet_positions(self, jd: float) -> np.ndarray:
+        """Heliocentric perturber positions as an ``(N, 3)`` array in AU."""
+        if not self._names:
+            return np.empty((0, 3), dtype=float)
+        array_method = getattr(self.ephemeris, "positions_array", None)
+        if callable(array_method):
+            return array_method(self._names, jd)
+        batch_method = getattr(self.ephemeris, "positions", None)
+        if callable(batch_method):
+            values = batch_method(self._names, jd)
+        else:
+            values = tuple(self.ephemeris.position(name, jd) for name in self._names)
+        return np.asarray(values, dtype=float).reshape(len(self._names), 3)
 
     def acceleration(
         self, jd: float, position: np.ndarray, velocity: np.ndarray | None = None,
     ) -> np.ndarray:
-        radius = np.linalg.norm(position)
-        if radius == 0:
-            raise ValueError("Těleso nemůže být ve středu Slunce.")
-        acceleration = -MU_SUN * position / radius**3
+        position = np.asarray(position, dtype=float)
+        radius2 = float(position @ position)
+        if radius2 == 0.0:
+            raise ValueError(tr("Těleso nemůže být ve středu Slunce."))
+        radius = np.sqrt(radius2)
+        acceleration = -MU_SUN / (radius2 * radius) * position
         if velocity is not None and self.include_solar_relativity:
-            acceleration += solar_post_newtonian_acceleration(position, velocity)
-        names = tuple(body.name for body in self.perturbers)
-        batch_method = getattr(self.ephemeris, "positions", None)
-        if callable(batch_method):
-            planet_positions = batch_method(names, jd)
-        else:
-            planet_positions = tuple(self.ephemeris.position(name, jd) for name in names)
-        for body, planet_value in zip(self.perturbers, planet_positions):
-            planet = np.asarray(planet_value, dtype=float)
-            relative = planet - position
-            relative_radius = np.linalg.norm(relative)
-            planet_radius = np.linalg.norm(planet)
-            if relative_radius == 0 or planet_radius == 0:
-                continue
-            acceleration += body.mu_au3_day2 * (
-                relative / relative_radius**3 - planet / planet_radius**3
-            )
-        if velocity is not None:
-            acceleration += nongravitational_acceleration(
+            acceleration = acceleration + solar_post_newtonian_acceleration(position, velocity)
+        if self._names:
+            planets = self._planet_positions(jd)
+            relative = planets - position
+            distance = np.sqrt(np.einsum("ij,ij->i", relative, relative))
+            planet_radius = np.sqrt(np.einsum("ij,ij->i", planets, planets))
+            valid = (distance > 0.0) & (planet_radius > 0.0)
+            if not np.all(valid):
+                relative = relative[valid]
+                planets = planets[valid]
+                distance = distance[valid]
+                planet_radius = planet_radius[valid]
+                mu = self._mu[valid]
+            else:
+                mu = self._mu
+            acceleration = acceleration + (
+                mu[:, None] * (
+                    relative / distance[:, None] ** 3
+                    - planets / planet_radius[:, None] ** 3
+                )
+            ).sum(axis=0)
+        if velocity is not None and self._has_nongravitational:
+            acceleration = acceleration + nongravitational_acceleration(
                 position, velocity, self.nongravitational_parameters
             )
         return acceleration
@@ -255,12 +323,14 @@ class NBodyIntegrator:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return da/dr, da/dv and da/dp for variational integration.
 
-        Position and velocity derivatives use analytic Newtonian gravity.
-        Only the much smaller relativistic and non-gravitational terms are
-        differenced locally, so deriving a century-long trajectory does not
-        require a separate complete integration for every fitted parameter.
-        ``parameter_scales`` maps optimizer units to the physical units used
-        by the force model (AU/day² for A1--A3 and days for DT).
+        Position derivatives use analytic Newtonian gravity of the Sun and the
+        perturbers.  The tiny post-Newtonian and non-gravitational dependences
+        on r and v are deliberately omitted from the *derivatives* (they are
+        always present in the trajectory itself): a Gauss-Newton Jacobian only
+        has to point downhill, while the residuals, which decide convergence,
+        are exact.  Derivatives with respect to A1--A3 are analytic; DT is
+        differenced.  ``parameter_scales`` maps optimizer units to the physical
+        units used by the force model (AU/day² for A1--A3, days for DT).
         """
         identity = np.eye(3)
         radius = float(np.linalg.norm(position))
@@ -268,73 +338,53 @@ class NBodyIntegrator:
             3.0 * np.outer(position, position) / radius**5
             - identity / radius**3
         )
-        names = tuple(body.name for body in self.perturbers)
-        batch_method = getattr(self.ephemeris, "positions", None)
-        if callable(batch_method):
-            planet_positions = batch_method(names, jd)
-        else:
-            planet_positions = tuple(
-                self.ephemeris.position(name, jd) for name in names
+        if self._names:
+            relative = self._planet_positions(jd) - position
+            distance = np.sqrt(np.einsum("ij,ij->i", relative, relative))
+            valid = distance > 0.0
+            relative = relative[valid]
+            distance = distance[valid]
+            mu = self._mu[valid]
+            position_jacobian = position_jacobian + (
+                3.0 * np.einsum("k,ki,kj->ij", mu / distance**5, relative, relative)
+                - identity * float(np.sum(mu / distance**3))
             )
-        for body, planet_value in zip(self.perturbers, planet_positions):
-            relative = np.asarray(planet_value, dtype=float) - position
-            distance = float(np.linalg.norm(relative))
-            if distance == 0.0:
-                continue
-            position_jacobian += body.mu_au3_day2 * (
-                3.0 * np.outer(relative, relative) / distance**5
-                - identity / distance**3
-            )
-
-        def extra(pos: np.ndarray, vel: np.ndarray) -> np.ndarray:
-            value = np.zeros(3, dtype=float)
-            if self.include_solar_relativity:
-                value += solar_post_newtonian_acceleration(pos, vel)
-            value += nongravitational_acceleration(
-                pos, vel, self.nongravitational_parameters,
-            )
-            return value
-
+        # Non-gravitational accelerations are ~1e-8 of solar gravity; their
+        # own dependence on r and v is negligible in a Gauss-Newton Jacobian.
         velocity_jacobian = np.zeros((3, 3), dtype=float)
-        for column in range(3):
-            position_step = max(1e-8, abs(float(position[column])) * 1e-7)
-            plus = position.copy()
-            minus = position.copy()
-            plus[column] += position_step
-            minus[column] -= position_step
-            position_jacobian[:, column] += (
-                extra(plus, velocity) - extra(minus, velocity)
-            ) / (2.0 * position_step)
-
-            velocity_step = max(1e-10, abs(float(velocity[column])) * 1e-7)
-            plus_velocity = velocity.copy()
-            minus_velocity = velocity.copy()
-            plus_velocity[column] += velocity_step
-            minus_velocity[column] -= velocity_step
-            velocity_jacobian[:, column] = (
-                extra(position, plus_velocity) - extra(position, minus_velocity)
-            ) / (2.0 * velocity_step)
-
         parameter_jacobian = np.zeros((3, len(parameter_names)), dtype=float)
+        if not parameter_names:
+            return position_jacobian, velocity_jacobian, parameter_jacobian
+        parameters = self.nongravitational_parameters
+        radial = position / radius
+        normal = _cross(position, velocity)
+        normal_norm = float(np.linalg.norm(normal))
+        if normal_norm <= 1e-18:
+            return position_jacobian, velocity_jacobian, parameter_jacobian
+        normal = normal / normal_norm
+        transverse = _cross(normal, radial)
+        if "R_EXPONENT" in parameters:
+            law = radius ** -float(parameters["R_EXPONENT"])
+        else:
+            law = float(marsden_water_ice_law(delayed_heliocentric_radius(
+                position, velocity, float(parameters.get(tr("DT"), 0.0)),
+            )))
+        directions = {"A1": radial, "A2": transverse, "A3": normal}
         for column, (name, scale) in enumerate(zip(parameter_names, parameter_scales)):
-            physical_value = float(self.nongravitational_parameters.get(name, 0.0))
-            physical_step = (
-                max(1e-10, abs(physical_value) * 1e-4)
-                if name != "DT" else max(.01, abs(physical_value) * 1e-5)
-            )
-            plus_parameters = dict(self.nongravitational_parameters)
-            minus_parameters = dict(self.nongravitational_parameters)
+            if name in directions:
+                # d(a)/d(A_k) = g(r) * unit vector, exactly.
+                parameter_jacobian[:, column] = law * directions[name] * float(scale)
+                continue
+            physical_value = float(parameters.get(name, 0.0))
+            physical_step = max(.01, abs(physical_value) * 1e-5)
+            plus_parameters = dict(parameters)
+            minus_parameters = dict(parameters)
             plus_parameters[name] = physical_value + physical_step
             minus_parameters[name] = physical_value - physical_step
-            plus = nongravitational_acceleration(
-                position, velocity, plus_parameters,
-            )
-            minus = nongravitational_acceleration(
-                position, velocity, minus_parameters,
-            )
             parameter_jacobian[:, column] = (
-                (plus - minus) / (2.0 * physical_step) * float(scale)
-            )
+                nongravitational_acceleration(position, velocity, plus_parameters)
+                - nongravitational_acceleration(position, velocity, minus_parameters)
+            ) / (2.0 * physical_step) * float(scale)
         return position_jacobian, velocity_jacobian, parameter_jacobian
 
     def propagate_with_partials(
@@ -350,14 +400,14 @@ class NBodyIntegrator:
         """
         epochs = np.asarray(epochs_jd, dtype=float)
         if epochs.ndim != 1 or epochs.size == 0 or not np.all(np.isfinite(epochs)):
-            raise ValueError("Je potřeba alespoň jeden konečný výstupní čas.")
+            raise ValueError(tr("Je potřeba alespoň jeden konečný výstupní čas."))
         scales = np.asarray(
             np.ones(len(parameter_names)) if parameter_scales is None
             else parameter_scales,
             dtype=float,
         )
         if scales.shape != (len(parameter_names),) or not np.all(np.isfinite(scales)):
-            raise ValueError("Měřítka variačních parametrů mají chybný rozměr.")
+            raise ValueError(tr("Měřítka variačních parametrů mají chybný rozměr."))
 
         order = np.argsort(epochs, kind="stable")
         sorted_epochs = epochs[order]
@@ -394,14 +444,11 @@ class NBodyIntegrator:
                 initial.epoch_jd + offset_days, position, velocity,
                 parameter_names, scales,
             )
-            dynamics = np.block([
-                [np.zeros((3, 3)), np.eye(3)],
-                [da_dr, da_dv],
-            ])
-            forcing = np.zeros((6, parameter_count), dtype=float)
-            forcing[3:, :] = da_dp
-            partial_derivative = dynamics @ partials
-            partial_derivative[:, 6:] += forcing
+            # d/dt [dr/dp; dv/dp] = [dv/dp; da/dr dr/dp + da/dv dv/dp (+ da/dp)].
+            partial_derivative = np.empty_like(partials)
+            partial_derivative[:3] = partials[3:]
+            partial_derivative[3:] = da_dr @ partials[:3] + da_dv @ partials[3:]
+            partial_derivative[3:, 6:] += da_dp
             return np.concatenate((
                 velocity, acceleration,
                 partial_derivative.ravel(),
@@ -446,9 +493,9 @@ class NBodyIntegrator:
     def propagate(self, initial: StateVector, epochs_jd: np.ndarray) -> np.ndarray:
         epochs = np.asarray(epochs_jd, dtype=float)
         if epochs.ndim != 1 or epochs.size == 0:
-            raise ValueError("Je potřeba alespoň jeden výstupní čas.")
+            raise ValueError(tr("Je potřeba alespoň jeden výstupní čas."))
         if not np.all(np.isfinite(epochs)):
-            raise ValueError("Výstupní časy musejí být konečná čísla.")
+            raise ValueError(tr("Výstupní časy musejí být konečná čísla."))
         # solve_ivp requires strictly monotonic t_eval.  Astrometric rows may
         # share one epoch and light-time correction can swap two otherwise
         # adjacent epochs by a tiny amount.  Integrate sorted unique epochs and

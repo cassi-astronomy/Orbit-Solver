@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+from .i18n import tr
 
 
 def power_law_magnitude(
@@ -36,7 +37,7 @@ def estimate_absolute_magnitude(
         reduced -= np.asarray(phase_correction, dtype=float)
     finite = reduced[np.isfinite(reduced)]
     if finite.size == 0:
-        raise ValueError("K odhadu H/M nejsou k dispozici platná fotometrická data.")
+        raise ValueError(tr("K odhadu H/M nejsou k dispozici platná fotometrická data."))
     return float(np.median(finite))
 
 

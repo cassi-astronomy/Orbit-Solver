@@ -18,7 +18,7 @@ os.environ.setdefault("QT_API", "pyside6")
 
 from PySide6.QtCore import (
     QAbstractTableModel, QByteArray, QItemSelectionModel, QModelIndex, QObject,
-    QThread, Qt, QTimer, QUrl, Signal, Slot,
+    QProcess, QThread, Qt, QTimer, QUrl, Signal, Slot,
 )
 from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
@@ -33,7 +33,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -68,12 +67,14 @@ from mpl_toolkits.mplot3d import Axes3D
 
 from .domain import Observation, OrbitSolution, is_comet_designation
 from .comet_dynamics import analyze_original_future_orbit
+from .i18n import SUPPORTED_LANGUAGES, language, save_language, tr
+from . import mpc_cache
 from .mpc import MpcClient, MpcError, parse_mpc80
 from .mpc_orbit import (
     OrbitParseError, cartesian_to_elements, mpc_identifier_choices, parse_mpc_orbit,
 )
 from .observatories import (
-    equatorial_to_horizontal, observation_altaz_series, observation_geometry,
+    observation_altaz_series, observation_geometry,
     observatory_details, station_offsets_gcrs,
 )
 from .orbit_fit import (
@@ -82,7 +83,7 @@ from .orbit_fit import (
 )
 from .orbit_engine import MU_SUN, NBodyIntegrator, StateVector
 from .orbit_evolution import (
-    ELEMENT_CENTERS, EvolutionResult, EvolutionReturn, HILL_RADII_AU,
+    ELEMENT_CENTERS, EvolutionResult, HILL_RADII_AU,
     PLANET_LABELS, PLANET_MU,
     calculate_orbit_evolution, centered_snapshot, centered_solution,
     format_evolution_mpc_report, format_evolution_report, return_solution,
@@ -147,15 +148,15 @@ register_projection(WideAxes3D)
 
 class ObservationModel(QAbstractTableModel):
     columns = (
-        ("Čas (UTC)", "time"),
+        (tr("Čas (UTC)"), "time"),
         ("RA [h m s]", "ra_deg"),
         ("Dec [° ′ ″]", "dec_deg"),
-        ("Mag / pásmo", "magnitude_band"),
-        ("Stanice", "station"),
-        ("Použít", "excluded_from_fit"),
+        (tr("Mag / pásmo"), "magnitude_band"),
+        (tr("Stanice"), "station"),
+        (tr("Použít"), "excluded_from_fit"),
         ("O−C RA [″]", "residual_ra_arcsec"),
         ("O−C Dec [″]", "residual_dec_arcsec"),
-        ("Ve fitu", "used_in_fit"),
+        (tr("Ve fitu"), "used_in_fit"),
     )
 
     def __init__(self) -> None:
@@ -184,7 +185,7 @@ class ObservationModel(QAbstractTableModel):
         if role == Qt.ToolTipRole and field == "excluded_from_fit":
             return observation.raw.get(
                 "automatic_exclusion_reason",
-                "Zaškrtnuto = měření je zahrnuto do dalšího fitu.",
+                tr("Zaškrtnuto = měření je zahrnuto do dalšího fitu."),
             )
         if role == Qt.BackgroundRole and field in ("residual_ra_arcsec", "residual_dec_arcsec"):
             worst = observation_residual_score(observation)
@@ -199,7 +200,10 @@ class ObservationModel(QAbstractTableModel):
         if role == Qt.ForegroundRole and field in ("residual_ra_arcsec", "residual_dec_arcsec"):
             return QColor("#07111f") if value is not None else None
         if role == Qt.ToolTipRole and field in ("residual_ra_arcsec", "residual_dec_arcsec"):
-            return "Barva podle většího z |O−C RA| a |O−C Dec|: zelená ≤0,5″; světle zelená ≤1″; žlutá ≤2″; červená >2″."
+            return tr(
+                "Barva podle většího z |O−C RA| a |O−C Dec|: zelená ≤0,5″; světle zelená "
+                "≤1″; žlutá ≤2″; červená >2″.",
+            )
         if role == Qt.DisplayRole:
             if field == "ra_deg":
                 return "—" if value is None else format_ra_sexagesimal(float(value))
@@ -212,7 +216,7 @@ class ObservationModel(QAbstractTableModel):
             if field == "excluded_from_fit":
                 return ""
             if field == "used_in_fit":
-                return "ano" if value is True else ("ne" if value is False else "—")
+                return tr("ano") if value is True else (tr("ne") if value is False else "—")
             if isinstance(value, float):
                 return f"{value:+.2f}" if field.startswith("residual_") else f"{value:.2f}"
             return "—" if value in (None, "") else str(value)
@@ -338,7 +342,7 @@ class MpcNetworkClient(QObject):
                         designation, not confirmation_page, allow_fallback=False
                     )
                     return
-                self.error.emit(f"MPC dotaz selhal: {reply.errorString()}")
+                self.error.emit(tr("MPC dotaz selhal: {0}", reply.errorString()))
                 return
             try:
                 body = json.loads(bytes(reply.readAll()).decode("utf-8"))
@@ -348,7 +352,7 @@ class MpcNetworkClient(QObject):
                         designation, not confirmation_page, allow_fallback=False
                     )
                     return
-                self.error.emit(f"MPC vrátil nečitelnou odpověď: {exc}")
+                self.error.emit(tr("MPC vrátil nečitelnou odpověď: {0}", exc))
                 return
             raw_rows = MpcClient._extract_rows(body)
             rows = [MpcClient._to_observation(row, designation) for row in raw_rows]
@@ -359,11 +363,19 @@ class MpcNetworkClient(QObject):
                     )
                     return
                 self.error.emit(
-                    f"Pro objekt „{designation}“ nebyla nalezena pozorování "
-                    "ani v běžném MPC, ani na NEOCP/PCCP."
+                    tr(
+                        "Pro objekt „{0}“ nebyla nalezena pozorování ani v běžném MPC, ani na "
+                        "NEOCP/PCCP.",
+                        designation,
+                    )
                 )
                 return
-            self.success.emit((designation, rows, confirmation_page))
+            if not confirmation_page:
+                try:
+                    mpc_cache.save(designation, raw_rows)
+                except OSError:
+                    pass  # an unwritable data folder must not block the download
+            self.success.emit((designation, rows, confirmation_page, None))
         finally:
             reply.deleteLater()
 
@@ -371,7 +383,7 @@ class MpcNetworkClient(QObject):
         self._active.discard(reply)
         try:
             if reply.error() != QNetworkReply.NoError:
-                self.orbit_error.emit(f"MPC orbitální dotaz selhal: {reply.errorString()}")
+                self.orbit_error.emit(tr("MPC orbitální dotaz selhal: {0}", reply.errorString()))
                 return
             try:
                 body = json.loads(bytes(reply.readAll()).decode("utf-8"))
@@ -422,17 +434,17 @@ class MpcNetworkClient(QObject):
         self._active.discard(reply)
         try:
             if reply.error() != QNetworkReply.NoError:
-                self.orbit_error.emit(f"JPL Horizons dotaz selhal: {reply.errorString()}")
+                self.orbit_error.emit(tr("JPL Horizons dotaz selhal: {0}", reply.errorString()))
                 return
             body = json.loads(bytes(reply.readAll()).decode("utf-8"))
             result = str(body.get("result") or "")
             match = re.search(r"\bEPOCH=\s*([0-9.]+)", result)
             if match is None:
-                self.orbit_error.emit("JPL Horizons nevrátil epochu fragmentu SL9.")
+                self.orbit_error.emit(tr("JPL Horizons nevrátil epochu fragmentu SL9."))
                 return
             self._request_sl9_horizons_vector(designation, spk_id, float(match.group(1)))
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-            self.orbit_error.emit(f"JPL Horizons vrátil nečitelná data: {exc}")
+            self.orbit_error.emit(tr("JPL Horizons vrátil nečitelná data: {0}", exc))
         finally:
             reply.deleteLater()
 
@@ -471,7 +483,7 @@ class MpcNetworkClient(QObject):
         self._active.discard(reply)
         try:
             if reply.error() != QNetworkReply.NoError:
-                self.orbit_error.emit(f"JPL Horizons dotaz selhal: {reply.errorString()}")
+                self.orbit_error.emit(tr("JPL Horizons dotaz selhal: {0}", reply.errorString()))
                 return
             body = json.loads(bytes(reply.readAll()).decode("utf-8"))
             result = str(body.get("result") or "")
@@ -482,7 +494,7 @@ class MpcNetworkClient(QObject):
                 result, designation, epoch_jd, representative_parent,
             ))
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError, OrbitParseError) as exc:
-            self.orbit_error.emit(f"JPL Horizons stav SL9 nelze načíst: {exc}")
+            self.orbit_error.emit(tr("JPL Horizons stav SL9 nelze načíst: {0}", exc))
         finally:
             reply.deleteLater()
 
@@ -496,7 +508,7 @@ class MpcNetworkClient(QObject):
         # is suitable for the application's J2000-ecliptic dynamics.
         ephemeris = re.search(r"\$\$SOE(.*?)\$\$EOE", result, re.S)
         if ephemeris is None:
-            raise ValueError("vektor není ve výsledku")
+            raise ValueError(tr("vektor není ve výsledku"))
         block = ephemeris.group(1)
         number = r"([+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+\-]?\d+)?)"
         position = re.search(
@@ -506,7 +518,7 @@ class MpcNetworkClient(QObject):
             rf"VX\s*=\s*{number}\s+VY\s*=\s*{number}\s+VZ\s*=\s*{number}", block
         )
         if position is None or velocity is None:
-            raise ValueError("vektor není ve výsledku")
+            raise ValueError(tr("vektor není ve výsledku"))
         state = np.array([float(value) for value in (*position.groups(), *velocity.groups())])
         a, e, inc, node, arg_peri, mean = cartesian_to_elements(state[:3], state[3:])
         name_match = re.search(r"Target body name:\s*([^\r\n{]+)", result)
@@ -522,7 +534,7 @@ class MpcNetworkClient(QObject):
             photometric_exponent=4.0, phase_correction=False,
             position_au=tuple(state[:3]), velocity_au_per_day=tuple(state[3:]),
             data_source=(
-                "JPL Horizons (reprezentativní počáteční stav fragmentu G)"
+                tr("JPL Horizons (reprezentativní počáteční stav fragmentu G)")
                 if representative_parent else "JPL Horizons"
             ),
         )
@@ -555,7 +567,7 @@ class OrbitFitProgressDialog(QDialog):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Výpočet dráhy")
+        self.setWindowTitle(tr("Výpočet dráhy"))
         self.setModal(True)
         self.setMinimumWidth(620)
         self._started = time.monotonic()
@@ -563,19 +575,21 @@ class OrbitFitProgressDialog(QDialog):
         self._total = 0
         self._running = True
 
-        self.phase = QLabel("Připravuji výpočet…")
+        self.phase = QLabel(tr("Připravuji výpočet…"))
         self.phase.setWordWrap(True)
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
-        self.timing = QLabel("Uplynulo: 0 s • zbývající čas zatím nelze odhadnout")
+        self.timing = QLabel(tr("Uplynulo: 0 s • zbývající čas zatím nelze odhadnout"))
         self.timing.setObjectName("muted")
         self.note = QLabel(
-            "Odhad je orientační. Dlouhé integrační větve mohou trvat různě "
-            "dlouho; zrušení se projeví po návratu právě běžící integrace."
+            tr(
+                "Odhad je orientační. Dlouhé integrační větve mohou trvat různě dlouho; "
+                "zrušení se projeví po návratu právě běžící integrace.",
+            )
         )
         self.note.setWordWrap(True)
         self.note.setObjectName("muted")
-        self.cancel_button = QPushButton("Zrušit výpočet")
+        self.cancel_button = QPushButton(tr("Zrušit výpočet"))
         self.cancel_button.clicked.connect(self._request_cancel)
 
         buttons = QHBoxLayout()
@@ -623,16 +637,16 @@ class OrbitFitProgressDialog(QDialog):
         completed = max(0, self._current - 1)
         if self._total > 0 and completed > 0 and completed < self._total:
             remaining = elapsed / completed * (self._total - completed)
-            detail = f"hrubý odhad zbývá: {self._duration(remaining)}"
-            step = f"krok {self._current} z nejvýše {self._total}"
+            detail = tr("hrubý odhad zbývá: {0}", self._duration(remaining))
+            step = tr("krok {0} z nejvýše {1}", self._current, self._total)
         elif self._total > 0 and self._current >= self._total:
-            detail = "dokončuji poslední krok"
-            step = f"krok {self._total} z {self._total}"
+            detail = tr("dokončuji poslední krok")
+            step = tr("krok {0} z {1}", self._total, self._total)
         else:
-            detail = "zbývající čas zatím nelze odhadnout"
-            step = "příprava"
+            detail = tr("zbývající čas zatím nelze odhadnout")
+            step = tr("příprava")
         self.timing.setText(
-            f"{step} • uplynulo: {self._duration(elapsed)} • {detail}"
+            tr("{0} • uplynulo: {1} • {2}", step, self._duration(elapsed), detail)
         )
 
     @Slot()
@@ -640,9 +654,9 @@ class OrbitFitProgressDialog(QDialog):
         if not self._running:
             return
         self.cancel_button.setEnabled(False)
-        self.cancel_button.setText("Ruším…")
+        self.cancel_button.setText(tr("Ruším…"))
         self.phase.setText(
-            "Čekám na bezpečné ukončení právě probíhající integrace…"
+            tr("Čekám na bezpečné ukončení právě probíhající integrace…")
         )
         self.cancel_requested.emit()
 
@@ -690,35 +704,17 @@ class OrbitFitWorker(QObject):
 
     @Slot()
     def run(self) -> None:
-        observation_snapshot = [
-            (
-                item.residual_ra_arcsec, item.residual_dec_arcsec,
-                item.used_in_fit, item.excluded_from_fit,
-                item.raw.get("automatic_exclusion"),
-                item.raw.get("coherent_secondary_track"),
-                item.raw.get("automatic_exclusion_reason"),
-            )
-            for item in self.observations
+        # The table model keeps showing ``self.observations`` while the fit
+        # runs.  Fit independent copies and hand them back only on success, so
+        # the GUI thread never sees half-written trial O-C values and a failed
+        # or cancelled run cannot leave its state behind.
+        working = [
+            replace(item, raw=dict(item.raw)) for item in self.observations
         ]
-
-        def restore_observations() -> None:
-            raw_keys = (
-                "automatic_exclusion", "coherent_secondary_track",
-                "automatic_exclusion_reason",
-            )
-            for item, values in zip(self.observations, observation_snapshot):
-                (
-                    item.residual_ra_arcsec, item.residual_dec_arcsec,
-                    item.used_in_fit, item.excluded_from_fit, *raw_values,
-                ) = values
-                for key, raw_value in zip(raw_keys, raw_values):
-                    if raw_value is None:
-                        item.raw.pop(key, None)
-                    else:
-                        item.raw[key] = raw_value
+        initial = replace(self.initial) if self.initial is not None else None
         try:
             result = fit_orbit(
-                self.observations, self.initial, self.constraints, self.truncate_years,
+                working, initial, self.constraints, self.truncate_years,
                 self.nongravitational,
                 progress_callback=self.progress.emit,
                 cancel_callback=self.is_cancel_requested,
@@ -728,12 +724,12 @@ class OrbitFitWorker(QObject):
                 if self.is_cancel_requested():
                     raise OrbitFitCancelled()
                 self.progress.emit(
-                    "Integruji původní a budoucí barycentrickou dráhu do 250 AU…",
+                    tr("Integruji původní a budoucí barycentrickou dráhu do 250 AU…"),
                     0, 0,
                 )
                 try:
                     analysis = analyze_original_future_orbit(solution)
-                except Exception as exc:
+                except (ValueError, RuntimeError, FloatingPointError, OverflowError) as exc:
                     analysis = {"error": str(exc)}
                 if self.is_cancel_requested():
                     raise OrbitFitCancelled()
@@ -752,17 +748,28 @@ class OrbitFitWorker(QObject):
                         solution,
                         np.array([datetime_to_jd(datetime.now(timezone.utc))]),
                     )
-                except Exception:
+                except (ValueError, RuntimeError, FloatingPointError, OverflowError):
                     pass
-            self.success.emit(result)
+            self.success.emit((result, working))
         except OrbitFitCancelled:
-            restore_observations()
             self.cancelled.emit()
         except Exception as exc:
-            restore_observations()
             self.error.emit(str(exc))
         finally:
             self.finished.emit()
+
+
+def apply_fitted_observations(
+    targets: list[Observation], fitted: list[Observation],
+) -> None:
+    """Copy fit results from worker copies back onto the displayed rows."""
+    for target, source in zip(targets, fitted):
+        target.residual_ra_arcsec = source.residual_ra_arcsec
+        target.residual_dec_arcsec = source.residual_dec_arcsec
+        target.used_in_fit = source.used_in_fit
+        target.excluded_from_fit = source.excluded_from_fit
+        target.raw.clear()
+        target.raw.update(source.raw)
 
 
 class PreliminaryOrbitWorker(QObject):
@@ -811,7 +818,7 @@ class EpochPropagationWorker(QObject):
         try:
             source = self.source
             if source.position_au is None or source.velocity_au_per_day is None:
-                raise ValueError("Dráha nemá kartézský stav.")
+                raise ValueError(tr("Dráha nemá kartézský stav."))
             engine = NBodyIntegrator(
                 PLANETS,
                 nongravitational_parameters=source.nongravitational_parameters,
@@ -1003,14 +1010,14 @@ class OrbitEvolutionPanel(QWidget):
     """Kinoshita-style overview of osculating elements across returns."""
 
     GRAPH_METRICS = {
-        "q": ("perihelion_au", "perihelová vzdálenost q [AU]", "perihelové vzdálenosti"),
-        "a": ("semi_major_axis_au", "velká poloosa a [AU]", "velké poloosy"),
-        "e": ("eccentricity", "excentricita e", "excentricity"),
-        "period": ("period_years", "oběžná doba P [roky]", "oběžné doby"),
-        "reciprocal_a": ("reciprocal_a", "1/a [AU⁻¹]", "reciproké velké poloosy"),
-        "inclination": ("inclination_deg", "sklon i [°]", "sklonu dráhy"),
-        "node": ("node_deg", "délka výstupného uzlu Ω [°]", "délky výstupného uzlu"),
-        "arg_peri": ("arg_peri_deg", "argument perihelu ω [°]", "argumentu perihelu"),
+        "q": ("perihelion_au", tr("perihelová vzdálenost q [AU]"), tr("perihelové vzdálenosti")),
+        "a": ("semi_major_axis_au", tr("velká poloosa a [AU]"), tr("velké poloosy")),
+        "e": ("eccentricity", tr("excentricita e"), "excentricity"),
+        "period": ("period_years", tr("oběžná doba P [roky]"), tr("oběžné doby")),
+        "reciprocal_a": ("reciprocal_a", "1/a [AU⁻¹]", tr("reciproké velké poloosy")),
+        "inclination": ("inclination_deg", tr("sklon i [°]"), tr("sklonu dráhy")),
+        "node": ("node_deg", tr("délka výstupného uzlu Ω [°]"), tr("délky výstupného uzlu")),
+        "arg_peri": ("arg_peri_deg", tr("argument perihelu ω [°]"), tr("argumentu perihelu")),
     }
 
     show_return = Signal(object, object)
@@ -1027,24 +1034,27 @@ class OrbitEvolutionPanel(QWidget):
         layout = QVBoxLayout(self)
         controls = QHBoxLayout()
         self.mode = QComboBox()
-        self.mode.addItem("Podle počtu návratů", "returns")
-        self.mode.addItem("Podle počtu let", "years")
-        self.past_label = QLabel("Předchozí návraty:")
+        self.mode.addItem(tr("Podle počtu návratů"), "returns")
+        self.mode.addItem(tr("Podle počtu let"), "years")
+        self.past_label = QLabel(tr("Předchozí návraty:"))
         self.past = QSpinBox(); self.past.setRange(0, 500); self.past.setValue(5)
-        self.future_label = QLabel("Budoucí návraty:")
+        self.future_label = QLabel(tr("Budoucí návraty:"))
         self.future = QSpinBox(); self.future.setRange(0, 500); self.future.setValue(5)
-        self.calculate = QPushButton("Spustit integraci")
+        self.calculate = QPushButton(tr("Spustit integraci"))
         self.calculate.setObjectName("primary")
         self.calculate.clicked.connect(self.start)
         self.mode.currentIndexChanged.connect(self._mode_changed)
-        controls.addWidget(QLabel("Rozsah:")); controls.addWidget(self.mode)
+        controls.addWidget(QLabel(tr("Rozsah:"))); controls.addWidget(self.mode)
         controls.addWidget(self.past_label); controls.addWidget(self.past)
         controls.addWidget(self.future_label); controls.addWidget(self.future)
         controls.addWidget(self.calculate); controls.addStretch()
         layout.addLayout(controls)
 
         self.note = QLabel(
-            "Výpočet se spouští pouze tlačítkem. Návrat 0 je perihelový průchod nejbližší epoše dráhy."
+            tr(
+                "Výpočet se spouští pouze tlačítkem. Návrat 0 je perihelový průchod "
+                "nejbližší epoše dráhy.",
+            )
         )
         self.note.setObjectName("muted"); self.note.setWordWrap(True)
         layout.addWidget(self.note)
@@ -1055,24 +1065,24 @@ class OrbitEvolutionPanel(QWidget):
 
         output_controls = QHBoxLayout()
         self.graph_metric = QComboBox()
-        self.graph_metric.addItem("Graf: perihelová vzdálenost q", "q")
-        self.graph_metric.addItem("Graf: velká poloosa a", "a")
-        self.graph_metric.addItem("Graf: excentricita e", "e")
-        self.graph_metric.addItem("Graf: oběžná doba P", "period")
-        self.graph_metric.addItem("Graf: reciproká poloosa 1/a", "reciprocal_a")
-        self.graph_metric.addItem("Graf: sklon i", "inclination")
-        self.graph_metric.addItem("Graf: výstupný uzel Ω", "node")
-        self.graph_metric.addItem("Graf: argument perihelu ω", "arg_peri")
+        self.graph_metric.addItem(tr("Graf: perihelová vzdálenost q"), "q")
+        self.graph_metric.addItem(tr("Graf: velká poloosa a"), "a")
+        self.graph_metric.addItem(tr("Graf: excentricita e"), "e")
+        self.graph_metric.addItem(tr("Graf: oběžná doba P"), "period")
+        self.graph_metric.addItem(tr("Graf: reciproká poloosa 1/a"), "reciprocal_a")
+        self.graph_metric.addItem(tr("Graf: sklon i"), "inclination")
+        self.graph_metric.addItem(tr("Graf: výstupný uzel Ω"), "node")
+        self.graph_metric.addItem(tr("Graf: argument perihelu ω"), "arg_peri")
         self.graph_metric.currentIndexChanged.connect(self._draw_result)
         self.element_center = QComboBox()
         for key, label in ELEMENT_CENTERS:
-            self.element_center.addItem(f"Střed: {label}", key)
+            self.element_center.addItem(tr("Střed: {0}", label), key)
         self.element_center.currentIndexChanged.connect(self._center_changed)
         self.report_format = QComboBox()
-        self.report_format.addItem("TXT: čitelný přehled", "readable")
+        self.report_format.addItem(tr("TXT: čitelný přehled"), "readable")
         self.report_format.addItem("TXT: MPC 1-line", "mpc")
-        self.copy_report = QPushButton("Kopírovat TXT")
-        self.save_report = QPushButton("Uložit TXT…")
+        self.copy_report = QPushButton(tr("Kopírovat TXT"))
+        self.save_report = QPushButton(tr("Uložit TXT…"))
         self.copy_report.setEnabled(False); self.save_report.setEnabled(False)
         self.copy_report.clicked.connect(self._copy_report)
         self.save_report.clicked.connect(self._save_report)
@@ -1089,8 +1099,8 @@ class OrbitEvolutionPanel(QWidget):
         tables = QSplitter(Qt.Horizontal)
         self.returns = QTableWidget(0, 9)
         self.returns.setHorizontalHeaderLabels((
-            "Návrat", "Perihelium (UTC)", "q [AU]", "e", "a [AU]",
-            "P [roky]", "i [°]", "Ω [°]", "ω [°]",
+            tr("Návrat"), tr("Perihelium (UTC)"), "q [AU]", "e", "a [AU]",
+            tr("P [roky]"), "i [°]", "Ω [°]", "ω [°]",
         ))
         self.returns.setSelectionBehavior(QTableWidget.SelectRows)
         self.returns.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -1100,8 +1110,8 @@ class OrbitEvolutionPanel(QWidget):
         tables.addWidget(self.returns)
         self.encounters = QTableWidget(0, 6)
         self.encounters.setHorizontalHeaderLabels((
-            "Datum (UTC)", "Planeta", "Vzdálenost [AU]", "Hillovy poloměry",
-            "v rel. [km/s]", "Δ(1/a) [AU⁻¹]",
+            tr("Datum (UTC)"), tr("Planeta"), tr("Vzdálenost [AU]"), tr("Hillovy poloměry"),
+            tr("v rel. [km/s]"), "Δ(1/a) [AU⁻¹]",
         ))
         self.encounters.setEditTriggers(QTableWidget.NoEditTriggers)
         self.encounters.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
@@ -1115,31 +1125,33 @@ class OrbitEvolutionPanel(QWidget):
 
     def _update_source_note(self) -> None:
         if self.solution.position_au is None or self.solution.velocity_au_per_day is None:
-            text = "Zdroj integrace: žádný použitelný kartézský stav ještě není načten."
+            text = tr("Zdroj integrace: žádný použitelný kartézský stav ještě není načten.")
         elif self.solution.fit_observation_count is not None:
             available = self.solution.fit_available_observation_count
             count_text = (
-                f"{self.solution.fit_observation_count} reprezentativních z "
-                f"{available} dostupných"
+                tr(
+                    "{0} reprezentativních z {1} dostupných",
+                    self.solution.fit_observation_count,
+                    available,
+                )
                 if available is not None
                 and available > self.solution.fit_observation_count
-                else f"{self.solution.fit_observation_count} použitých"
+                else tr("{0} použitých", self.solution.fit_observation_count)
             )
             text = (
-                "Zdroj integrace: vlastní fit z "
-                f"{count_text} pozorování."
+                tr("Zdroj integrace: vlastní fit z {0} pozorování.", count_text)
             )
             linkage = apparition_linkage_summary(self.solution)
             if linkage:
                 text += f" {linkage}."
         else:
-            text = "Zdroj integrace: výchozí kartézská dráha MPC."
+            text = tr("Zdroj integrace: výchozí kartézská dráha MPC.")
         self.source_note.setText(text)
 
     def _mode_changed(self, *_args) -> None:
         years = self.mode.currentData() == "years"
-        self.past_label.setText("Roky do minulosti:" if years else "Předchozí návraty:")
-        self.future_label.setText("Roky do budoucnosti:" if years else "Budoucí návraty:")
+        self.past_label.setText(tr("Roky do minulosti:") if years else tr("Předchozí návraty:"))
+        self.future_label.setText(tr("Roky do budoucnosti:") if years else tr("Budoucí návraty:"))
         if years and self.past.value() <= 50 and self.future.value() <= 50:
             self.past.setValue(200); self.future.setValue(200)
         elif not years and (self.past.value() > 50 or self.future.value() > 50):
@@ -1155,70 +1167,46 @@ class OrbitEvolutionPanel(QWidget):
         self.canvas.axes.clear(); self.canvas.style_axes(); self.canvas.draw_idle()
         self.calculate.setEnabled(solution.position_au is not None)
         self.note.setText(
-            "Výpočet se spouští pouze tlačítkem. Návrat 0 je perihelový průchod "
-            "nejbližší epoše dráhy."
-        )
-        cached = tuple(solution.apparition_elements or ())
-        cached_returns = tuple(
-            EvolutionReturn(
-                index=int(item.get("index", index)),
-                epoch_jd=float(item["epoch_jd"]),
-                state=tuple(float(value) for value in item["state"]),
-                semi_major_axis_au=float(item["a"]),
-                eccentricity=float(item["e"]),
-                inclination_deg=float(item["i"]),
-                node_deg=float(item["node"]),
-                arg_peri_deg=float(item["arg_peri"]),
-                perihelion_au=float(item["q"]),
-                period_years=(
-                    None if item.get("period_years") is None
-                    else float(item["period_years"])
-                ),
-                reciprocal_a=(
-                    0.0 if float(item["a"]) == 0.0 else 1.0 / float(item["a"])
-                ),
+            tr(
+                "Výpočet se spouští pouze tlačítkem. Návrat 0 je perihelový průchod "
+                "nejbližší epoše dráhy.",
             )
-            for index, item in enumerate(cached)
-            if item.get("state") is not None
         )
-        if cached_returns:
-            self.result = EvolutionResult(
-                returns=cached_returns, encounters=(),
-                start_jd=min(item.epoch_jd for item in cached_returns),
-                end_jd=max(item.epoch_jd for item in cached_returns),
-                sample_step_days=0.0,
-                model_note=(
-                    "Převzaty oskulační návraty již vypočtené při "
-                    "víceaparičním fitu; setkání a průběžný vývoj vyžadují "
-                    "samostatnou integraci."
-                ),
-            )
-            self.copy_report.setEnabled(True); self.save_report.setEnabled(True)
+        observed = solution.observed_evolution
+        if isinstance(observed, EvolutionResult):
+            # The fit already integrated the whole observed arc (for example
+            # 1892–2008 for 206P).  Show its returns, encounters and element
+            # history directly instead of asking for the same integration.
+            self._completed(observed)
             self.note.setText(
-                "Zobrazeny jsou návraty již vypočtené při navazování astrometrie. "
-                "Tlačítkem Spustit integraci lze rozsah změnit a doplnit setkání "
-                "s planetami i plynulý průběh elementů."
+                tr(
+                    "{0}  Návrat 0 je perihelový průchod nejbližší epoše dráhy.  Tlačítkem "
+                    "Spustit integraci lze zvolit jiný rozsah.",
+                    observed.model_note,
+                )
             )
-            self._populate_state_table()
-            self._draw_result()
 
     def start(self) -> None:
         if self.thread is not None:
             return
         if self.solution.position_au is None or self.solution.velocity_au_per_day is None:
             QMessageBox.warning(
-                self, "Vývoj dráhy",
-                "Nejdřív načtěte dráhu s kartézským stavem nebo spočítejte vlastní fit.",
+                self, tr("Vývoj dráhy"),
+                tr("Nejdřív načtěte dráhu s kartézským stavem nebo spočítejte vlastní fit."),
             )
             return
         if self.past.value() == 0 and self.future.value() == 0:
-            QMessageBox.warning(self, "Vývoj dráhy", "Alespoň jeden směr musí mít nenulový rozsah.")
+            QMessageBox.warning(self, tr("Vývoj dráhy"), tr(
+                "Alespoň jeden směr musí mít nenulový rozsah.",
+            ))
             return
         self.calculate.setEnabled(False)
-        self.calculate.setText("Integruji…")
+        self.calculate.setText(tr("Integruji…"))
         self.note.setText(
-            "Probíhá numerická integrace; u stovek let může výpočet trvat déle. "
-            "Ostatní části programu zůstávají ovladatelné."
+            tr(
+                "Probíhá numerická integrace; u stovek let může výpočet trvat déle. "
+                "Ostatní části programu zůstávají ovladatelné.",
+            )
         )
         thread = QThread(self)
         worker = OrbitEvolutionWorker(
@@ -1237,12 +1225,12 @@ class OrbitEvolutionPanel(QWidget):
 
     def _finished(self) -> None:
         self.thread = None; self.worker = None
-        self.calculate.setText("Spustit integraci")
+        self.calculate.setText(tr("Spustit integraci"))
         self.calculate.setEnabled(self.solution.position_au is not None)
 
     def _failed(self, message: str) -> None:
-        self.note.setText(f"Výpočet se nezdařil: {message}")
-        QMessageBox.warning(self, "Vývoj dráhy", message)
+        self.note.setText(tr("Výpočet se nezdařil: {0}", message))
+        QMessageBox.warning(self, tr("Vývoj dráhy"), message)
 
     def _completed(self, result: EvolutionResult) -> None:
         self.result = result
@@ -1250,17 +1238,23 @@ class OrbitEvolutionPanel(QWidget):
         self.copy_report.setEnabled(True); self.save_report.setEnabled(True)
         self.evolution_ready.emit(self.solution, result)
         phase_note = (
-            "Vstup a výstup jsou oskulační stavy na hranicích zvoleného intervalu. "
-            "Svislé značky v grafu ukazují planetární setkání. Dvojklikem zobrazíte stav "
-            "ve Sluneční soustavě."
+            tr(
+                "Vstup a výstup jsou oskulační stavy na hranicích zvoleného intervalu. "
+                "Svislé značky v grafu ukazují planetární setkání. Dvojklikem zobrazíte "
+                "stav ve Sluneční soustavě.",
+            )
             if result.snapshots else
-            "Dvojklikem na návrat jej zobrazíte ve Sluneční soustavě."
+            tr("Dvojklikem na návrat jej zobrazíte ve Sluneční soustavě.")
         )
         self.note.setText(
-            f"{result.model_note}  Krok vyhledávání událostí: {result.sample_step_days:.2f} dne. "
-            f"{phase_note}"
+            tr(
+                "{0}  Krok vyhledávání událostí: {1:.2f} dne. {2}",
+                result.model_note,
+                result.sample_step_days,
+                phase_note,
+            )
             + (
-                "  Detekováno planetocentrické zachycení: "
+                tr("  Detekováno planetocentrické zachycení: ")
                 + ", ".join(
                     f"{PLANET_LABELS.get(item.planet, item.planet)} "
                     f"{(datetime_from_jd(item.start_jd) or datetime.min.replace(tzinfo=timezone.utc)).year}–"
@@ -1324,16 +1318,16 @@ class OrbitEvolutionPanel(QWidget):
         displayed_states = self._states_for_center("events")
         result = self.result
         if result.snapshots:
-            self.returns.setHorizontalHeaderItem(0, QTableWidgetItem("Fáze"))
-            self.returns.setHorizontalHeaderItem(1, QTableWidgetItem("Epocha (UTC)"))
+            self.returns.setHorizontalHeaderItem(0, QTableWidgetItem(tr("Fáze")))
+            self.returns.setHorizontalHeaderItem(1, QTableWidgetItem(tr("Epocha (UTC)")))
         else:
-            self.returns.setHorizontalHeaderItem(0, QTableWidgetItem("Rok návratu"))
-            self.returns.setHorizontalHeaderItem(1, QTableWidgetItem("Perihelium (UTC)"))
+            self.returns.setHorizontalHeaderItem(0, QTableWidgetItem(tr("Rok návratu")))
+            self.returns.setHorizontalHeaderItem(1, QTableWidgetItem(tr("Perihelium (UTC)")))
         self.returns.setRowCount(len(displayed_states))
         for row, item in enumerate(displayed_states):
             date = datetime_from_jd(item.epoch_jd)
             values = (
-                item.phase if result.snapshots else (
+                tr(item.phase) if result.snapshots else (
                     str(date.year) if date else f"JD {item.epoch_jd:.0f}"
                 ),
                 date.strftime("%Y-%m-%d %H:%M") if date else f"JD {item.epoch_jd:.2f}",
@@ -1351,7 +1345,7 @@ class OrbitEvolutionPanel(QWidget):
     def _draw_result(self) -> None:
         ax = self.canvas.axes; ax.clear(); self.canvas.style_axes()
         if not self.result or not (self.result.timeline or self.result.returns or self.result.snapshots):
-            ax.text(.5, .5, "V zadaném rozsahu nejsou dostupné stavy dráhy.",
+            ax.text(.5, .5, tr("V zadaném rozsahu nejsou dostupné stavy dráhy."),
                     ha="center", va="center", transform=ax.transAxes, color="#afc2d8")
             self.canvas.draw_idle(); return
         metric_key = str(self.graph_metric.currentData() or "q")
@@ -1386,7 +1380,7 @@ class OrbitEvolutionPanel(QWidget):
         if self.result.snapshots:
             for item, x_value, y_value in zip(displayed_states, return_x, return_y):
                 if np.isfinite(y_value):
-                    ax.annotate(item.phase, (x_value, y_value), xytext=(5, 7),
+                    ax.annotate(tr(item.phase), (x_value, y_value), xytext=(5, 7),
                                 textcoords="offset points", color="#b9cbe0", fontsize=8)
         else:
             for item, x_value, y_value in zip(displayed_states, return_x, return_y):
@@ -1409,14 +1403,18 @@ class OrbitEvolutionPanel(QWidget):
             end_x = 2000.0 + (capture.end_jd - 2451545.0) / 365.25
             ax.axvspan(start_x, end_x, color="#b07cff", alpha=.12, zorder=.1)
             ax.text((start_x + end_x) / 2.0, .04,
-                    f"zachycení: {PLANET_LABELS.get(capture.planet, capture.planet)}",
+                    tr("zachycení: {0}", PLANET_LABELS.get(capture.planet, capture.planet)),
                     transform=ax.get_xaxis_transform(), ha="center", va="bottom",
                     color="#c9a8ff", fontsize=8)
-        ax.set_xlabel("rok")
+        ax.set_xlabel(tr("rok"))
         ax.set_ylabel(y_label)
         ax.set_title(
-            f"{self.solution.display_name or self.solution.designation} — vývoj {title_label} "
-            f"({self.element_center.currentText().replace('Střed: ', '')}-centrické elementy)"
+            tr(
+                "{0} — vývoj {1} ({2}-centrické elementy)",
+                self.solution.display_name or self.solution.designation,
+                title_label,
+                self.element_center.currentText().replace('Střed: ', ''),
+            )
         )
         ax.grid(color="#273750", alpha=.55, lw=.6)
         self.canvas.draw_idle()
@@ -1434,7 +1432,10 @@ class OrbitEvolutionPanel(QWidget):
             return
         QApplication.clipboard().setText(report)
         self.note.setText(
-            f"Chronologický TXT výstup byl zkopírován do schránky.  {self.result.model_note}"
+            tr(
+                "Chronologický TXT výstup byl zkopírován do schránky.  {0}",
+                self.result.model_note,
+            )
         )
 
     def _save_report(self) -> None:
@@ -1445,19 +1446,24 @@ class OrbitEvolutionPanel(QWidget):
             r"[^A-Za-z0-9._-]+", "_",
             self.solution.display_name or self.solution.designation,
         ).strip("_") or "orbit"
-        suffix = "mpc-elements" if self.report_format.currentData() == "mpc" else "vyvoj-drahy"
+        suffix = "mpc-elements" if self.report_format.currentData() == "mpc" else tr(
+            "vyvoj-drahy",
+        )
         path, _filter = QFileDialog.getSaveFileName(
-            self, "Uložit vývoj dráhy", f"{safe_name}-{suffix}.txt",
-            "Textové soubory (*.txt);;Všechny soubory (*)",
+            self, tr("Uložit vývoj dráhy"), f"{safe_name}-{suffix}.txt",
+            tr("Textové soubory (*.txt);;Všechny soubory (*)"),
         )
         if not path:
             return
         try:
             Path(path).write_text(report, encoding="utf-8-sig")
         except OSError as exc:
-            QMessageBox.warning(self, "Vývoj dráhy", f"Soubor se nepodařilo uložit:\n{exc}")
+            QMessageBox.warning(self, tr("Vývoj dráhy"), tr(
+                "Soubor se nepodařilo uložit:\n{0}",
+                exc,
+            ))
             return
-        self.note.setText(f"Chronologický výstup byl uložen do {path}")
+        self.note.setText(tr("Chronologický výstup byl uložen do {0}", path))
 
     def _open_return(self, row: int, _column: int) -> None:
         if not self.result:
@@ -1477,15 +1483,15 @@ class PlaybackBar(QWidget):
     STANDARD_SPEEDS = (
         ("1 min/s", 1 / 1440), ("10 min/s", 10 / 1440),
         ("1 h/s", 1 / 24), ("6 h/s", 6 / 24),
-        ("1 den/s", 1), ("2 dny/s", 2), ("5 dní/s", 5),
-        ("10 dní/s", 10), ("25 dní/s", 25),
-        ("50 dní/s", 50), ("100 dní/s", 100),
-        ("250 dní/s", 250), ("500 dní/s", 500),
+        (tr("1 den/s"), 1), (tr("2 dny/s"), 2), (tr("5 dní/s"), 5),
+        (tr("10 dní/s"), 10), (tr("25 dní/s"), 25),
+        (tr("50 dní/s"), 50), (tr("100 dní/s"), 100),
+        (tr("250 dní/s"), 250), (tr("500 dní/s"), 500),
     )
     VISIBILITY_SPEEDS = (
-        ("1 den/s", 1), ("2 dny/s", 2), ("3 dny/s", 3),
-        ("5 dní/s", 5), ("10 dní/s", 10), ("15 dní/s", 15),
-        ("20 dní/s", 20), ("25 dní/s", 25),
+        (tr("1 den/s"), 1), (tr("2 dny/s"), 2), (tr("3 dny/s"), 3),
+        (tr("5 dní/s"), 5), (tr("10 dní/s"), 10), (tr("15 dní/s"), 15),
+        (tr("20 dní/s"), 20), (tr("25 dní/s"), 25),
     )
 
     def __init__(self) -> None:
@@ -1502,9 +1508,9 @@ class PlaybackBar(QWidget):
         self.timer.timeout.connect(self._tick)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.back = QPushButton("◀ Zpět")
+        self.back = QPushButton(tr("◀ Zpět"))
         self.pause = QPushButton("■ Stop")
-        self.forward = QPushButton("Vpřed ▶")
+        self.forward = QPushButton(tr("Vpřed ▶"))
         self.slower = QPushButton("−")
         self.faster = QPushButton("+")
         self.speed = QComboBox()
@@ -1592,36 +1598,44 @@ class SolarSystemPanel(QWidget):
         layout = QVBoxLayout(self)
         controls = QHBoxLayout()
         notice = QLabel(
-            "Heliocentrická ekliptikální soustava J2000 • tažení myší otáčí kameru • kolečko přibližuje"
+            tr(
+                "Heliocentrická ekliptikální soustava J2000 • tažení myší otáčí kameru • "
+                "kolečko přibližuje",
+            )
         )
         notice.setObjectName("muted")
         controls.addWidget(notice); controls.addStretch()
-        self.show_orbit_curtain = QCheckBox("Projekční plocha k ekliptice (3D)")
+        self.show_orbit_curtain = QCheckBox(tr("Projekční plocha k ekliptice (3D)"))
         self.show_orbit_curtain.setChecked(False)
         self.show_orbit_curtain.setToolTip(
-            "Zobrazí průsvitnou projekční plochu mezi dráhou tělesa a jejím "
-            "kolmým průmětem do roviny ekliptiky."
+            tr(
+                "Zobrazí průsvitnou projekční plochu mezi dráhou tělesa a jejím kolmým "
+                "průmětem do roviny ekliptiky.",
+            )
         )
         self.show_orbit_curtain.toggled.connect(
             lambda _: self.set_time(self.playback.time.dateTime().toPython())
         )
         controls.addWidget(self.show_orbit_curtain)
         self.evolution_count = QComboBox()
-        self.evolution_count.addItem("Integrovaná dráha: vypnuta", 0)
-        self.evolution_count.addItem("Integrovaná dráha: zapnuta", -1)
+        self.evolution_count.addItem(tr("Integrovaná dráha: vypnuta"), 0)
+        self.evolution_count.addItem(tr("Integrovaná dráha: zapnuta"), -1)
         self.evolution_count.setCurrentIndex(1)
         self.evolution_count.setVisible(False)
         self.evolution_count.currentIndexChanged.connect(self._evolution_display_changed)
         controls.addWidget(self.evolution_count)
         self.view_center = QComboBox()
         for key, label in ELEMENT_CENTERS:
-            self.view_center.addItem(f"Střed: {label}", key)
+            self.view_center.addItem(tr("Střed: {0}", label), key)
         self.view_center.setEnabled(False)
         self.view_center.currentIndexChanged.connect(self._view_center_changed)
         controls.addWidget(self.view_center)
-        enlarge = QPushButton("Zvětšit ↗" if allow_detach else "Celá obrazovka (F11)")
+        enlarge = QPushButton(tr("Zvětšit ↗") if allow_detach else tr("Celá obrazovka (F11)"))
         enlarge.setToolTip(
-            "Otevře dráhu ve zvětšeném samostatném okně. Klávesou F11 přepnete celou obrazovku."
+            tr(
+                "Otevře dráhu ve zvětšeném samostatném okně. Klávesou F11 přepnete celou "
+                "obrazovku.",
+            )
         )
         enlarge.clicked.connect(self._open_detached if allow_detach else self._toggle_fullscreen)
         controls.addWidget(enlarge)
@@ -1634,8 +1648,8 @@ class SolarSystemPanel(QWidget):
         self.elevation_readout = QLabel(); self.elevation_readout.setMinimumWidth(38)
         self.zoom_readout = QLabel()
         self.zoom_readout.setMinimumWidth(105)
-        for label, slider in (("Azimut kamery", self.view_azimuth), ("Výška kamery", self.view_elevation),
-                              ("Přiblížení", self.view_zoom)):
+        for label, slider in ((tr("Azimut kamery"), self.view_azimuth), (tr("Výška kamery"), self.view_elevation),
+                              (tr("Přiblížení"), self.view_zoom)):
             slider.setMinimumWidth(120)
             slider.valueChanged.connect(lambda _: self.set_time(self.playback.time.dateTime().toPython()))
             view_controls.addWidget(QLabel(label)); view_controls.addWidget(slider, 1)
@@ -1645,8 +1659,8 @@ class SolarSystemPanel(QWidget):
                 view_controls.addWidget(self.elevation_readout)
             else:
                 view_controls.addWidget(self.zoom_readout)
-        top_view = QPushButton("Shora")
-        ecliptic_view = QPushButton("Z ekliptiky")
+        top_view = QPushButton(tr("Shora"))
+        ecliptic_view = QPushButton(tr("Z ekliptiky"))
         top_view.clicked.connect(lambda: self.view_elevation.setValue(89))
         ecliptic_view.clicked.connect(lambda: self.view_elevation.setValue(0))
         view_controls.addWidget(top_view); view_controls.addWidget(ecliptic_view)
@@ -1687,7 +1701,7 @@ class SolarSystemPanel(QWidget):
     def _open_detached(self) -> None:
         window = QMainWindow(self)
         window.setAttribute(Qt.WA_DeleteOnClose)
-        window.setWindowTitle(f"{self.solution.designation} — dráha ve Sluneční soustavě")
+        window.setWindowTitle(tr("{0} — dráha ve Sluneční soustavě", self.solution.designation))
         playback = PlaybackBar()
         playback.time.setDateTime(self.playback.time.dateTime())
         panel = SolarSystemPanel(self.solution, playback, allow_detach=False)
@@ -2086,10 +2100,10 @@ class SolarSystemPanel(QWidget):
                     textcoords="offset points", color="#e9cb78", fontsize=7,
                     alpha=.85,
                 )
-        planets = (("mercury", "Merkur", .241, "#aaaeb5"), ("venus", "Venuše", .615, "#e4bd70"),
-                   ("earth", "Země", 1.0, "#4ea1ff"), ("mars", "Mars", 1.881, "#e0714c"),
+        planets = (("mercury", tr("Merkur"), .241, "#aaaeb5"), ("venus", tr("Venuše"), .615, "#e4bd70"),
+                   ("earth", tr("Země"), 1.0, "#4ea1ff"), ("mars", "Mars", 1.881, "#e0714c"),
                    ("jupiter", "Jupiter", 11.86, "#d0a17a"), ("saturn", "Saturn", 29.46, "#d8c58b"),
-                   ("uranus", "Uran", 84.01, "#71d5de"), ("neptune", "Neptun", 164.8, "#537be8"))
+                   ("uranus", tr("Uran"), 84.01, "#71d5de"), ("neptune", tr("Neptun"), 164.8, "#537be8"))
         for key, name, years, color in planets:
             relative_position = PLANETS.position(key, current_jd) - center_now
             if np.linalg.norm(relative_position) > curve_radius * 1.15:
@@ -2133,7 +2147,7 @@ class SolarSystemPanel(QWidget):
         ax.scatter(sun_x, sun_y, s=95, color="#ffd166", edgecolor="#fff0b3",
                    linewidth=.8, zorder=8)
         if center != "sun" and np.linalg.norm(sun_position) <= curve_radius * 1.15:
-            ax.annotate("Slunce", (sun_x, sun_y), xytext=(5, 5), textcoords="offset points",
+            ax.annotate(tr("Slunce"), (sun_x, sun_y), xytext=(5, 5), textcoords="offset points",
                         color="#ffd166", fontsize=8)
         axis_limit = plot_limit
         ax.set_xlim(-axis_limit * viewport_aspect, axis_limit * viewport_aspect)
@@ -2151,14 +2165,14 @@ class SolarSystemPanel(QWidget):
         for start, color in ((0, "#b85b62"), (2, "#5ea978"), (4, "#668fd3")):
             ax.plot(axis_x[start:start + 2], axis_y[start:start + 2], color=color, lw=.8, alpha=.7)
         for index, label, color in (
-            (1, "+X  ♈ jarní bod", "#d9878d"),
+            (1, tr("+X  ♈ jarní bod"), "#d9878d"),
             (3, "+Y  λ=90°", "#83c99a"),
-            (5, "+Z  sever ekliptiky", "#8eb0eb"),
+            (5, tr("+Z  sever ekliptiky"), "#8eb0eb"),
         ):
             ax.annotate(label, (axis_x[index], axis_y[index]), xytext=(4, 3),
                         textcoords="offset points", color=color, fontsize=8)
         ax.set_title(
-            f"{self.solution.designation} — {center_label}-centrický pohled — "
+            tr("{0} — {1}-centrický pohled — ", self.solution.designation, center_label)
             + time.strftime("%Y-%m-%d %H:%M UTC"),
             color="#edf5ff", y=.965, pad=0,
         )
@@ -2167,10 +2181,20 @@ class SolarSystemPanel(QWidget):
         distance_earth = float(np.linalg.norm(heliocentric_current - earth))
         distance_sun = float(np.linalg.norm(heliocentric_current))
         center_distance = float(np.linalg.norm(current))
-        center_text = "" if center == "sun" else f"    od {center_label} {center_distance:.6f} AU"
+        center_text = "" if center == "sun" else tr(
+            "    od {0} {1:.6f} AU",
+            center_label,
+            center_distance,
+        )
         self.info.setText(
-            f"{time:%Y-%m-%d %H:%M UTC}    Δ od Země {distance_earth:.6f} AU    "
-            f"r od Slunce {distance_sun:.6f} AU{center_text}"
+            tr(
+                "{0:%Y-%m-%d %H:%M UTC}    Δ od Země {1:.6f} AU    r od Slunce {2:.6f} "
+                "AU{3}",
+                time,
+                distance_earth,
+                distance_sun,
+                center_text,
+            )
         )
         self.canvas.draw_idle()
 
@@ -2226,8 +2250,8 @@ _ecliptic_ra = np.degrees(np.arctan2(
 )) % 360.0
 _ecliptic_dec = np.degrees(np.arcsin(np.sin(_reference_lambda) * np.sin(_obliquity)))
 SKY_REFERENCE_CURVES = (
-    ("Nebeský rovník", _reference_ra, np.zeros_like(_reference_ra), "#788bb0", "--"),
-    ("Ekliptika", _ecliptic_ra, _ecliptic_dec, "#c6a45b", "-."),
+    (tr("Nebeský rovník"), _reference_ra, np.zeros_like(_reference_ra), "#788bb0", "--"),
+    (tr("Ekliptika"), _ecliptic_ra, _ecliptic_dec, "#c6a45b", "-."),
 )
 
 
@@ -2257,63 +2281,71 @@ class SkyPanel(QWidget):
         layout = QVBoxLayout(self)
         controls = QHBoxLayout()
         self.projection_mode = QComboBox()
-        self.projection_mode.addItem("Rovníkový (RA/Dec)", "equatorial")
-        self.projection_mode.addItem("Středový azimutální", "azimuthal")
-        self.projection_mode.addItem("Obzorový (Az/Alt)", "horizontal")
+        self.projection_mode.addItem(tr("Rovníkový (RA/Dec)"), "equatorial")
+        self.projection_mode.addItem(tr("Středový azimutální"), "azimuthal")
+        self.projection_mode.addItem(tr("Obzorový (Az/Alt)"), "horizontal")
         self.horizon = QComboBox()
         for label, days in SKY_TRACK_HORIZONS:
             self.horizon.addItem(label, days)
         self.horizon.setToolTip(
-            "Dlouhé rozsahy jsou určeny hlavně pro přehled. Přesnost vzdálené "
-            "extrapolace závisí na nejistotě dráhy a planetárních perturbacích."
+            tr(
+                "Dlouhé rozsahy jsou určeny hlavně pro přehled. Přesnost vzdálené "
+                "extrapolace závisí na nejistotě dráhy a planetárních perturbacích.",
+            )
         )
         self.field_of_view = QComboBox()
         for angle in (15, 30, 60, 120, 180, 240):
             self.field_of_view.addItem(f"{angle}°", float(angle))
-        self.field_of_view.addItem("Celá obloha", 360.0)
+        self.field_of_view.addItem(tr("Celá obloha"), 360.0)
         self.field_of_view.setCurrentIndex(2)
         self.horizontal_horizon = QComboBox()
         for label, days in (
-            ("12 hodin celkem", .25), ("24 hodin celkem", .5),
-            ("2 dny celkem", 1.0), ("6 dní celkem", 3.0),
-            ("14 dní celkem", 7.0),
+            (tr("12 hodin celkem"), .25), (tr("24 hodin celkem"), .5),
+            (tr("2 dny celkem"), 1.0), (tr("6 dní celkem"), 3.0),
+            (tr("14 dní celkem"), 7.0),
         ):
             self.horizontal_horizon.addItem(label, days)
         self.horizontal_horizon.setCurrentIndex(1)
-        self.horizontal_time_label = QLabel("Střed intervalu:")
+        self.horizontal_time_label = QLabel(tr("Střed intervalu:"))
         self.horizontal_time = QDateTimeEdit(self.playback.time.dateTime())
         self.horizontal_time.setDisplayFormat("yyyy-MM-dd HH:mm")
         self.horizontal_time.setCalendarPopup(True)
         self.horizontal_time.setFixedWidth(160)
         self.horizontal_time.setToolTip(
-            "Datum a čas uprostřed zobrazeného intervalu v UTC."
+            tr("Datum a čas uprostřed zobrazeného intervalu v UTC.")
         )
         self.horizontal_timezone = QComboBox()
         self.horizontal_timezone.addItem("UTC", 0)
-        self.horizontal_timezone.addItem("SEČ", 1)
-        self.horizontal_timezone.addItem("SELČ", 2)
+        self.horizontal_timezone.addItem(tr("SEČ"), 1)
+        self.horizontal_timezone.addItem(tr("SELČ"), 2)
         self.horizontal_timezone.setToolTip(
-            "Časové pásmo použité pro zadaný čas i popisky grafu."
+            tr("Časové pásmo použité pro zadaný čas i popisky grafu.")
         )
         self.station_code = QLineEdit("557")
         self.station_code.setMaximumWidth(68)
         self.station_code.setMaxLength(3)
         self.station_code.setToolTip(
-            "Kód pozorovací stanice MPC; 557 = Ondřejov. Výška je geometrická, bez refrakce."
+            tr(
+                "Kód pozorovací stanice MPC; 557 = Ondřejov. Výška je geometrická, bez "
+                "refrakce.",
+            )
         )
         self.station_name = QLabel()
         self.station_name.setObjectName("muted")
         self.station_name.setMaximumWidth(190)
-        self.show_path = QCheckBox("Zobrazit dráhu"); self.show_path.setChecked(True)
-        self.show_labels = QCheckBox("Popisky těles"); self.show_labels.setChecked(True)
-        self.lock_target = QCheckBox("Fixovat objekt ve středu"); self.lock_target.setChecked(True)
+        self.show_path = QCheckBox(tr("Zobrazit dráhu")); self.show_path.setChecked(True)
+        self.show_labels = QCheckBox(tr("Popisky těles")); self.show_labels.setChecked(True)
+        self.lock_target = QCheckBox(tr("Fixovat objekt ve středu")); self.lock_target.setChecked(True)
         self.lock_target.setToolTip(
-            "Vypnutím se souřadnicové pole uzamkne v aktuálním směru a objekt se po něm bude pohybovat."
+            tr(
+                "Vypnutím se souřadnicové pole uzamkne v aktuálním směru a objekt se po "
+                "něm bude pohybovat.",
+            )
         )
-        self.range_label = QLabel("Rozsah:")
-        self.fov_label = QLabel("Zorné pole:")
-        self.station_label = QLabel("Stanice MPC:")
-        controls.addWidget(QLabel("Pohled:")); controls.addWidget(self.projection_mode)
+        self.range_label = QLabel(tr("Rozsah:"))
+        self.fov_label = QLabel(tr("Zorné pole:"))
+        self.station_label = QLabel(tr("Stanice MPC:"))
+        controls.addWidget(QLabel(tr("Pohled:"))); controls.addWidget(self.projection_mode)
         controls.addWidget(self.station_label); controls.addWidget(self.station_code)
         controls.addWidget(self.station_name)
         controls.addStretch(); controls.addWidget(self.range_label)
@@ -2324,9 +2356,12 @@ class SkyPanel(QWidget):
         controls.addWidget(self.fov_label)
         controls.addWidget(self.field_of_view); controls.addWidget(self.show_path)
         controls.addWidget(self.show_labels); controls.addWidget(self.lock_target)
-        enlarge = QPushButton("Zvětšit ↗" if allow_detach else "Celá obrazovka (F11)")
+        enlarge = QPushButton(tr("Zvětšit ↗") if allow_detach else tr("Celá obrazovka (F11)"))
         enlarge.setToolTip(
-            "Otevře mapu ve zvětšeném samostatném okně. Klávesou F11 přepnete celou obrazovku."
+            tr(
+                "Otevře mapu ve zvětšeném samostatném okně. Klávesou F11 přepnete celou "
+                "obrazovku.",
+            )
         )
         enlarge.clicked.connect(self._open_detached if allow_detach else self._toggle_fullscreen)
         controls.addWidget(enlarge)
@@ -2378,7 +2413,7 @@ class SkyPanel(QWidget):
         self.fov_label.setVisible(not horizontal)
         self.field_of_view.setVisible(not horizontal)
         self.lock_target.setVisible(not horizontal)
-        self.show_labels.setText("Popisek objektu" if horizontal else "Popisky těles")
+        self.show_labels.setText(tr("Popisek objektu") if horizontal else tr("Popisky těles"))
         self.playback.set_speed_profile("visibility" if horizontal else "standard")
         if horizontal:
             self._update_station_name()
@@ -2399,7 +2434,7 @@ class SkyPanel(QWidget):
     def _horizontal_timezone_changed(self, *_args) -> None:
         zone = self.horizontal_timezone.currentText()
         self.horizontal_time.setToolTip(
-            f"Datum a čas uprostřed zobrazeného intervalu v pásmu {zone}."
+            tr("Datum a čas uprostřed zobrazeného intervalu v pásmu {0}.", zone)
         )
         self._sync_horizontal_time(self.playback.time.dateTime().toPython())
         self.rebuild(self.playback.time.dateTime().toPython())
@@ -2411,14 +2446,16 @@ class SkyPanel(QWidget):
 
     def _update_station_name(self) -> None:
         details = observatory_details(self.station_code.text())
-        name = str(details["name"]) if details and "latitude_deg" in details else "neznámá stanice"
+        name = str(details["name"]) if details and "latitude_deg" in details else tr(
+            "neznámá stanice",
+        )
         self.station_name.setText(name)
         self.station_name.setToolTip(name)
 
     def _open_detached(self) -> None:
         window = QMainWindow(self)
         window.setAttribute(Qt.WA_DeleteOnClose)
-        window.setWindowTitle(f"{self.solution.designation} — pohled ze Země")
+        window.setWindowTitle(tr("{0} — pohled ze Země", self.solution.designation))
         playback = PlaybackBar()
         playback.time.setDateTime(self.playback.time.dateTime())
         panel = SkyPanel(self.solution, playback, allow_detach=False)
@@ -2644,11 +2681,11 @@ class SkyPanel(QWidget):
 
     def _body_positions(self, jd: float) -> list[tuple[str, float, float, str, int]]:
         earth = PLANETS.position("earth", jd)
-        bodies = [("Slunce", -earth, "#ffd166", 72), ("Měsíc", self._moon_vector(jd), "#d9e1ec", 42)]
-        for key, name, color in (("mercury", "Merkur", "#aaaeb5"), ("venus", "Venuše", "#e4bd70"),
+        bodies = [(tr("Slunce"), -earth, "#ffd166", 72), (tr("Měsíc"), self._moon_vector(jd), "#d9e1ec", 42)]
+        for key, name, color in (("mercury", tr("Merkur"), "#aaaeb5"), ("venus", tr("Venuše"), "#e4bd70"),
                                  ("mars", "Mars", "#e0714c"), ("jupiter", "Jupiter", "#d0a17a"),
-                                 ("saturn", "Saturn", "#d8c58b"), ("uranus", "Uran", "#71d5de"),
-                                 ("neptune", "Neptun", "#537be8")):
+                                 ("saturn", "Saturn", "#d8c58b"), ("uranus", tr("Uran"), "#71d5de"),
+                                 ("neptune", tr("Neptun"), "#537be8")):
             bodies.append((name, PLANETS.position(key, jd) - earth, color, 34))
         result = []
         for name, vector, color, size in bodies:
@@ -2670,10 +2707,19 @@ class SkyPanel(QWidget):
         ra_text = format_ra_sexagesimal(float(geometry["ra"][0]))
         dec_text = format_dec_sexagesimal(float(geometry["dec"][0]))
         self.info.setText(
-            f"{shown_time:%Y-%m-%d %H:%M} {zone_label}    RA {ra_text}    "
-            f"Dec {dec_text}    mag {magnitude[0]:.2f}    "
-            f"Δ {geometry['delta'][0]:.5f} AU    r {geometry['r'][0]:.5f} AU    "
-            f"elongace {geometry['elongation'][0]:.1f}°{extra}"
+            tr(
+                "{0:%Y-%m-%d %H:%M} {1}    RA {2}    Dec {3}    mag {4:.2f}    Δ {5:.5f} "
+                "AU    r {6:.5f} AU    elongace {7:.1f}°{8}",
+                shown_time,
+                zone_label,
+                ra_text,
+                dec_text,
+                magnitude[0],
+                geometry['delta'][0],
+                geometry['r'][0],
+                geometry['elongation'][0],
+                extra,
+            )
         )
 
     @staticmethod
@@ -2704,13 +2750,15 @@ class SkyPanel(QWidget):
         details = observatory_details(code)
         if not details or "latitude_deg" not in details or code == "500":
             ax.text(
-                .5, .5, "Zadejte platný pozemní kód stanice MPC.\n"
-                "Geocentrický kód 500 nemá místní obzor.",
+                .5, .5, tr(
+                    "Zadejte platný pozemní kód stanice MPC.\nGeocentrický kód 500 nemá místní "
+                    "obzor.",
+                ),
                 transform=ax.transAxes, ha="center", va="center", color="#dce7f3",
                 fontsize=13,
             )
             ax.set_axis_off()
-            self.info.setText("Obzorový pohled vyžaduje pozemní stanici se známou polohou.")
+            self.info.setText(tr("Obzorový pohled vyžaduje pozemní stanici se známou polohou."))
             self.canvas.draw_idle()
             return
 
@@ -2775,17 +2823,17 @@ class SkyPanel(QWidget):
             1.0, (display_times[-1] - display_times[0]).total_seconds() / 3600.0
         )
         if self.show_path.isChecked():
-            plot_track(track_alt < 0.0, "#79505a", "--", .52, "pod obzorem")
+            plot_track(track_alt < 0.0, "#79505a", "--", .52, tr("pod obzorem"))
             visibility_bands = (
-                ((track_alt >= 0.0) & (sun_alt >= 0.0), "#e2b85d", "den"),
+                ((track_alt >= 0.0) & (sun_alt >= 0.0), "#e2b85d", tr("den")),
                 ((track_alt >= 0.0) & (sun_alt < 0.0) & (sun_alt >= -6.0),
-                 "#d8895b", "občanský soumrak"),
+                 "#d8895b", tr("občanský soumrak")),
                 ((track_alt >= 0.0) & (sun_alt < -6.0) & (sun_alt >= -12.0),
-                 "#a170b4", "nautický soumrak"),
+                 "#a170b4", tr("nautický soumrak")),
                 ((track_alt >= 0.0) & (sun_alt < -12.0) & (sun_alt >= -18.0),
-                 "#6687c9", "astronomický soumrak"),
+                 "#6687c9", tr("astronomický soumrak")),
                 ((track_alt >= 0.0) & (sun_alt < -18.0),
-                 "#45d7ff", "astronomická noc"),
+                 "#45d7ff", tr("astronomická noc")),
             )
             for mask, color, label in visibility_bands:
                 plot_track(mask, color, "-", .92, label)
@@ -2847,12 +2895,18 @@ class SkyPanel(QWidget):
         ax.set_xticks(np.arange(0.0, 361.0, 45.0))
         ax.set_xticklabels(tuple(f"{degrees}°" for degrees in range(0, 361, 45)))
         ax.set_yticks(np.arange(max(0.0, minimum_altitude), 91.0, 15.0))
-        ax.set_xlabel("azimut")
-        ax.set_ylabel("výška nad obzorem [°]")
+        ax.set_xlabel(tr("azimut"))
+        ax.set_ylabel(tr("výška nad obzorem [°]"))
         ax.set_title(
-            f"{self.solution.designation} • Graf viditelnosti • {code} {details['name']} • "
-            f"{self.horizontal_horizon.currentText()}\n"
-            f"střed {display_time:%Y-%m-%d %H:%M} {zone_name}"
+            tr(
+                "{0} • Graf viditelnosti • {1} {2} • {3}\nstřed {4:%Y-%m-%d %H:%M} {5}",
+                self.solution.designation,
+                code,
+                details['name'],
+                self.horizontal_horizon.currentText(),
+                display_time,
+                zone_name,
+            )
         )
         handles, labels = ax.get_legend_handles_labels()
         if handles:
@@ -2870,8 +2924,13 @@ class SkyPanel(QWidget):
         display_geom["delta"] = now_delta
         self._set_info(
             time, display_geom,
-            f"    Az {now_az:.1f}°    výška {now_alt:+.1f}°"
-            f"    Slunce {now_sun_alt:+.1f}°    stanice {code}",
+            tr(
+                "    Az {0:.1f}°    výška {1:+.1f}°    Slunce {2:+.1f}°    stanice {3}",
+                now_az,
+                now_alt,
+                now_sun_alt,
+                code,
+            ),
             display_time=display_time, zone_label=zone_name,
         )
         self.canvas.draw_idle()
@@ -3091,20 +3150,27 @@ class SkyPanel(QWidget):
             tick_positions, tick_labels = equatorial_ra_ticks(center_ra, selected_field)
             ax.set_xticks(tick_positions)
             ax.set_xticklabels(tick_labels)
-            ax.set_xlabel("RA — východ vlevo")
+            ax.set_xlabel(tr("RA — východ vlevo"))
             ax.set_ylabel("Dec [°]")
-            projection_name = "Rovníkový pohled (RA/Dec)"
+            projection_name = tr("Rovníkový pohled (RA/Dec)")
         else:
-            ax.set_xlabel("úhlová vzdálenost — východ vlevo [°]")
-            ax.set_ylabel("úhlová vzdálenost k severu [°]")
+            ax.set_xlabel(tr("úhlová vzdálenost — východ vlevo [°]"))
+            ax.set_ylabel(tr("úhlová vzdálenost k severu [°]"))
             projection_name = (
-                "Hammerova projekce celé oblohy" if full_sky
-                else "Středový azimutální pohled"
+                tr("Hammerova projekce celé oblohy") if full_sky
+                else tr("Středový azimutální pohled")
             )
-        tracking_name = "objekt ve středu" if self.lock_target.isChecked() else "pevné hvězdné pole"
+        tracking_name = tr("objekt ve středu") if self.lock_target.isChecked() else tr(
+            "pevné hvězdné pole",
+        )
         ax.set_title(
-            f"{self.solution.designation} • {projection_name} • {tracking_name} • "
-            f"trajektorie {self.horizon.currentText()}"
+            tr(
+                "{0} • {1} • {2} • trajektorie {3}",
+                self.solution.designation,
+                projection_name,
+                tracking_name,
+                self.horizon.currentText(),
+            )
         )
         self._set_info(time, now)
         self.canvas.draw_idle()
@@ -3120,7 +3186,7 @@ class PhotometryPanel(QWidget):
         self.canvas = PlotCanvas()
         self.distance_axes = self.canvas.axes.twinx()
         controls = QHBoxLayout()
-        self.kind = QComboBox(); self.kind.addItems(["Planetka", "Kometa – celková jasnost"])
+        self.kind = QComboBox(); self.kind.addItems([tr("Planetka"), tr("Kometa – celková jasnost")])
         self.absolute = QDoubleSpinBox(); self.absolute.setRange(-10, 40); self.absolute.setValue(solution.absolute_magnitude)
         self.absolute.setDecimals(2); self.absolute.setPrefix("H/M = ")
         comet = is_comet_designation(solution.designation) or is_comet_designation(solution.display_name or "")
@@ -3132,7 +3198,7 @@ class PhotometryPanel(QWidget):
         self.exponent = QDoubleSpinBox(); self.exponent.setRange(0, 20)
         self.exponent.setValue(solution.photometric_exponent); self.exponent.setSingleStep(.25)
         self.exponent.setPrefix("n = ")
-        self.phase = QCheckBox("H–G fázová korekce")
+        self.phase = QCheckBox(tr("H–G fázová korekce"))
         self.phase.setChecked(solution.phase_correction and not comet)
         self.phase.setEnabled(not comet)
         for widget in (self.kind, self.absolute, self.exponent, self.phase): controls.addWidget(widget)
@@ -3144,10 +3210,10 @@ class PhotometryPanel(QWidget):
         self.cursor_time = QDateTimeEdit(now); self.cursor_time.setCalendarPopup(True)
         for editor in (self.date_from, self.date_to, self.cursor_time):
             editor.setDisplayFormat("yyyy-MM-dd HH:mm")
-        now_button = QPushButton("Nyní"); now_button.clicked.connect(self._select_now)
-        redraw_button = QPushButton("Překreslit"); redraw_button.clicked.connect(self.redraw)
-        for widget in (QLabel("Od:"), self.date_from, QLabel("Do:"), self.date_to,
-                       QLabel("Kurzor:"), self.cursor_time, now_button, redraw_button):
+        now_button = QPushButton(tr("Nyní")); now_button.clicked.connect(self._select_now)
+        redraw_button = QPushButton(tr("Překreslit")); redraw_button.clicked.connect(self.redraw)
+        for widget in (QLabel(tr("Od:")), self.date_from, QLabel(tr("Do:")), self.date_to,
+                       QLabel(tr("Kurzor:")), self.cursor_time, now_button, redraw_button):
             date_controls.addWidget(widget)
         date_controls.addStretch()
         layout = QVBoxLayout(self); layout.addLayout(controls); layout.addLayout(date_controls)
@@ -3259,22 +3325,22 @@ class PhotometryPanel(QWidget):
         if self.kind.currentIndex() == 0 and self.phase.isChecked():
             magnitude += hg_phase_correction(geom["phase"], self.solution.slope_g)
         magnitude_line, = ax.plot(
-            dates, magnitude, color="#55c7ff", lw=2.2, label="zdánlivá magnituda"
+            dates, magnitude, color="#55c7ff", lw=2.2, label=tr("zdánlivá magnituda")
         )
         earth_line, = distance_ax.plot(
             dates, geom["delta"], color="#55e3a4", lw=1.35, ls="--",
-            label="Δ od Země",
+            label=tr("Δ od Země"),
         )
         sun_line, = distance_ax.plot(
             dates, geom["r"], color="#ffb85c", lw=1.35, ls="-.",
-            label="r od Slunce",
+            label=tr("r od Slunce"),
         )
         perihelion_time = datetime_from_jd(perihelion_jd_from_solution(self.solution))
         if perihelion_time is not None and start <= perihelion_time <= stop:
             ax.axvline(perihelion_time, color="#ff7e67", lw=1.15, alpha=.9, ls=":")
             ax.text(
                 perihelion_time, .98,
-                f"přísluní\n{perihelion_time:%Y-%m-%d %H:%M}",
+                tr("přísluní\n{0:%Y-%m-%d %H:%M}", perihelion_time),
                 transform=ax.get_xaxis_transform(), ha="center", va="top",
                 color="#ff9b88", fontsize=8,
             )
@@ -3290,18 +3356,21 @@ class PhotometryPanel(QWidget):
             ax.annotate(f"{cursor:%Y-%m-%d}\nmag {cursor_mag[0]:.2f}", (cursor, cursor_mag[0]),
                         xytext=(8, 8), textcoords="offset points", color="#ffdf8a", fontsize=9)
         ax.invert_yaxis(); ax.grid(color="#23354d", alpha=.55)
-        ax.set_ylabel("Zdánlivá magnituda"); ax.set_xlabel("Datum")
-        distance_ax.set_ylabel("Vzdálenost [AU]")
+        ax.set_ylabel(tr("Zdánlivá magnituda")); ax.set_xlabel(tr("Datum"))
+        distance_ax.set_ylabel(tr("Vzdálenost [AU]"))
         legend = ax.legend(
             [magnitude_line, earth_line, sun_line],
-            ["zdánlivá magnituda", "Δ od Země", "r od Slunce"],
+            [tr("zdánlivá magnituda"), tr("Δ od Země"), tr("r od Slunce")],
             loc="best", framealpha=.72,
         )
         legend.get_frame().set_facecolor("#111d30")
         legend.get_frame().set_edgecolor("#334760")
         for text_item in legend.get_texts():
             text_item.set_color("#d9e6f5")
-        ax.set_title(f"Předpověď jasnosti — fotometrický exponent n = {self.exponent.value():.2f}")
+        ax.set_title(tr(
+            "Předpověď jasnosti — fotometrický exponent n = {0:.2f}",
+            self.exponent.value(),
+        ))
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
         self.canvas.figure.autofmt_xdate(rotation=25)
         self.canvas.draw_idle()
@@ -3317,21 +3386,25 @@ class EphemerisPanel(QWidget):
         utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
         self.start = QDateTimeEdit(utc_now); self.start.setCalendarPopup(True); self.start.setDisplayFormat("yyyy-MM-dd HH:mm")
         self.step = QComboBox()
-        for label, minutes in (("10 minut", 10), ("30 minut", 30), ("1 hodina", 60), ("1 den", 1440)):
+        for label, minutes in ((tr("10 minut"), 10), (tr("30 minut"), 30), (tr("1 hodina"), 60), (tr(
+            "1 den",
+        ), 1440)):
             self.step.addItem(label, minutes)
         self.step.setCurrentIndex(self.step.findData(60))
-        self.count = QSpinBox(); self.count.setRange(2, 2000); self.count.setValue(48); self.count.setPrefix("Řádků: ")
+        self.count = QSpinBox(); self.count.setRange(2, 2000); self.count.setValue(48); self.count.setPrefix(tr(
+            "Řádků: ",
+        ))
         self.station = QLineEdit("500"); self.station.setMaxLength(3); self.station.setMaximumWidth(62)
-        self.station.setToolTip("MPC kód observatoře; 500 znamená geocentrickou efemeridu.")
-        self.generate_button = QPushButton("Vygenerovat efemeridu")
+        self.station.setToolTip(tr("MPC kód observatoře; 500 znamená geocentrickou efemeridu."))
+        self.generate_button = QPushButton(tr("Vygenerovat efemeridu"))
         self.generate_button.setObjectName("primary")
         self.generate_button.clicked.connect(self.generate)
-        copy_selected = QPushButton("Kopírovat vybrané")
-        copy_all = QPushButton("Kopírovat vše")
+        copy_selected = QPushButton(tr("Kopírovat vybrané"))
+        copy_all = QPushButton(tr("Kopírovat vše"))
         copy_selected.clicked.connect(self.copy_selected)
         copy_all.clicked.connect(self.copy_all)
-        for widget in (QLabel("Od:"), self.start, QLabel("Krok:"), self.step, self.count,
-                       QLabel("MPC stanice:"), self.station, self.generate_button,
+        for widget in (QLabel(tr("Od:")), self.start, QLabel(tr("Krok:")), self.step, self.count,
+                       QLabel(tr("MPC stanice:")), self.station, self.generate_button,
                        copy_selected, copy_all):
             controls.addWidget(widget)
         controls.addStretch()
@@ -3339,8 +3412,10 @@ class EphemerisPanel(QWidget):
         self.uncertainty_status.setObjectName("muted")
         self.table = QTableWidget(0, 10)
         self.headers = (
-            "Čas UTC", "RA astrom. J2000 (h m s)", "Dec astrom. J2000 (° ′ ″)", "Azimut", "Výška",
-            "Výška Slunce", "Nejistota 1σ [″]", "Δ [AU]", "r [AU]", "Mag",
+            tr("Čas UTC"), tr("RA astrom. J2000 (h m s)"), tr("Dec astrom. J2000 (° ′ ″)"), tr("Azimut"), tr(
+                "Výška",
+            ),
+            tr("Výška Slunce"), tr("Nejistota 1σ [″]"), "Δ [AU]", "r [AU]", "Mag",
         )
         self.table.setHorizontalHeaderLabels(self.headers)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -3392,7 +3467,10 @@ class EphemerisPanel(QWidget):
         station_code = self.station.text().strip().upper() or "500"
         self.station.setText(station_code)
         if station_code != "500" and observatory_details(station_code) is None:
-            QMessageBox.warning(self, "Efemerida", f"MPC stanice {station_code} není v katalogu.")
+            QMessageBox.warning(self, tr("Efemerida"), tr(
+                "MPC stanice {0} není v katalogu.",
+                station_code,
+            ))
             return
         observer_offsets = (
             None if station_code == "500" else station_offsets_gcrs([station_code] * count, dates)
@@ -3408,16 +3486,16 @@ class EphemerisPanel(QWidget):
         if self.solution.phase_correction:
             mag += hg_phase_correction(geom["phase"], self.solution.slope_g)
         self.table.setRowCount(count)
-        for row, time in enumerate(dates):
+        for row, instant in enumerate(dates):
             if altaz is None:
                 azimuth, altitude, sun_altitude = "—", "—", "—"
             else:
                 azimuth = f"{altaz[0][row]:.1f}°"
                 altitude = f"{altaz[1][row]:+.1f}°"
                 sun_altitude = f"{altaz[2][row]:+.1f}°"
-            uncertainty_text = "počítám…" if self._has_positional_covariance() else "—"
+            uncertainty_text = tr("počítám…") if self._has_positional_covariance() else "—"
             values = (
-                time.strftime("%Y-%m-%d %H:%M"), format_ra_sexagesimal(ra[row]),
+                instant.strftime("%Y-%m-%d %H:%M"), format_ra_sexagesimal(ra[row]),
                 format_dec_sexagesimal(dec[row]), azimuth, altitude, sun_altitude,
                 uncertainty_text, f"{delta[row]:.6f}", f"{geom['r'][row]:.6f}", f"{mag[row]:.2f}",
             )
@@ -3443,7 +3521,7 @@ class EphemerisPanel(QWidget):
         nominal_dec: np.ndarray,
     ) -> None:
         self.uncertainty_status.setText(
-            "Tabulka je hotová; polohová nejistota 1σ se počítá na pozadí…"
+            tr("Tabulka je hotová; polohová nejistota 1σ se počítá na pozadí…")
         )
         self.generate_button.setEnabled(False)
         thread = QThread(self)
@@ -3469,7 +3547,7 @@ class EphemerisPanel(QWidget):
         if request_id != self._uncertainty_request_id:
             return
         if uncertainty is None:
-            self.uncertainty_status.setText("Polohovou nejistotu 1σ se nepodařilo určit.")
+            self.uncertainty_status.setText(tr("Polohovou nejistotu 1σ se nepodařilo určit."))
             for row in range(self.table.rowCount()):
                 self.table.setItem(row, 6, QTableWidgetItem("—"))
             return
@@ -3479,13 +3557,15 @@ class EphemerisPanel(QWidget):
         for row, value in enumerate(values):
             text = f"{value:.3f}" if value < 10.0 else f"{value:.2f}"
             self.table.setItem(row, 6, QTableWidgetItem(text))
-        self.uncertainty_status.setText("Polohová nejistota 1σ byla dopočítána v úhlových vteřinách.")
+        self.uncertainty_status.setText(tr(
+            "Polohová nejistota 1σ byla dopočítána v úhlových vteřinách.",
+        ))
 
     @Slot(int, str)
     def _uncertainty_failed(self, request_id: int, detail: str) -> None:
         if request_id != self._uncertainty_request_id:
             return
-        self.uncertainty_status.setText("Polohovou nejistotu 1σ se nepodařilo dopočítat.")
+        self.uncertainty_status.setText(tr("Polohovou nejistotu 1σ se nepodařilo dopočítat."))
         self.uncertainty_status.setToolTip(detail)
         for row in range(self.table.rowCount()):
             self.table.setItem(row, 6, QTableWidgetItem("—"))
@@ -3545,8 +3625,8 @@ class ElementsPanel(QWidget):
         self.text.setReadOnly(True)
         self.text.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.text.setStyleSheet("font-family: Consolas, 'Courier New', monospace; font-size: 14px;")
-        copy_report = QPushButton("Kopírovat přehled")
-        copy_mpc = QPushButton("Kopírovat MPC 1-line elements")
+        copy_report = QPushButton(tr("Kopírovat přehled"))
+        copy_mpc = QPushButton(tr("Kopírovat MPC 1-line elements"))
         copy_report.clicked.connect(lambda: QApplication.clipboard().setText(self._report()))
         copy_mpc.clicked.connect(lambda: QApplication.clipboard().setText(self._mpc_line()))
         buttons = QHBoxLayout(); buttons.addWidget(copy_report); buttons.addWidget(copy_mpc)
@@ -3555,28 +3635,31 @@ class ElementsPanel(QWidget):
         # being typed because its internal calendar minimum is 1752.  A plain
         # validated text field also lets observers enter a year by itself.
         self.output_epoch = QLineEdit()
-        self.output_epoch.setPlaceholderText("YYYY nebo YYYY-MM-DD HH:MM")
+        self.output_epoch.setPlaceholderText(tr("YYYY nebo YYYY-MM-DD HH:MM"))
         self.output_epoch.setMinimumWidth(175)
         epoch_time = datetime_from_jd(solution.epoch_jd) or datetime.now()
         self.output_epoch.setText(epoch_time.strftime("%Y-%m-%d %H:%M"))
-        self.apply_epoch_button = QPushButton("Převést na epochu")
+        self.apply_epoch_button = QPushButton(tr("Převést na epochu"))
         self.apply_epoch_button.clicked.connect(self._apply_output_epoch)
-        reset_epoch = QPushButton("Epocha fitu")
+        reset_epoch = QPushButton(tr("Epocha fitu"))
         reset_epoch.clicked.connect(self._reset_output_epoch)
         epoch_controls = QHBoxLayout()
-        epoch_controls.addWidget(QLabel("Výstupní epocha:"))
+        epoch_controls.addWidget(QLabel(tr("Výstupní epocha:")))
         epoch_controls.addWidget(self.output_epoch)
         epoch_controls.addWidget(self.apply_epoch_button)
         epoch_controls.addWidget(reset_epoch)
         self.element_center = QComboBox()
         for key, label in ELEMENT_CENTERS:
-            self.element_center.addItem(f"Střed elementů: {label}", key)
+            self.element_center.addItem(tr("Střed elementů: {0}", label), key)
         self.element_center.currentIndexChanged.connect(self._apply_element_center)
         epoch_controls.addWidget(self.element_center)
         epoch_controls.addStretch()
         self.epoch_note = QLabel(
-            "Převod používá N-body integraci s planetami a případnými A1–A3/DT. "
-            f"Aktivní planetární efemerida: {PLANETS.model_name}."
+            tr(
+                "Převod používá N-body integraci s planetami a případnými A1–A3/DT. "
+                "Aktivní planetární efemerida: {0}.",
+                PLANETS.model_name,
+            )
         )
         self.epoch_note.setObjectName("muted"); self.epoch_note.setWordWrap(True)
         layout = QVBoxLayout(self)
@@ -3597,8 +3680,10 @@ class ElementsPanel(QWidget):
         center_control = getattr(self, "element_center", None)
         if center_control is not None and str(center_control.currentData() or "sun") != "sun":
             return (
-                "MPC 1-line elements jsou definovány pro heliocentrickou dráhu; "
-                "pro planetocentrické elementy nejsou exportovány."
+                tr(
+                    "MPC 1-line elements jsou definovány pro heliocentrickou dráhu; pro "
+                    "planetocentrické elementy nejsou exportovány.",
+                )
             )
         s = self.display_solution
         comet_match = re.match(r"^\s*([ACDPX])/\s*(\d{4})\s+([A-Z])(\d+)", s.designation, re.I)
@@ -3621,8 +3706,10 @@ class ElementsPanel(QWidget):
             epoch = datetime_from_jd(s.epoch_jd)
             if peri_time is None or epoch is None:
                 return (
-                    "MPC 1-line elements nelze vytvořit: kalendářní datum "
-                    "epochy nebo perihelia je mimo podporovaný rozsah."
+                    tr(
+                        "MPC 1-line elements nelze vytvořit: kalendářní datum epochy nebo "
+                        "perihelia je mimo podporovaný rozsah.",
+                    )
                 )
             day_fraction = peri_time.day + (
                 peri_time.hour * 3600 + peri_time.minute * 60 + peri_time.second + peri_time.microsecond / 1e6
@@ -3674,8 +3761,10 @@ class ElementsPanel(QWidget):
         mean_motion = np.degrees(mean_motion_rad_day)
         if perihelion_time is None:
             perihelion_line = (
-                f"Perihelion: kalendářní datum mimo podporovaný rozsah "
-                f"[JD {perihelion_jd:.8f}]"
+                tr(
+                    "Perihelion: kalendářní datum mimo podporovaný rozsah [JD {0:.8f}]",
+                    perihelion_jd,
+                )
             )
         else:
             peri_day = perihelion_time.day + (
@@ -3688,7 +3777,10 @@ class ElementsPanel(QWidget):
                 f" [JD {perihelion_jd:.8f}]"
             )
         if epoch is None:
-            epoch_line = f"Epoch: kalendářní datum mimo podporovaný rozsah [JDT {s.epoch_jd:.8f}]"
+            epoch_line = tr(
+                "Epoch: kalendářní datum mimo podporovaný rozsah [JDT {0:.8f}]",
+                s.epoch_jd,
+            )
         else:
             epoch_day = epoch.day + (
                 epoch.hour * 3600 + epoch.minute * 60 + epoch.second
@@ -3723,7 +3815,7 @@ class ElementsPanel(QWidget):
                 )
             else:
                 lines.append("Nongravitational parameters (Marsden water-ice model):")
-            for name in ("A1", "A2", "A3", "DT"):
+            for name in ("A1", "A2", "A3", tr("DT")):
                 if name in s.nongravitational_parameters:
                     value = s.nongravitational_parameters[name]
                     uncertainty = (s.element_uncertainties or {}).get(name)
@@ -3731,17 +3823,17 @@ class ElementsPanel(QWidget):
                         f" +/- {uncertainty:.3e}" if uncertainty is not None
                         and np.isfinite(uncertainty) else ""
                     )
-                    unit = "days" if name == "DT" else "AU/day^2"
-                    value_text = f"{value:+.6f}" if name == "DT" else f"{value:+.6e}"
+                    unit = "days" if name == tr("DT") else "AU/day^2"
+                    value_text = f"{value:+.6f}" if name == tr("DT") else f"{value:+.6e}"
                     lines.append(f"{name}   {value_text}{suffix} {unit}")
         if s.dynamical_1a:
             dynamics = s.dynamical_1a
-            lines.extend(("", "Původní a budoucí barycentrická dráha:"))
+            lines.extend(("", tr("Původní a budoucí barycentrická dráha:")))
             if "error" in dynamics:
-                lines.append(f"Výpočet se nezdařil: {dynamics['error']}")
+                lines.append(tr("Výpočet se nezdařil: {0}", dynamics['error']))
             else:
                 boundary = float(dynamics.get("boundary_au", 250.0))
-                lines.append(f"Hranice výpočtu: {boundary:g} AU od Slunce")
+                lines.append(tr("Hranice výpočtu: {0:g} AU od Slunce", boundary))
                 sigma_value = dynamics.get("reciprocal_a_sigma")
                 sigma = float(sigma_value) if sigma_value is not None else None
                 for prefix, label in (("original", "original"), ("future", "future")):
@@ -3754,13 +3846,16 @@ class ElementsPanel(QWidget):
                         semimajor = 1.0 / reciprocal
                         period_years = semimajor ** 1.5
                         lines.append(
-                            f"    a = {semimajor:.1f} AU; přibližná perioda "
-                            f"{period_years:.0f} let"
+                            tr(
+                                "    a = {0:.1f} AU; přibližná perioda {1:.0f} let",
+                                semimajor,
+                                period_years,
+                            )
                         )
                     interpretation = dynamics.get(f"{prefix}_interpretation")
                     if interpretation:
                         lines.append(f"    {interpretation}")
-                lines.append(f"Poznámka: {dynamics.get('model', '')}")
+                lines.append(tr("Poznámka: {0}", dynamics.get('model', '')))
         if s.fit_observation_count is not None:
             normalized = (
                 f"; normalized RMS {s.fit_normalized_rms:.3f} sigma"
@@ -3781,9 +3876,9 @@ class ElementsPanel(QWidget):
             )
         linkage_summary = apparition_linkage_summary(s)
         if linkage_summary:
-            lines.extend(("", "Navázání pozorovaných návratů:", linkage_summary))
+            lines.extend(("", tr("Navázání pozorovaných návratů:"), linkage_summary))
             lines.append(
-                "Návrat   Pozorovací oblouk  Dostupná  Ve fitu  RMS [\"]  RMS [σ]  Stav"
+                tr("Návrat   Pozorovací oblouk  Dostupná  Ve fitu  RMS [\"]  RMS [σ]  Stav")
             )
             for record in s.apparition_linkage or ():
                 start = record.get("year_start")
@@ -3804,15 +3899,17 @@ class ElementsPanel(QWidget):
                 if reason:
                     lines.append(f"         ↳ {reason}")
         if s.fit_model_note:
-            lines.append(f"Poznámka k fitu: {s.fit_model_note}")
+            lines.append(tr("Poznámka k fitu: {0}", s.fit_model_note))
         if (
             s.apparition_elements
             and str(self.element_center.currentData() or "sun") == "sun"
         ):
             lines.extend((
-                "", "Oskulační elementy jednotlivých návratů:",
-                "Perihelium (UTC)      q [AU]       e           a [AU]      "
-                "P [roky]    i [deg]    Node [deg]  Peri. [deg]",
+                "", tr("Oskulační elementy jednotlivých návratů:"),
+                tr(
+                    "Perihelium (UTC)      q [AU]       e           a [AU]      P [roky]    i "
+                    "[deg]    Node [deg]  Peri. [deg]",
+                ),
             ))
             for item in s.apparition_elements:
                 instant = datetime_from_jd(float(item["epoch_jd"]))
@@ -3825,7 +3922,7 @@ class ElementsPanel(QWidget):
                     "       —" if period_value is None
                     else f"{float(period_value):8.3f}"
                 )
-                marker = "  budoucí" if bool(item.get("future")) else ""
+                marker = tr("  budoucí") if bool(item.get("future")) else ""
                 lines.append(
                     f"{date_text:19s}  {float(item['q']):10.6f}  "
                     f"{float(item['e']):10.7f}  {float(item['a']):11.6f}  "
@@ -3835,12 +3932,14 @@ class ElementsPanel(QWidget):
                 )
             if not s.nongravitational_parameters and is_comet_designation(s.designation):
                 lines.append(
-                    "Pozor: návraty jsou propojeny čistě gravitačním modelem; "
-                    "bez A1/A2/A3 mohou mít aktivní komety systematicky posunuté perihelové časy."
+                    tr(
+                        "Pozor: návraty jsou propojeny čistě gravitačním modelem; bez A1/A2/A3 "
+                        "mohou mít aktivní komety systematicky posunuté perihelové časy.",
+                    )
                 )
         if s.position_au and s.velocity_au_per_day:
             lines.extend((
-                "", "Kartézský stav (AU, AU/den):",
+                "", tr("Kartézský stav (AU, AU/den):"),
                 "r = " + "  ".join(f"{value:+.12f}" for value in s.position_au),
                 "v = " + "  ".join(f"{value:+.12f}" for value in s.velocity_au_per_day),
             ))
@@ -3857,8 +3956,11 @@ class ElementsPanel(QWidget):
         if epoch_time is not None:
             self.output_epoch.setText(epoch_time.strftime("%Y-%m-%d %H:%M"))
         self.epoch_note.setText(
-            "Zobrazena je epocha vlastního fitu. Převod používá N-body integraci; "
-            f"aktivní planetární efemerida: {PLANETS.model_name}."
+            tr(
+                "Zobrazena je epocha vlastního fitu. Převod používá N-body integraci; "
+                "aktivní planetární efemerida: {0}.",
+                PLANETS.model_name,
+            )
         )
         self.redraw()
 
@@ -3870,21 +3972,25 @@ class ElementsPanel(QWidget):
             )
         except (ValueError, OrbitParseError) as exc:
             self.display_solution = self._heliocentric_display_solution
-            self.epoch_note.setText(f"Planetocentrické elementy nelze určit: {exc}")
+            self.epoch_note.setText(tr("Planetocentrické elementy nelze určit: {0}", exc))
         self.redraw()
 
     def _apply_output_epoch(self) -> None:
         source = self.solution
         if source.position_au is None or source.velocity_au_per_day is None:
-            self.epoch_note.setText("Převod epochy vyžaduje kartézský stav načtené nebo vypočtené dráhy.")
+            self.epoch_note.setText(tr(
+                "Převod epochy vyžaduje kartézský stav načtené nebo vypočtené dráhy.",
+            ))
             return
         value = self.output_epoch.text().strip()
         try:
             target_time = parse_output_epoch(value)
         except ValueError:
             self.epoch_note.setText(
-                "Neplatná epocha. Použijte například 1900, 1900-01-01 nebo "
-                "1900-01-01 00:00."
+                tr(
+                    "Neplatná epocha. Použijte například 1900, 1900-01-01 nebo 1900-01-01 "
+                    "00:00.",
+                )
             )
             self.output_epoch.setFocus()
             return
@@ -3894,8 +4000,11 @@ class ElementsPanel(QWidget):
         self._epoch_target_time = target_time
         self.apply_epoch_button.setEnabled(False)
         self.epoch_note.setText(
-            f"Integruji dráhu na epochu {target_time:%Y-%m-%d %H:%M}… "
-            "U vzdálené epochy to může trvat desítky sekund."
+            tr(
+                "Integruji dráhu na epochu {0:%Y-%m-%d %H:%M}… U vzdálené epochy to může "
+                "trvat desítky sekund.",
+                target_time,
+            )
         )
         thread = QThread(self)
         worker = EpochPropagationWorker(source, target_jd)
@@ -3916,14 +4025,17 @@ class ElementsPanel(QWidget):
         self._apply_element_center()
         target_time = self._epoch_target_time or datetime.now()
         self.epoch_note.setText(
-            f"Elementy převedeny N-body integrací na {target_time:%Y-%m-%d %H:%M}. "
-            "Formální nejistoty nebyly do nové epochy propagovány. "
-            f"Planetární efemerida: {PLANETS.model_name}."
+            tr(
+                "Elementy převedeny N-body integrací na {0:%Y-%m-%d %H:%M}. Formální "
+                "nejistoty nebyly do nové epochy propagovány. Planetární efemerida: {1}.",
+                target_time,
+                PLANETS.model_name,
+            )
         )
         self.redraw()
 
     def _epoch_failed(self, message: str) -> None:
-        self.epoch_note.setText(f"Převod epochy se nezdařil: {message}")
+        self.epoch_note.setText(tr("Převod epochy se nezdařil: {0}", message))
 
     def _epoch_finished(self) -> None:
         self.epoch_thread = None
@@ -3940,7 +4052,7 @@ class De440DownloadDialog(QDialog):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Stažení JPL DE440")
+        self.setWindowTitle(tr("Stažení JPL DE440"))
         self.setMinimumWidth(560)
         self.destination = de440_path()
         self.partial = self.destination.with_suffix(".bsp.part")
@@ -3948,13 +4060,12 @@ class De440DownloadDialog(QDialog):
         self.output = None
         self.cancelled = False
         self.status = QLabel(
-            "Stahuji oficiální kernel JPL DE440 z NASA/NAIF…\n"
-            f"Cíl: {self.destination}"
+            tr("Stahuji oficiální kernel JPL DE440 z NASA/NAIF…\nCíl: {0}", self.destination)
         )
         self.status.setWordWrap(True)
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
-        self.cancel_button = QPushButton("Zrušit")
+        self.cancel_button = QPushButton(tr("Zrušit"))
         self.cancel_button.clicked.connect(self._cancel_download)
         layout = QVBoxLayout(self)
         layout.addWidget(self.status)
@@ -3968,7 +4079,7 @@ class De440DownloadDialog(QDialog):
             self.destination.parent.mkdir(parents=True, exist_ok=True)
             self.output = self.partial.open("wb")
         except OSError as exc:
-            QMessageBox.warning(self, "JPL DE440", f"Nelze vytvořit soubor:\n{exc}")
+            QMessageBox.warning(self, "JPL DE440", tr("Nelze vytvořit soubor:\n{0}", exc))
             self.reject()
             return
         request = QNetworkRequest(QUrl(DE440_URL))
@@ -3988,8 +4099,12 @@ class De440DownloadDialog(QDialog):
             self.progress.setRange(0, 1000)
             self.progress.setValue(int(received * 1000 / total))
             self.status.setText(
-                f"Stahuji JPL DE440: {received / 1048576:.1f} z "
-                f"{total / 1048576:.1f} MB\nCíl: {self.destination}"
+                tr(
+                    "Stahuji JPL DE440: {0:.1f} z {1:.1f} MB\nCíl: {2}",
+                    received / 1048576,
+                    total / 1048576,
+                    self.destination,
+                )
             )
         else:
             self.progress.setRange(0, 0)
@@ -4022,12 +4137,14 @@ class De440DownloadDialog(QDialog):
             self.reject()
             return
         if self.reply is None or self.reply.error() != QNetworkReply.NoError:
-            message = self.reply.errorString() if self.reply is not None else "neznámá chyba"
+            message = self.reply.errorString() if self.reply is not None else tr(
+                "neznámá chyba",
+            )
             self._cleanup_partial()
-            QMessageBox.warning(self, "JPL DE440", f"Stažení selhalo:\n{message}")
+            QMessageBox.warning(self, "JPL DE440", tr("Stažení selhalo:\n{0}", message))
             self.reject()
             return
-        self.status.setText("Ověřuji kontrolní součet staženého souboru…")
+        self.status.setText(tr("Ověřuji kontrolní součet staženého souboru…"))
         QApplication.processEvents()
         digest = hashlib.md5()
         try:
@@ -4036,13 +4153,13 @@ class De440DownloadDialog(QDialog):
                     digest.update(block)
             if digest.hexdigest().lower() != DE440_MD5:
                 raise ValueError(
-                    "Kontrolní součet nesouhlasí. Soubor může být neúplný nebo poškozený."
+                    tr("Kontrolní součet nesouhlasí. Soubor může být neúplný nebo poškozený.")
                 )
             # On Windows an mmap-backed SPK cannot be replaced while open.
             PLANETS.unload()
             self.partial.replace(self.destination)
             if not PLANETS.reload():
-                raise ValueError(PLANETS.load_error or "Kernel se nepodařilo otevřít.")
+                raise ValueError(PLANETS.load_error or tr("Kernel se nepodařilo otevřít."))
         except (OSError, ValueError) as exc:
             self._cleanup_partial()
             PLANETS.reload()
@@ -4052,10 +4169,12 @@ class De440DownloadDialog(QDialog):
         self.progress.setRange(0, 1000)
         self.progress.setValue(1000)
         self.status.setText(
-            "JPL DE440 byla ověřena a aktivována. Nové výpočty budou používat "
-            "planetární efemeridu DE440 v rozsahu 1549–2650."
+            tr(
+                "JPL DE440 byla ověřena a aktivována. Nové výpočty budou používat "
+                "planetární efemeridu DE440 v rozsahu 1549–2650.",
+            )
         )
-        self.cancel_button.setText("Zavřít")
+        self.cancel_button.setText(tr("Zavřít"))
         self.cancel_button.setEnabled(True)
         self.cancel_button.clicked.disconnect()
         self.cancel_button.clicked.connect(self.accept)
@@ -4070,9 +4189,9 @@ class De440DownloadDialog(QDialog):
 
 class OrbitConstraintsDialog(QDialog):
     LABELS = (
-        ("a", "Velká poloosa a [AU]"), ("e", "Excentricita e"),
-        ("i", "Sklon i [°]"), ("node", "Uzel Ω [°]"),
-        ("arg_peri", "Perihelium ω [°]"), ("mean_anomaly", "Střední anomálie M [°]"),
+        ("a", tr("Velká poloosa a [AU]")), ("e", tr("Excentricita e")),
+        ("i", tr("Sklon i [°]")), ("node", tr("Uzel Ω [°]")),
+        ("arg_peri", tr("Perihelium ω [°]")), ("mean_anomaly", tr("Střední anomálie M [°]")),
     )
 
     def __init__(
@@ -4083,7 +4202,7 @@ class OrbitConstraintsDialog(QDialog):
         allow_element_constraints: bool = True, parent=None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Vlastní nastavení fitu")
+        self.setWindowTitle(tr("Vlastní nastavení fitu"))
         self.controls: dict[str, tuple[QCheckBox, QDoubleSpinBox]] = {}
         self.ng_controls: dict[str, tuple[QCheckBox, QDoubleSpinBox]] = {}
         values = {
@@ -4093,7 +4212,7 @@ class OrbitConstraintsDialog(QDialog):
         }
         form = QFormLayout()
         for name, label in self.LABELS:
-            enabled = QCheckBox("fixovat")
+            enabled = QCheckBox(tr("fixovat"))
             editor = QDoubleSpinBox(); editor.setDecimals(9); editor.setSingleStep(.01)
             if name == "a":
                 editor.setRange(-1_000_000.0, 1_000_000.0)
@@ -4110,13 +4229,15 @@ class OrbitConstraintsDialog(QDialog):
             form.addRow(label, row)
             self.controls[name] = (enabled, editor)
         self.output_epoch = QLineEdit(output_epoch)
-        self.output_epoch.setPlaceholderText("např. 2026 nebo 2026-10-18 00:00")
+        self.output_epoch.setPlaceholderText(tr("např. 2026 nebo 2026-10-18 00:00"))
         self.output_epoch.setToolTip(
-            "Fit zůstane kvůli numerické stabilitě v epoše uprostřed pozorování; "
-            "výsledné oskulační elementy se po výpočtu převedou na tuto epochu."
+            tr(
+                "Fit zůstane kvůli numerické stabilitě v epoše uprostřed pozorování; "
+                "výsledné oskulační elementy se po výpočtu převedou na tuto epochu.",
+            )
         )
-        form.addRow("Výstupní epocha po fitu:", self.output_epoch)
-        ephemeris_heading = QLabel("Planetární efemerida")
+        form.addRow(tr("Výstupní epocha po fitu:"), self.output_epoch)
+        ephemeris_heading = QLabel(tr("Planetární efemerida"))
         ephemeris_heading.setStyleSheet("font-weight: 650; margin-top: 10px;")
         form.addRow(ephemeris_heading)
         self.ephemeris_status = QLabel(PLANETS.status_text())
@@ -4124,11 +4245,11 @@ class OrbitConstraintsDialog(QDialog):
         self.ephemeris_status.setObjectName("muted")
         form.addRow(self.ephemeris_status)
         self.download_de440 = QPushButton(
-            "Přeinstalovat JPL DE440…" if PLANETS.jpl is not None
-            else "Stáhnout JPL DE440 (cca 114 MB)…"
+            tr("Přeinstalovat JPL DE440…") if PLANETS.jpl is not None
+            else tr("Stáhnout JPL DE440 (cca 114 MB)…")
         )
         self.download_de440.setToolTip(
-            "Oficiální planetární kernel NASA/NAIF; pokrytí 1549-12-31 až 2650-01-25."
+            tr("Oficiální planetární kernel NASA/NAIF; pokrytí 1549-12-31 až 2650-01-25.")
         )
         self.download_de440.clicked.connect(self._download_de440)
         form.addRow(self.download_de440)
@@ -4138,46 +4259,48 @@ class OrbitConstraintsDialog(QDialog):
         )
         self.is_comet = comet
         self.original_future = QCheckBox(
-            "Po fitu spočítat původní a budoucí barycentrickou dráhu v 250 AU"
+            tr("Po fitu spočítat původní a budoucí barycentrickou dráhu v 250 AU")
         )
         self.original_future.setChecked(comet and compute_original_future)
         self.original_future.setVisible(comet)
-        separator = QLabel("Negravitační zrychlení")
+        separator = QLabel(tr("Negravitační zrychlení"))
         separator.setStyleSheet("font-weight: 650; margin-top: 10px;")
         form.addRow(separator)
         current_ng = dict(solution.nongravitational_parameters or {})
         current_ng.update(nongravitational or {})
         self.ng_model = QComboBox()
-        self.ng_model.addItem("Marsdenův vodní model (komety)", "marsden")
-        self.ng_model.addItem("Mocninný model r⁻ᵐ (planetky / Yarkovsky)", "power")
+        self.ng_model.addItem(tr("Marsdenův vodní model (komety)"), "marsden")
+        self.ng_model.addItem(tr("Mocninný model r⁻ᵐ (planetky / Yarkovsky)"), "power")
         default_model = "power" if "R_EXPONENT" in current_ng or not comet else "marsden"
         self.ng_model.setCurrentIndex(self.ng_model.findData(default_model))
-        form.addRow("Závislost na vzdálenosti:", self.ng_model)
+        form.addRow(tr("Závislost na vzdálenosti:"), self.ng_model)
         self.ng_exponent = QDoubleSpinBox()
         self.ng_exponent.setDecimals(3)
         self.ng_exponent.setRange(.1, 10.0)
         self.ng_exponent.setSingleStep(.1)
         self.ng_exponent.setValue(float(current_ng.get("R_EXPONENT", 2.0)))
         self.ng_exponent.setToolTip(
-            "g(r) = (1 AU / r)^m. Hodnota m = 2 je jednoduchý standardní "
-            "model pro tlak záření nebo příčnou Yarkovského složku A2."
+            tr(
+                "g(r) = (1 AU / r)^m. Hodnota m = 2 je jednoduchý standardní model pro "
+                "tlak záření nebo příčnou Yarkovského složku A2.",
+            )
         )
         form.addRow("Exponent m:", self.ng_exponent)
         for name, label in (
-            ("A1", "A1 radiální [10⁻⁸ AU/den²]"),
-            ("A2", "A2 příčný [10⁻⁸ AU/den²]"),
-            ("A3", "A3 normálový [10⁻⁸ AU/den²]"),
-            ("DT", "DT zpoždění aktivity [dny]"),
+            ("A1", tr("A1 radiální [10⁻⁸ AU/den²]")),
+            ("A2", tr("A2 příčný [10⁻⁸ AU/den²]")),
+            ("A3", tr("A3 normálový [10⁻⁸ AU/den²]")),
+            (tr("DT"), tr("DT zpoždění aktivity [dny]")),
         ):
-            enabled = QCheckBox("fitovat")
+            enabled = QCheckBox(tr("fitovat"))
             editor = QDoubleSpinBox()
             editor.setDecimals(6)
             editor.setRange(
-                -1_000.0 if name == "DT" else -10_000.0,
-                1_000.0 if name == "DT" else 10_000.0,
+                -1_000.0 if name == tr("DT") else -10_000.0,
+                1_000.0 if name == tr("DT") else 10_000.0,
             )
-            editor.setSingleStep(.5 if name == "DT" else .1)
-            scale = 1.0 if name == "DT" else 1e-8
+            editor.setSingleStep(.5 if name == tr("DT") else .1)
+            scale = 1.0 if name == tr("DT") else 1e-8
             editor.setValue(float(current_ng.get(name, 0.0)) / scale)
             enabled.setChecked(name in (nongravitational or {}))
             row = QWidget(); row_layout = QHBoxLayout(row)
@@ -4185,7 +4308,7 @@ class OrbitConstraintsDialog(QDialog):
             row_layout.addWidget(enabled); row_layout.addWidget(editor, 1)
             form.addRow(label, row)
             self.ng_controls[name] = (enabled, editor)
-        dt_enabled, dt_editor = self.ng_controls["DT"]
+        dt_enabled, dt_editor = self.ng_controls[tr("DT")]
         a_checks = [self.ng_controls[name][0] for name in ("A1", "A2", "A3")]
 
         def sync_ng_model() -> None:
@@ -4204,47 +4327,59 @@ class OrbitConstraintsDialog(QDialog):
         self.ng_model.currentIndexChanged.connect(sync_ng_model)
         sync_ng_model()
         nongrav_note = QLabel(
-            "A1–A3 lze fitovat bez ohledu na označení tělesa. Pro planetky je "
-            "obvyklá příčná A2 (Yarkovsky); radiální A1 může popsat tlak záření. "
-            "Marsdenův model a DT jsou určeny pro kometární odplyňování. "
-            "Detekce Yarkovského efektu vyžaduje dlouhý přesný oblouk; samotná "
-            "nenulová hodnota A2 na krátkém oblouku není průkazná."
+            tr(
+                "A1–A3 lze fitovat bez ohledu na označení tělesa. Pro planetky je obvyklá "
+                "příčná A2 (Yarkovsky); radiální A1 může popsat tlak záření. Marsdenův "
+                "model a DT jsou určeny pro kometární odplyňování. Detekce Yarkovského "
+                "efektu vyžaduje dlouhý přesný oblouk; samotná nenulová hodnota A2 na "
+                "krátkém oblouku není průkazná.",
+            )
         )
         nongrav_note.setWordWrap(True)
         nongrav_note.setObjectName("muted")
         form.addRow(nongrav_note)
         if comet:
-            dynamics_heading = QLabel("Dlouhodobá dynamika komety")
+            dynamics_heading = QLabel(tr("Dlouhodobá dynamika komety"))
             dynamics_heading.setStyleSheet("font-weight: 650; margin-top: 10px;")
             form.addRow(dynamics_heading)
             form.addRow(self.original_future)
             dynamics_note = QLabel(
-                "Volba je standardně vypnutá. Výpočet může trvat podstatně déle; "
-                f"proběhne na pozadí. Aktivní model planet: {PLANETS.model_name}."
+                tr(
+                    "Volba je standardně vypnutá. Výpočet může trvat podstatně déle; proběhne "
+                    "na pozadí. Aktivní model planet: {0}.",
+                    PLANETS.model_name,
+                )
             )
             dynamics_note.setWordWrap(True)
             dynamics_note.setObjectName("muted")
             form.addRow(dynamics_note)
             comparison_note = QLabel(
-                "Pro přímé porovnání s publikovanou dráhou zapněte stejnou sadu "
-                "parametrů. Například řešení JPL s A1+A2 nelze přesně porovnávat "
-                "s fitem A1+A2+A3+DT; volné A3 a DT mohou kvůli korelacím "
-                "posunout i A1 a A2."
+                tr(
+                    "Pro přímé porovnání s publikovanou dráhou zapněte stejnou sadu "
+                    "parametrů. Například řešení JPL s A1+A2 nelze přesně porovnávat s fitem "
+                    "A1+A2+A3+DT; volné A3 a DT mohou kvůli korelacím posunout i A1 a A2.",
+                )
             )
             comparison_note.setWordWrap(True)
             comparison_note.setObjectName("muted")
             form.addRow(comparison_note)
         note = QLabel(
             (
-                "Fixace elementů je vynucena během diferenciální korekce. Pro parabolickou "
-                "hypotézu lze nastavit e = 1. "
+                tr(
+                    "Fixace elementů je vynucena během diferenciální korekce. Pro "
+                    "parabolickou hypotézu lze nastavit e = 1. ",
+                )
                 if allow_element_constraints else
-                "MPC neposkytlo počáteční dráhu, proto bude nejprve určena z astrometrie; "
-                "fixace elementů se zpřístupní po prvním úspěšném fitu. "
+                tr(
+                    "MPC neposkytlo počáteční dráhu, proto bude nejprve určena z astrometrie; "
+                    "fixace elementů se zpřístupní po prvním úspěšném fitu. ",
+                )
             )
-            + "A1–A3 a volitelný časový posun DT se fitují jako volné parametry. "
-              "DT má smysl především u více návratů; kladná hodnota znamená "
-              "maximum aktivity po perihelu."
+            + tr(
+                "A1–A3 a volitelný časový posun DT se fitují jako volné parametry. DT má "
+                "smysl především u více návratů; kladná hodnota znamená maximum aktivity "
+                "po perihelu.",
+            )
         )
         note.setWordWrap(True); note.setObjectName("muted")
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -4272,12 +4407,13 @@ class OrbitConstraintsDialog(QDialog):
     def _download_de440(self) -> None:
         if PLANETS.jpl is None:
             prompt = (
-                "Stáhnout oficiální JPL DE440 z NASA/NAIF?\n\n"
-                "Soubor má přibližně 114 MB a bude uložen do složky orbit-data. "
-                "Pokrytí efemeridy je 1549–2650."
+                tr(
+                    "Stáhnout oficiální JPL DE440 z NASA/NAIF?\n\nSoubor má přibližně 114 MB a "
+                    "bude uložen do složky orbit-data. Pokrytí efemeridy je 1549–2650.",
+                )
             )
         else:
-            prompt = "Stáhnout a znovu ověřit JPL DE440 (přibližně 114 MB)?"
+            prompt = tr("Stáhnout a znovu ověřit JPL DE440 (přibližně 114 MB)?")
         if QMessageBox.question(
             self, "JPL DE440", prompt,
             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
@@ -4287,8 +4423,8 @@ class OrbitConstraintsDialog(QDialog):
         dialog.exec()
         self.ephemeris_status.setText(PLANETS.status_text())
         self.download_de440.setText(
-            "Přeinstalovat JPL DE440…" if PLANETS.jpl is not None
-            else "Stáhnout JPL DE440 (cca 114 MB)…"
+            tr("Přeinstalovat JPL DE440…") if PLANETS.jpl is not None
+            else tr("Stáhnout JPL DE440 (cca 114 MB)…")
         )
 
     def selected_constraints(self) -> dict[str, float]:
@@ -4296,15 +4432,15 @@ class OrbitConstraintsDialog(QDialog):
 
     def selected_nongravitational(self) -> dict[str, float]:
         selected = {
-            name: editor.value() * (1.0 if name == "DT" else 1e-8)
+            name: editor.value() * (1.0 if name == tr("DT") else 1e-8)
             for name, (enabled, editor) in self.ng_controls.items()
             if enabled.isChecked()
         }
-        if "DT" in selected and not any(name in selected for name in ("A1", "A2", "A3")):
-            selected.pop("DT")
+        if tr("DT") in selected and not any(name in selected for name in ("A1", "A2", "A3")):
+            selected.pop(tr("DT"))
         if any(name in selected for name in ("A1", "A2", "A3")):
             if self.ng_model.currentData() == "power":
-                selected.pop("DT", None)
+                selected.pop(tr("DT"), None)
                 selected["R_EXPONENT"] = self.ng_exponent.value()
         return selected
 
@@ -4320,11 +4456,11 @@ class PreliminaryOrbitDialog(QDialog):
 
     def __init__(self, observation_count: int, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Předběžná dráha z krátkého oblouku")
+        self.setWindowTitle(tr("Předběžná dráha z krátkého oblouku"))
         self.setMinimumWidth(560)
         self.method = QComboBox()
-        self.method.addItem("Systematické hledání vzdálenosti (doporučeno)", "systematic")
-        self.method.addItem("Väisälä — předpoklad průchodu perihelem", "vaisala")
+        self.method.addItem(tr("Systematické hledání vzdálenosti (doporučeno)"), "systematic")
+        self.method.addItem(tr("Väisälä — předpoklad průchodu perihelem"), "vaisala")
         self.perihelion = QDoubleSpinBox()
         self.perihelion.setRange(0.01, 100.0)
         self.perihelion.setDecimals(4)
@@ -4336,21 +4472,26 @@ class PreliminaryOrbitDialog(QDialog):
             lambda _: self.perihelion.setEnabled(self.method.currentData() == "vaisala")
         )
         description = QLabel(
-            f"Načteno {observation_count} měření. Systematická metoda prohledá vzdálenost "
-            "a radiální rychlost. Väisälova varianta vytvoří jednu hypotézu pro zadané q."
+            tr(
+                "Načteno {0} měření. Systematická metoda prohledá vzdálenost a radiální "
+                "rychlost. Väisälova varianta vytvoří jednu hypotézu pro zadané q.",
+                observation_count,
+            )
         )
         description.setWordWrap(True)
         warning = QLabel(
-            "Výsledek z krátkého oblouku není jednoznačně určená dráha. Použijte jej "
-            "jako počáteční odhad a počítejte s rychle rostoucí nejistotou efemeridy."
+            tr(
+                "Výsledek z krátkého oblouku není jednoznačně určená dráha. Použijte jej "
+                "jako počáteční odhad a počítejte s rychle rostoucí nejistotou efemeridy.",
+            )
         )
         warning.setWordWrap(True)
         warning.setStyleSheet("color: #ffcf70;")
         form = QFormLayout()
-        form.addRow("Metoda:", self.method)
-        form.addRow("Perihelová vzdálenost q:", self.perihelion)
+        form.addRow(tr("Metoda:"), self.method)
+        form.addRow(tr("Perihelová vzdálenost q:"), self.perihelion)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("Vypočítat předběžnou dráhu")
+        buttons.button(QDialogButtonBox.Ok).setText(tr("Vypočítat předběžnou dráhu"))
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout = QVBoxLayout(self)
@@ -4375,34 +4516,41 @@ class PreliminaryOrbitResultDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Předběžná dráha — výsledek")
+        self.setWindowTitle(tr("Předběžná dráha — výsledek"))
         self.setMinimumWidth(600)
         method_text = (
-            "systematické hledání vzdálenosti a radiální rychlosti"
-            if method == "systematic" else f"Väisälova hypotéza, zadané q = {assumed_q:.4f} AU"
+            tr("systematické hledání vzdálenosti a radiální rychlosti")
+            if method == "systematic" else tr(
+                "Väisälova hypotéza, zadané q = {0:.4f} AU",
+                assumed_q,
+            )
         )
         actual_q = solution.semi_major_axis_au * (1.0 - solution.eccentricity)
         report = QPlainTextEdit()
         report.setReadOnly(True)
         report.setMinimumHeight(220)
         report.setPlainText(
-            "PŘEDBĚŽNÉ ŘEŠENÍ — DRÁHA NENÍ JEDNOZNAČNĚ URČENA\n\n"
-            f"Metoda: {method_text}\n"
-            f"Epocha: JD {solution.epoch_jd:.6f}\n"
-            f"a = {solution.semi_major_axis_au:.8g} AU\n"
-            f"e = {solution.eccentricity:.8f}\n"
-            f"q = {actual_q:.8f} AU\n"
-            f"i = {solution.inclination_deg:.6f}°\n"
-            f"Ω = {solution.node_deg:.6f}°\n"
-            f"ω = {solution.arg_peri_deg:.6f}°\n"
-            f"M = {solution.mean_anomaly_deg:.6f}°\n\n"
-            "Volba „Použít a zpřesnit“ spustí běžnou diferenciální korekci ze všech "
-            "vybraných měření. Efemerida bude přednastavena po 10 minutách na 48 hodin."
+            tr(
+                "PŘEDBĚŽNÉ ŘEŠENÍ — DRÁHA NENÍ JEDNOZNAČNĚ URČENA\n\nMetoda: {0}\nEpocha: JD "
+                "{1:.6f}\na = {2:.8g} AU\ne = {3:.8f}\nq = {4:.8f} AU\ni = {5:.6f}°\nΩ = "
+                "{6:.6f}°\nω = {7:.6f}°\nM = {8:.6f}°\n\nVolba „Použít a zpřesnit“ spustí "
+                "běžnou diferenciální korekci ze všech vybraných měření. Efemerida bude "
+                "přednastavena po 10 minutách na 48 hodin.",
+                method_text,
+                solution.epoch_jd,
+                solution.semi_major_axis_au,
+                solution.eccentricity,
+                actual_q,
+                solution.inclination_deg,
+                solution.node_deg,
+                solution.arg_peri_deg,
+                solution.mean_anomaly_deg,
+            )
         )
-        use = QPushButton("Použít předběžnou dráhu")
-        refine = QPushButton("Použít a zpřesnit")
+        use = QPushButton(tr("Použít předběžnou dráhu"))
+        refine = QPushButton(tr("Použít a zpřesnit"))
         refine.setObjectName("solveOrbit")
-        close = QPushButton("Zavřít")
+        close = QPushButton(tr("Zavřít"))
         use.clicked.connect(lambda: self.done(self.USE))
         refine.clicked.connect(lambda: self.done(self.REFINE))
         close.clicked.connect(self.reject)
@@ -4428,14 +4576,12 @@ def metric_card(title: str, value: str) -> tuple[QFrame, QLabel]:
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Orbit Solver — určování drah")
+        self.setWindowTitle(tr("Orbit Solver — určování drah"))
         self.resize(1500, 920)
         self.solution = demo_solution()
         self.mpc_network = MpcNetworkClient(self)
         self.mpc_network.success.connect(
-            lambda result: self._observations_loaded(
-                result[0], result[1], result[2] if len(result) > 2 else None
-            )
+            lambda result: self._observations_loaded(*result)
         )
         self.mpc_network.error.connect(self._observations_failed)
         self.mpc_network.orbit_success.connect(self._orbit_loaded)
@@ -4468,97 +4614,165 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._workspace())
         splitter.setSizes([300, 1200]); splitter.setCollapsible(0, False)
         self.setCentralWidget(splitter)
-        status = QStatusBar(); status.showMessage("Připraveno — zadejte objekt; jeho výchozí dráha se načte z MPC.")
+        status = QStatusBar(); status.showMessage(tr(
+            "Připraveno — zadejte objekt; jeho výchozí dráha se načte z MPC.",
+        ))
         self.setStatusBar(status)
 
     def _sidebar(self) -> QWidget:
         panel = QFrame(); panel.setObjectName("sidebar"); panel.setMinimumWidth(270); panel.setMaximumWidth(370)
         layout = QVBoxLayout(panel); layout.setContentsMargins(20, 24, 20, 20); layout.setSpacing(12)
         title = QLabel("ORBIT SOLVER"); title.setObjectName("title")
-        subtitle = QLabel("Výpočet drah z astrometrie MPC"); subtitle.setObjectName("muted")
+        subtitle = QLabel(tr("Výpočet drah z astrometrie MPC")); subtitle.setObjectName("muted")
         self.search = QLineEdit(); self.search.setPlaceholderText("Apophis, 2026 AB, P21…")
         self.search.returnPressed.connect(self.load_object)
-        self.load_button = QPushButton("Načíst objekt")
+        self.load_button = QPushButton(tr("Načíst objekt"))
         self.load_button.setToolTip(
-            "Načte katalogovou dráhu; u NEOCP/PCCP stáhne astrometrii a spočítá vlastní dráhu."
+            tr(
+                "Načte katalogovou dráhu; u NEOCP/PCCP stáhne astrometrii a spočítá "
+                "vlastní dráhu.",
+            )
         )
         self.load_button.setObjectName("primary"); self.load_button.clicked.connect(self.load_object)
-        self.solve = QPushButton("Znovu načíst výchozí dráhu"); self.solve.setEnabled(False)
+        self.solve = QPushButton(tr("Znovu načíst výchozí dráhu")); self.solve.setEnabled(False)
         self.solve.setToolTip(
-            "Načte stav z MPC; u historických fragmentů Shoemaker–Levy 9 použije JPL Horizons."
+            tr(
+                "Načte stav z MPC; u historických fragmentů Shoemaker–Levy 9 použije JPL "
+                "Horizons.",
+            )
         )
         self.solve.clicked.connect(self.load_orbit)
-        self.mpc_observations_button = QPushButton("Stáhnout astrometrii z MPC")
+        self.mpc_observations_button = QPushButton(tr("Načíst astrometrii z MPC"))
         self.mpc_observations_button.setToolTip(
-            "Program sám vyzkouší běžný archiv MPC i aktuální NEOCP/PCCP."
+            tr(
+                "Použije astrometrii uloženou v místní cache, pokud už byla dříve "
+                "stažena; jinak ji stáhne z MPC. Program sám vyzkouší běžný archiv MPC "
+                "i aktuální NEOCP/PCCP.",
+            )
         )
-        self.mpc_observations_button.clicked.connect(self.load_observations)
-        self.file_observations_button = QPushButton("Načíst pozorování z TXT…")
+        self.mpc_observations_button.clicked.connect(lambda: self.load_observations(False))
+        self.mpc_refresh_button = QPushButton(tr("Aktualizovat astrometrii z MPC"))
+        self.mpc_refresh_button.setToolTip(
+            tr(
+                "Znovu stáhne kompletní astrometrii z MPC (včetně nových pozorování) "
+                "a přepíše místní cache.",
+            )
+        )
+        self.mpc_refresh_button.clicked.connect(lambda: self.load_observations(True))
+        self.file_observations_button = QPushButton(tr("Načíst pozorování z TXT…"))
         self.file_observations_button.clicked.connect(self.load_observations_file)
-        self.paste_observations_button = QPushButton("Vložit MPC pozorování…")
+        self.paste_observations_button = QPushButton(tr("Vložit MPC pozorování…"))
         self.paste_observations_button.clicked.connect(self.paste_observations)
-        self.fit_button = QPushButton("▶  Spočítat vlastní dráhu"); self.fit_button.setEnabled(False)
+        self.fit_button = QPushButton(tr("▶  Spočítat vlastní dráhu")); self.fit_button.setEnabled(False)
         self.fit_button.setObjectName("solveOrbit")
         self.fit_button.setVisible(False)
         self.fit_button.clicked.connect(self.calculate_own_orbit)
-        self.preliminary_button = QPushButton("Předběžná dráha z krátkého oblouku…")
+        self.preliminary_button = QPushButton(tr("Předběžná dráha z krátkého oblouku…"))
         self.preliminary_button.setToolTip(
-            "Prohledá možné vzdálenosti a radiální rychlosti, případně vytvoří "
-            "Väisälovu hypotézu se zadanou perihelovou vzdáleností."
+            tr(
+                "Prohledá možné vzdálenosti a radiální rychlosti, případně vytvoří "
+                "Väisälovu hypotézu se zadanou perihelovou vzdáleností.",
+            )
         )
         self.preliminary_button.setEnabled(False)
         self.preliminary_button.setVisible(False)
         self.preliminary_button.clicked.connect(self.calculate_preliminary_orbit)
-        self.constraints_button = QPushButton("Vlastní nastavení…")
+        self.constraints_button = QPushButton(tr("Vlastní nastavení…"))
         self.constraints_button.setEnabled(False)
         self.constraints_button.clicked.connect(self.configure_constraints)
         self.fit_interval = QComboBox()
-        self.fit_interval.addItem("Celý pozorovací oblouk", None)
-        self.fit_interval.addItem("Poslední 2 roky", 2.0)
-        self.fit_interval.addItem("Posledních 5 let", 5.0)
-        self.fit_interval.addItem("Posledních 10 let", 10.0)
+        self.fit_interval.addItem(tr("Celý pozorovací oblouk"), None)
+        self.fit_interval.addItem(tr("Poslední 2 roky"), 2.0)
+        self.fit_interval.addItem(tr("Posledních 5 let"), 5.0)
+        self.fit_interval.addItem(tr("Posledních 10 let"), 10.0)
         self.fit_interval.setToolTip(
-            "Časový výřez se počítá zpětně od nejnovějšího pozorování; data v tabulce zůstanou zachována."
+            tr(
+                "Časový výřez se počítá zpětně od nejnovějšího pozorování; data v tabulce "
+                "zůstanou zachována.",
+            )
         )
         self.fit_interval.currentIndexChanged.connect(
             lambda _: self._update_fit_button_label()
         )
         hint = QLabel(
-            "MPC dráha je počáteční odhad; vlastní fit používá topocentrické polohy stanic "
-            "a automatické planetární perturbace."
+            tr(
+                "MPC dráha je počáteční odhad; vlastní fit používá topocentrické polohy "
+                "stanic a automatické planetární perturbace.",
+            )
         )
         hint.setWordWrap(True); hint.setObjectName("muted")
         layout.addWidget(title); layout.addWidget(subtitle); layout.addSpacing(18)
-        layout.addWidget(QLabel("Objekt")); layout.addWidget(self.search)
+        layout.addWidget(QLabel(tr("Objekt"))); layout.addWidget(self.search)
         layout.addWidget(self.load_button); layout.addWidget(self.solve)
-        layout.addSpacing(8); layout.addWidget(QLabel("Astrometrie pro vlastní fit"))
+        layout.addSpacing(8); layout.addWidget(QLabel(tr("Astrometrie pro vlastní fit")))
         layout.addWidget(self.mpc_observations_button)
+        layout.addWidget(self.mpc_refresh_button)
         layout.addWidget(self.file_observations_button)
         layout.addWidget(self.paste_observations_button)
         layout.addSpacing(7)
         layout.addWidget(self.fit_button)
         layout.addWidget(self.preliminary_button)
-        layout.addWidget(self.constraints_button); layout.addWidget(QLabel("Rozsah astrometrie:"))
+        layout.addWidget(self.constraints_button); layout.addWidget(QLabel(tr(
+            "Rozsah astrometrie:",
+        )))
         layout.addWidget(self.fit_interval); layout.addWidget(hint)
         layout.addStretch()
+        language_row = QHBoxLayout()
+        language_row.addWidget(QLabel("Language / Jazyk:"))
+        self.language_box = QComboBox()
+        for code, name in SUPPORTED_LANGUAGES.items():
+            self.language_box.addItem(name, code)
+        self.language_box.setCurrentIndex(self.language_box.findData(language()))
+        self.language_box.currentIndexChanged.connect(self._language_changed)
+        language_row.addWidget(self.language_box, 1)
+        layout.addLayout(language_row)
         version = QLabel(
-            "Orbit Solver 1.0\n"
-            "Autor: Martin Mašek\n"
-            "Vyvíjeno s pomocí OpenAI Codex"
+            tr("Orbit Solver 1.0\nAutor: Martin Mašek\nVyvíjeno s pomocí OpenAI Codex")
         )
         version.setObjectName("muted")
         version.setWordWrap(True)
         layout.addWidget(version)
         return panel
 
+    def _language_changed(self, *_args) -> None:
+        """Store the chosen language and offer an immediate restart.
+
+        Labels are built when the window is created, so a switch needs a new
+        process; the choice is remembered for every later start.
+        """
+        code = str(self.language_box.currentData() or "en")
+        if code == language():
+            return
+        try:
+            save_language(code)
+        except Exception as exc:  # settings backend unavailable
+            QMessageBox.warning(self, "Language / Jazyk", str(exc))
+            return
+        answer = QMessageBox.question(
+            self, "Language / Jazyk",
+            "The language will change after a restart. Restart Orbit Solver now?\n\n"
+            "Jazyk se změní po restartu. Restartovat Orbit Solver nyní?",
+        )
+        if answer != QMessageBox.Yes:
+            return
+        if self.fit_thread is not None:
+            QMessageBox.information(
+                self, "Language / Jazyk",
+                "Wait until the running orbit calculation finishes.\n\n"
+                "Počkejte, až doběhne výpočet dráhy.",
+            )
+            return
+        QProcess.startDetached(sys.executable, sys.argv, os.getcwd())
+        QApplication.instance().quit()
+
     def _workspace(self) -> QWidget:
         area = QWidget(); outer = QVBoxLayout(area); outer.setContentsMargins(18, 18, 18, 18)
         header = QHBoxLayout()
-        heading = QVBoxLayout(); self.object_title = QLabel("Žádný objekt"); self.object_title.setObjectName("title")
+        heading = QVBoxLayout(); self.object_title = QLabel(tr("Žádný objekt")); self.object_title.setObjectName("title")
         self.object_label = QLabel(self.solution.designation); self.object_label.setObjectName("muted")
         heading.addWidget(self.object_title); heading.addWidget(self.object_label); header.addLayout(heading); header.addStretch()
         cards = []
-        for title, value in (("Pozorování", "0"), ("Časový oblouk", "—"), ("RMS", "—")):
+        for title, value in ((tr("Pozorování"), "0"), (tr("Časový oblouk"), "—"), ("RMS", "—")):
             card, label = metric_card(title, value); cards.append(label); header.addWidget(card)
         self.obs_metric, self.arc_metric, self.rms_metric = cards
         outer.addLayout(header)
@@ -4566,22 +4780,27 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         obs_page = QWidget(); obs_layout = QVBoxLayout(obs_page)
         observation_actions = QHBoxLayout()
-        exclude_selected = QPushButton("Vyřadit vybraná z fitu")
-        include_selected = QPushButton("Zařadit vybraná do fitu")
-        copy_selected_observations = QPushButton("Kopírovat vybraná")
+        exclude_selected = QPushButton(tr("Vyřadit vybraná z fitu"))
+        include_selected = QPushButton(tr("Zařadit vybraná do fitu"))
+        copy_selected_observations = QPushButton(tr("Kopírovat vybraná"))
         copy_selected_observations.setToolTip(
-            "Zkopíruje celé vybrané řádky včetně sexagesimální RA/Dec a obou reziduí O−C."
+            tr("Zkopíruje celé vybrané řádky včetně sexagesimální RA/Dec a obou reziduí O−C.")
         )
-        self.exclude_outliers_button = QPushButton("Vyřadit rezidua > 2″")
+        self.exclude_outliers_button = QPushButton(tr("Vyřadit rezidua > 2″"))
         self.exclude_outliers_button.setToolTip(
-            "Vybere a vyřadí všechna dosud zařazená pozorování, u nichž |O−C RA| "
-            "nebo |O−C Dec| přesahuje 2 obloukové sekundy. Poté je potřeba dráhu přepočítat."
+            tr(
+                "Vybere a vyřadí všechna dosud zařazená pozorování, u nichž |O−C RA| nebo "
+                "|O−C Dec| přesahuje 2 obloukové sekundy. Poté je potřeba dráhu "
+                "přepočítat.",
+            )
         )
         self.exclude_outliers_button.setEnabled(False)
         self.worst_observation_button = QPushButton("Worst obs")
         self.worst_observation_button.setToolTip(
-            "Najde a označí nejhorší dosud nevyřazené pozorování podle většího "
-            "z absolutních reziduí RA a Dec."
+            tr(
+                "Najde a označí nejhorší dosud nevyřazené pozorování podle většího z "
+                "absolutních reziduí RA a Dec.",
+            )
         )
         self.worst_observation_button.setEnabled(False)
         exclude_selected.clicked.connect(lambda: self._set_selected_observations_excluded(True))
@@ -4605,7 +4824,7 @@ class MainWindow(QMainWindow):
         self.observation_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         obs_layout.addWidget(self.observation_table)
         self.observation_detail = QLabel(
-            "Kliknutím na pozorování zobrazíte observatoř a geometrii v okamžiku měření."
+            tr("Kliknutím na pozorování zobrazíte observatoř a geometrii v okamžiku měření.")
         )
         self.observation_detail.setObjectName("value")
         self.observation_detail.setWordWrap(True)
@@ -4620,22 +4839,22 @@ class MainWindow(QMainWindow):
         self.observation_model.dataChanged.connect(
             lambda *_: (self._update_fit_button_label(), self._refresh_residual_actions())
         )
-        self.tabs.addTab(obs_page, "Pozorování")
+        self.tabs.addTab(obs_page, tr("Pozorování"))
         self.elements_panel = ElementsPanel(self.solution)
-        self.tabs.addTab(self.elements_panel, "Elementy")
+        self.tabs.addTab(self.elements_panel, tr("Elementy"))
         self.ephemeris_panel = EphemerisPanel(self.solution)
-        self.tabs.addTab(self.ephemeris_panel, "Efemerida")
+        self.tabs.addTab(self.ephemeris_panel, tr("Efemerida"))
         self.evolution_panel = OrbitEvolutionPanel(self.solution)
         self.evolution_panel.show_return.connect(self._show_evolution_return)
         self.evolution_panel.evolution_ready.connect(self._evolution_ready)
-        self.tabs.addTab(self.evolution_panel, "Vývoj dráhy")
+        self.tabs.addTab(self.evolution_panel, tr("Vývoj dráhy"))
         solar_playback = PlaybackBar(); self.solar_panel = SolarSystemPanel(self.solution, solar_playback)
-        self.tabs.addTab(self.solar_panel, "Sluneční soustava")
+        self.tabs.addTab(self.solar_panel, tr("Sluneční soustava"))
         sky_playback = PlaybackBar(); self.sky_panel = SkyPanel(self.solution, sky_playback)
-        self.tabs.addTab(self.sky_panel, "Pohled ze Země")
+        self.tabs.addTab(self.sky_panel, tr("Pohled ze Země"))
         self.photometry_panel = PhotometryPanel(self.solution)
         self.photometry_panel.photometry_changed.connect(self._refresh_photometric_dependents)
-        self.tabs.addTab(self.photometry_panel, "Světelná křivka")
+        self.tabs.addTab(self.photometry_panel, tr("Světelná křivka"))
         for index in range(1, self.tabs.count()):
             self.tabs.setTabEnabled(index, False)
         self.tabs.currentChanged.connect(self._refresh_solution_tab)
@@ -4645,11 +4864,13 @@ class MainWindow(QMainWindow):
     def load_object(self) -> None:
         designation = self.search.text().strip()
         if not designation:
-            self.search.setFocus(); self.statusBar().showMessage("Nejdřív zadejte označení objektu.")
+            self.search.setFocus(); self.statusBar().showMessage(tr(
+                "Nejdřív zadejte označení objektu.",
+            ))
             return
         if not any(character.isdigit() for character in designation) and "/" not in designation:
             self.load_button.setEnabled(False)
-            self.statusBar().showMessage(f"Hledám název {designation} v MPC…")
+            self.statusBar().showMessage(tr("Hledám název {0} v MPC…", designation))
             self.mpc_network.identifier(designation)
             return
         self._begin_object_load(designation)
@@ -4660,7 +4881,7 @@ class MainWindow(QMainWindow):
             self.observation_model.set_rows([])
             self._refresh_residual_actions()
             self.photometry_panel.set_observations([])
-            self.fit_button.setText("▶  Spočítat vlastní dráhu")
+            self.fit_button.setText(tr("▶  Spočítat vlastní dráhu"))
             self.fit_button.setVisible(False)
             self.preliminary_button.setVisible(False)
             self.preliminary_button.setEnabled(False)
@@ -4696,12 +4917,12 @@ class MainWindow(QMainWindow):
         else:
             labels = [caption for caption, _ in choices]
             selected, accepted = QInputDialog.getItem(
-                self, "Vyberte objekt",
-                f"Název „{query}“ odpovídá více objektům:", labels, 0, False,
+                self, tr("Vyberte objekt"),
+                tr("Název „{0}“ odpovídá více objektům:", query), labels, 0, False,
             )
             if not accepted:
                 self.load_button.setEnabled(True)
-                self.statusBar().showMessage("Výběr objektu byl zrušen.")
+                self.statusBar().showMessage(tr("Výběr objektu byl zrušen."))
                 return
             caption, designation = choices[labels.index(selected)]
         # The type suffix belongs in the picker, not in the main heading.
@@ -4714,33 +4935,51 @@ class MainWindow(QMainWindow):
         # orbit request, which accepts many common names itself.
         self._begin_object_load(designation)
 
-    def load_observations(self) -> None:
+    def load_observations(self, force_refresh: bool = False) -> None:
         designation = self.search.text().strip()
         if not designation:
-            self.search.setFocus(); self.statusBar().showMessage("Nejdřív zadejte označení objektu.")
+            self.search.setFocus(); self.statusBar().showMessage(tr(
+                "Nejdřív zadejte označení objektu.",
+            ))
             return
-        self.statusBar().showMessage(f"Stahuji astrometrii pro {designation}…")
-        self.mpc_observations_button.setEnabled(False)
+        self._request_observations(designation, force_refresh)
+
+    def _request_observations(self, designation: str, force_refresh: bool = False) -> None:
+        """Load astrometry from the local cache, or download it from the MPC."""
+        if not force_refresh:
+            cached = mpc_cache.load(designation)
+            if cached is not None:
+                rows = cached.observations()
+                if rows:
+                    self._observations_loaded(designation, rows, False, cached.downloaded_utc)
+                    return
+        self.statusBar().showMessage(tr("Stahuji astrometrii pro {0}…", designation))
+        self._set_observation_buttons_enabled(False)
         # Start with the archive for ordinary designations; the network client
         # automatically retries NEOCP/PCCP when the object is not found there.
         self.mpc_network.observations(designation, False)
 
+    def _set_observation_buttons_enabled(self, enabled: bool) -> None:
+        self.mpc_observations_button.setEnabled(enabled)
+        self.mpc_refresh_button.setEnabled(enabled)
+
     def _observations_loaded(
         self, designation: str, rows: list[Observation], confirmation_page: bool | None = None,
+        cached_utc: datetime | None = None,
     ) -> None:
-        self.mpc_observations_button.setEnabled(True)
+        self._set_observation_buttons_enabled(True)
         self.load_button.setEnabled(True)
         same_object = designation.strip().casefold() == self.current_designation.strip().casefold()
         self.has_orbit = self.has_orbit and same_object
         self.observation_model.set_rows(rows)
         self.observation_detail.setText(
-            "Kliknutím na pozorování zobrazíte observatoř a geometrii v okamžiku měření."
+            tr("Kliknutím na pozorování zobrazíte observatoř a geometrii v okamžiku měření.")
         )
         orbit_note = (
-            f"výchozí dráha {self.solution.data_source}"
-            if self.has_orbit else "dráha dosud nenačtena"
+            tr("výchozí dráha {0}", self.solution.data_source)
+            if self.has_orbit else tr("dráha dosud nenačtena")
         )
-        self.object_label.setText(f"{len(rows)} pozorování • {orbit_note}")
+        self.object_label.setText(tr("{0} pozorování • {1}", len(rows), orbit_note))
         self.obs_metric.setText(str(len(rows)))
         self.current_designation = designation
         if not same_object:
@@ -4762,26 +5001,37 @@ class MainWindow(QMainWindow):
         times = sorted(row.time for row in rows if row.time)
         self.arc_metric.setText(f"{times[0][:10]} → {times[-1][:10]}" if times else "—")
         source_note = (
-            " z NEOCP/PCCP" if confirmation_page is True
-            else " z MPC" if confirmation_page is False else ""
+            tr(
+                " z místní cache (staženo z MPC {0:%Y-%m-%d %H:%M} UTC; pro nová data "
+                "použijte Aktualizovat astrometrii z MPC)",
+                cached_utc,
+            ) if cached_utc is not None
+            else tr(" z NEOCP/PCCP") if confirmation_page is True
+            else tr(" z MPC") if confirmation_page is False else ""
         )
         self.statusBar().showMessage(
-            f"Načteno {len(rows)} pozorování{source_note}. Výchozí dráha se tím nemění."
+            tr(
+                "Načteno {0} pozorování{1}. Výchozí dráha se tím nemění.",
+                len(rows),
+                source_note,
+            )
         )
         if self._fit_after_observations_load:
             self._fit_after_observations_load = False
             self.statusBar().showMessage(
-                f"Načteno {len(rows)} pozorování z NEOCP/PCCP; počítám vlastní dráhu…"
+                tr("Načteno {0} pozorování{1}; počítám vlastní dráhu…", len(rows), source_note)
             )
             self._start_own_orbit_fit(None)
 
     def _observations_failed(self, message: str) -> None:
         automatic_fit = self._fit_after_observations_load
         self._fit_after_observations_load = False
-        self.mpc_observations_button.setEnabled(True)
+        self._set_observation_buttons_enabled(True)
         self.load_button.setEnabled(True)
         self.statusBar().showMessage(
-            "Automatické načtení objektu selhalo." if automatic_fit else "Načtení MPC selhalo."
+            tr("Automatické načtení objektu selhalo.") if automatic_fit else tr(
+                "Načtení MPC selhalo.",
+            )
         )
         QMessageBox.warning(self, "MPC", message)
 
@@ -4790,7 +5040,10 @@ class MainWindow(QMainWindow):
             return
         self._auto_orbit_request = bool(auto)
         self.solve.setEnabled(False)
-        self.statusBar().showMessage(f"Načítám výchozí kartézský stav pro {self.current_designation}…")
+        self.statusBar().showMessage(tr(
+            "Načítám výchozí kartézský stav pro {0}…",
+            self.current_designation,
+        ))
         self.mpc_network.orbit(self.current_designation)
 
     def _orbit_loaded(self, solution: OrbitSolution) -> None:
@@ -4812,25 +5065,29 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentIndex(1)
         self._apply_solution(solution)
         self.object_title.setText(self.current_display_name)
-        observation_note = f" • {len(self.current_observations)} pozorování" if self.current_observations else ""
+        observation_note = tr(" • {0} pozorování", len(self.current_observations)) if self.current_observations else ""
         self.object_label.setText(
-            f"Výchozí kartézský stav {solution.data_source}{observation_note}"
+            tr("Výchozí kartézský stav {0}{1}", solution.data_source, observation_note)
         )
         if continue_with_fit:
             self.statusBar().showMessage(
-                f"Výchozí dráha {solution.data_source} načtena; "
-                "spouštím vlastní fit z astrometrie…"
+                tr(
+                    "Výchozí dráha {0} načtena; spouštím vlastní fit z astrometrie…",
+                    solution.data_source,
+                )
             )
             self.calculate_own_orbit()
         else:
             self.statusBar().showMessage(
-                "Dráha načtena. Grafy a efemerida se přepočítají při otevření záložky.",
+                tr("Dráha načtena. Grafy a efemerida se přepočítají při otevření záložky."),
                 8000,
             )
 
     def load_observations_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Načíst MPC pozorování", "", "Textové soubory (*.txt *.obs);;Všechny soubory (*)"
+            self, tr("Načíst MPC pozorování"), "", tr(
+                "Textové soubory (*.txt *.obs);;Všechny soubory (*)",
+            )
         )
         if not path:
             return
@@ -4841,7 +5098,7 @@ class MainWindow(QMainWindow):
                 text = Path(path).read_text(encoding="latin-1")
             rows = parse_mpc80(text, self.search.text().strip())
         except (OSError, MpcError) as exc:
-            QMessageBox.warning(self, "Pozorování", str(exc))
+            QMessageBox.warning(self, tr("Pozorování"), str(exc))
             return
         designation = self.search.text().strip() or rows[0].designation
         if not self.search.text().strip():
@@ -4849,10 +5106,10 @@ class MainWindow(QMainWindow):
         self._observations_loaded(designation, rows)
 
     def paste_observations(self) -> None:
-        dialog = QDialog(self); dialog.setWindowTitle("Vložit MPC 80-col pozorování")
+        dialog = QDialog(self); dialog.setWindowTitle(tr("Vložit MPC 80-col pozorování"))
         dialog.resize(900, 520)
         editor = QPlainTextEdit(); editor.setPlaceholderText(
-            "Vložte jeden nebo více řádků astrometrie ve formátu MPC 80-column…"
+            tr("Vložte jeden nebo více řádků astrometrie ve formátu MPC 80-column…")
         )
         editor.setLineWrapMode(QPlainTextEdit.NoWrap)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -4863,7 +5120,7 @@ class MainWindow(QMainWindow):
         try:
             rows = parse_mpc80(editor.toPlainText(), self.search.text().strip())
         except MpcError as exc:
-            QMessageBox.warning(self, "Pozorování", str(exc))
+            QMessageBox.warning(self, tr("Pozorování"), str(exc))
             return
         designation = self.search.text().strip() or rows[0].designation
         if not self.search.text().strip():
@@ -4880,20 +5137,19 @@ class MainWindow(QMainWindow):
         if requested_for_fit:
             self.load_button.setEnabled(True)
             self.statusBar().showMessage(
-                "MPC výchozí dráhu nemá; určuji počáteční stav přímo z astrometrie…"
+                tr("MPC výchozí dráhu nemá; určuji počáteční stav přímo z astrometrie…")
             )
             self._start_own_orbit_fit(None)
         elif automatic:
             self.statusBar().showMessage(
-                "Katalogová dráha není dostupná; hledám pozorování v MPC a NEOCP/PCCP…"
+                tr("Katalogová dráha není dostupná; hledám pozorování v MPC a NEOCP/PCCP…")
             )
             self._fit_after_observations_load = True
-            self.mpc_observations_button.setEnabled(False)
-            self.mpc_network.observations(self.current_designation, False)
+            self._request_observations(self.current_designation)
         else:
             self.load_button.setEnabled(True)
-            self.statusBar().showMessage("Orbitální data MPC se nepodařilo načíst.")
-            QMessageBox.warning(self, "Dráha", message)
+            self.statusBar().showMessage(tr("Orbitální data MPC se nepodařilo načíst."))
+            QMessageBox.warning(self, tr("Dráha"), message)
 
     def _apply_solution(self, solution: OrbitSolution) -> None:
         self.solution = solution
@@ -4905,9 +5161,10 @@ class MainWindow(QMainWindow):
         self.photometry_panel.solution = solution
         self.photometry_panel.observations = self.current_observations
         self.ephemeris_panel.solution = solution
-        self.evolution_panel.set_solution(solution)
         self.solar_panel.solution = solution
+        # Reset before the Evolution panel may publish the fit's integration.
         self.solar_panel.set_evolution(None, None)
+        self.evolution_panel.set_solution(solution)
         self.sky_panel.solution = solution
         self.sky_panel.free_center_ra = None
         self.sky_panel.free_center_dec = None
@@ -4937,7 +5194,10 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentWidget(self.solar_panel)
         self.solar_panel.set_time(time)
         self.statusBar().showMessage(
-            "Zobrazen je oskulační návrat z Vývoje dráhy; načtená/fituovaná dráha zůstává beze změny.",
+            tr(
+                "Zobrazen je oskulační návrat z Vývoje dráhy; načtená/fituovaná dráha "
+                "zůstává beze změny.",
+            ),
             9000,
         )
 
@@ -4950,9 +5210,13 @@ class MainWindow(QMainWindow):
         else:
             self._dirty_solution_tabs.add(4)
         self.statusBar().showMessage(
-            f"Vývoj dráhy dokončen: {len(result.returns)} návratů, "
-            f"{len(result.encounters)} významných přiblížení, "
-            f"{len(result.captures)} planetocentrických zachycení.",
+            tr(
+                "Vývoj dráhy dokončen: {0} návratů, {1} významných přiblížení, {2} "
+                "planetocentrických zachycení.",
+                len(result.returns),
+                len(result.encounters),
+                len(result.captures),
+            ),
             12000,
         )
 
@@ -4979,8 +5243,8 @@ class MainWindow(QMainWindow):
             self.observation_model.set_rows(self.current_observations)
             self._update_fit_button_label()
             self._refresh_residual_actions()
-            action = "Vyřazeno" if excluded else "Zařazeno"
-            self.statusBar().showMessage(f"{action} {len(rows)} vybraných pozorování.", 6000)
+            action = tr("Vyřazeno") if excluded else tr("Zařazeno")
+            self.statusBar().showMessage(tr("{0} {1} vybraných pozorování.", action, len(rows)), 6000)
 
     def _copy_selected_observations(self) -> None:
         selection = self.observation_table.selectionModel()
@@ -4990,12 +5254,12 @@ class MainWindow(QMainWindow):
         if not rows and selection.currentIndex().isValid():
             rows = [selection.currentIndex().row()]
         if not rows:
-            self.statusBar().showMessage("Nejdřív vyberte alespoň jedno pozorování.", 5000)
+            self.statusBar().showMessage(tr("Nejdřív vyberte alespoň jedno pozorování."), 5000)
             return
         observations = [self.observation_model.rows[row] for row in rows]
         QApplication.clipboard().setText(observations_to_tsv(observations))
         self.statusBar().showMessage(
-            f"Zkopírováno {len(observations)} pozorování včetně O−C RA a Dec.", 6000
+            tr("Zkopírováno {0} pozorování včetně O−C RA a Dec.", len(observations)), 6000
         )
 
     def _active_residual_rows(self) -> list[tuple[int, float]]:
@@ -5015,8 +5279,8 @@ class MainWindow(QMainWindow):
         outlier_count = sum(score > 2.0 for _, score in active)
         self.worst_observation_button.setEnabled(bool(active))
         self.exclude_outliers_button.setText(
-            f"Vyřadit rezidua > 2″ ({outlier_count})"
-            if outlier_count else "Vyřadit rezidua > 2″"
+            tr("Vyřadit rezidua > 2″ ({0})", outlier_count)
+            if outlier_count else tr("Vyřadit rezidua > 2″")
         )
         self.exclude_outliers_button.setEnabled(outlier_count > 0)
 
@@ -5035,7 +5299,7 @@ class MainWindow(QMainWindow):
         rows = [row for row, score in self._active_residual_rows() if score > 2.0]
         if not rows:
             self.statusBar().showMessage(
-                "Žádné zařazené pozorování nemá reziduum větší než 2″.", 6000
+                tr("Žádné zařazené pozorování nemá reziduum větší než 2″."), 6000
             )
             self._refresh_residual_actions()
             return
@@ -5048,7 +5312,7 @@ class MainWindow(QMainWindow):
         self._update_fit_button_label()
         self._refresh_residual_actions()
         self.statusBar().showMessage(
-            f"Vyřazeno {len(rows)} pozorování s reziduem > 2″; nyní dráhu přepočítejte.",
+            tr("Vyřazeno {0} pozorování s reziduem > 2″; nyní dráhu přepočítejte.", len(rows)),
             10000,
         )
 
@@ -5056,7 +5320,7 @@ class MainWindow(QMainWindow):
         active = self._active_residual_rows()
         if not active:
             self.statusBar().showMessage(
-                "Nejhorší pozorování lze určit až po výpočtu reziduí.", 6000
+                tr("Nejhorší pozorování lze určit až po výpočtu reziduí."), 6000
             )
             self._refresh_residual_actions()
             return
@@ -5064,8 +5328,12 @@ class MainWindow(QMainWindow):
         self._select_table_rows([row])
         observation = self.observation_model.rows[row]
         self.statusBar().showMessage(
-            f"Nejhorší nevyřazené pozorování: řádek {row + 1}, "
-            f"{observation.time}, reziduum {score:.2f}″.",
+            tr(
+                "Nejhorší nevyřazené pozorování: řádek {0}, {1}, reziduum {2:.2f}″.",
+                row + 1,
+                observation.time,
+                score,
+            ),
             10000,
         )
 
@@ -5079,17 +5347,21 @@ class MainWindow(QMainWindow):
                 self.current_observations, None,
             ) >= 3)
         if not total:
-            self.fit_button.setText("▶  Spočítat vlastní dráhu")
+            self.fit_button.setText(tr("▶  Spočítat vlastní dráhu"))
         elif selected == total:
-            self.fit_button.setText(f"▶  Spočítat vlastní dráhu ({selected} měření)")
+            self.fit_button.setText(tr("▶  Spočítat vlastní dráhu ({0} měření)", selected))
         else:
             self.fit_button.setText(
-                f"▶  Spočítat vlastní dráhu ({selected} z {total} měření)"
+                tr("▶  Spočítat vlastní dráhu ({0} z {1} měření)", selected, total)
             )
         self.fit_button.setToolTip(
-            f"Do zvoleného časového rozsahu a ručního výběru spadá {selected} "
-            f"z {total} načtených měření. Bez katalogové dráhy program určí "
-            "počáteční stav přímo z astrometrie."
+            tr(
+                "Do zvoleného časového rozsahu a ručního výběru spadá {0} z {1} načtených "
+                "měření. Bez katalogové dráhy program určí počáteční stav přímo z "
+                "astrometrie.",
+                selected,
+                total,
+            )
         )
 
     def _show_observation_detail(self, current: QModelIndex, previous: QModelIndex) -> None:
@@ -5097,8 +5369,8 @@ class MainWindow(QMainWindow):
             return
         observation = self.observation_model.rows[current.row()]
         station = observatory_details(observation.station)
-        station_name = str(station["name"]) if station else "neznámá observatoř"
-        location_text = "poloha není v katalogu MPC"
+        station_name = str(station["name"]) if station else tr("neznámá observatoř")
+        location_text = tr("poloha není v katalogu MPC")
         if station and "latitude_deg" in station:
             latitude = float(station["latitude_deg"])
             longitude = float(station["longitude_deg"])
@@ -5106,7 +5378,7 @@ class MainWindow(QMainWindow):
                 f"{abs(latitude):.4f}° {'N' if latitude >= 0 else 'S'}, "
                 f"{abs(longitude):.4f}° {'E' if longitude >= 0 else 'W'}"
             )
-        geometry_text = "výška a elongace nejsou dostupné"
+        geometry_text = tr("výška a elongace nejsou dostupné")
         if observation.ra_deg is not None and observation.dec_deg is not None and observation.time:
             try:
                 instant = parse_observation_time(observation.time)
@@ -5115,9 +5387,13 @@ class MainWindow(QMainWindow):
                 )
                 if geometry:
                     geometry_text = (
-                        f"výška objektu {geometry['target_altitude_deg']:+.1f}°   •   "
-                        f"výška Slunce {geometry['sun_altitude_deg']:+.1f}°   •   "
-                        f"elongace {geometry['elongation_deg']:.1f}°"
+                        tr(
+                            "výška objektu {0:+.1f}°   •   výška Slunce {1:+.1f}°   •   elongace "
+                            "{2:.1f}°",
+                            geometry['target_altitude_deg'],
+                            geometry['sun_altitude_deg'],
+                            geometry['elongation_deg'],
+                        )
                     )
             except (ValueError, TypeError):
                 pass
@@ -5126,7 +5402,7 @@ class MainWindow(QMainWindow):
             magnitude += f" {observation.band}"
         exclusion_reason = observation.raw.get("automatic_exclusion_reason")
         exclusion_text = (
-            f"\nAutomaticky vyřazeno: {exclusion_reason}"
+            tr("\nAutomaticky vyřazeno: {0}", exclusion_reason)
             if exclusion_reason else ""
         )
         self.observation_detail.setText(
@@ -5161,13 +5437,15 @@ class MainWindow(QMainWindow):
                 parse_output_epoch(self.fit_output_epoch)
             except ValueError:
                 QMessageBox.warning(
-                    self, "Výstupní epocha",
-                    "Neplatná výstupní epocha. Použijte například 2026, "
-                    "2026-10-18 nebo 2026-10-18 00:00.",
+                    self, tr("Výstupní epocha"),
+                    tr(
+                        "Neplatná výstupní epocha. Použijte například 2026, 2026-10-18 nebo "
+                        "2026-10-18 00:00.",
+                    ),
                 )
                 self.fit_output_epoch = ""
         fitted_ng_names = [
-            name for name in ("A1", "A2", "A3", "DT")
+            name for name in ("A1", "A2", "A3", tr("DT"))
             if name in self.nongravitational_fit
         ]
         count = (
@@ -5176,28 +5454,28 @@ class MainWindow(QMainWindow):
             + int(bool(self.fit_output_epoch))
         )
         self.constraints_button.setText(
-            f"Vlastní nastavení… ({count})" if count else "Vlastní nastavení…"
+            tr("Vlastní nastavení… ({0})", count) if count else tr("Vlastní nastavení…")
         )
         if count:
             fixed = [f"{name}={value:g}" for name, value in self.fit_constraints.items()]
             fitted = [f"fit {name}" for name in fitted_ng_names]
             if "R_EXPONENT" in self.nongravitational_fit:
                 fitted.append(
-                    f"mocninný model m={self.nongravitational_fit['R_EXPONENT']:g}"
+                    tr("mocninný model m={0:g}", self.nongravitational_fit['R_EXPONENT'])
                 )
             dynamics = ["original/future 1/a"] if self.compute_original_future else []
-            epoch = ([f"výstupní epocha {self.fit_output_epoch}"]
+            epoch = ([tr("výstupní epocha {0}", self.fit_output_epoch)]
                      if self.fit_output_epoch else [])
             summary = ", ".join(fixed + fitted + dynamics + epoch)
-            self.statusBar().showMessage(f"Aktivní vlastní nastavení: {summary}", 10000)
+            self.statusBar().showMessage(tr("Aktivní vlastní nastavení: {0}", summary), 10000)
         else:
-            self.statusBar().showMessage("Všech šest elementů je ve vlastním fitu volných.", 6000)
+            self.statusBar().showMessage(tr("Všech šest elementů je ve vlastním fitu volných."), 6000)
 
     def calculate_preliminary_orbit(self) -> None:
         if fit_selection_count(self.current_observations, None) < 3:
             QMessageBox.information(
-                self, "Předběžná dráha",
-                "Pro předběžný výpočet jsou potřeba alespoň tři platná měření.",
+                self, tr("Předběžná dráha"),
+                tr("Pro předběžný výpočet jsou potřeba alespoň tři platná měření."),
             )
             return
         dialog = PreliminaryOrbitDialog(len(self.current_observations), self)
@@ -5207,9 +5485,9 @@ class MainWindow(QMainWindow):
         perihelion_distance = dialog.selected_perihelion_distance()
         self.preliminary_button.setEnabled(False)
         self.fit_button.setEnabled(False)
-        method_text = "systematicky" if method == "systematic" else "Väisälovou metodou"
+        method_text = tr("systematicky") if method == "systematic" else tr("Väisälovou metodou")
         self.statusBar().showMessage(
-            f"Hledám předběžnou dráhu {method_text}; výpočet běží na pozadí…"
+            tr("Hledám předběžnou dráhu {0}; výpočet běží na pozadí…", method_text)
         )
         thread = QThread(self)
         worker = PreliminaryOrbitWorker(
@@ -5237,15 +5515,17 @@ class MainWindow(QMainWindow):
         dialog = PreliminaryOrbitResultDialog(solution, method, assumed_q, self)
         choice = dialog.exec()
         if choice not in (PreliminaryOrbitResultDialog.USE, PreliminaryOrbitResultDialog.REFINE):
-            self.statusBar().showMessage("Předběžné řešení nebylo použito.", 6000)
+            self.statusBar().showMessage(tr("Předběžné řešení nebylo použito."), 6000)
             return
         self.has_orbit = True
         self.ephemeris_panel.use_short_arc_preset()
         self._apply_solution(solution)
         self.object_title.setText(self.current_display_name or solution.designation)
-        method_label = "systematický odhad" if method == "systematic" else "Väisälova hypotéza"
+        method_label = tr("systematický odhad") if method == "systematic" else tr(
+            "Väisälova hypotéza",
+        )
         self.object_label.setText(
-            f"Předběžná dráha z krátkého oblouku • {method_label} • není jednoznačná"
+            tr("Předběžná dráha z krátkého oblouku • {0} • není jednoznačná", method_label)
         )
         self.constraints_button.setEnabled(True)
         for index in range(1, self.tabs.count()):
@@ -5255,13 +5535,15 @@ class MainWindow(QMainWindow):
         else:
             self.tabs.setCurrentIndex(1)
             self.statusBar().showMessage(
-                "Použita předběžná dráha. Efemerida je nastavena po 10 minutách na 48 hodin; "
-                "výsledek může mít velkou a rychle rostoucí nejistotu.", 15000,
+                tr(
+                    "Použita předběžná dráha. Efemerida je nastavena po 10 minutách na 48 "
+                    "hodin; výsledek může mít velkou a rychle rostoucí nejistotu.",
+                ), 15000,
             )
 
     def _preliminary_orbit_failed(self, message: str) -> None:
-        QMessageBox.warning(self, "Předběžná dráha", message)
-        self.statusBar().showMessage("Výpočet předběžné dráhy selhal.", 7000)
+        QMessageBox.warning(self, tr("Předběžná dráha"), message)
+        self.statusBar().showMessage(tr("Výpočet předběžné dráhy selhal."), 7000)
 
     def _preliminary_finished(self) -> None:
         self.preliminary_thread = None
@@ -5278,7 +5560,10 @@ class MainWindow(QMainWindow):
             self._fit_after_orbit_load = True
             self.fit_button.setEnabled(False)
             self.statusBar().showMessage(
-                "Nejprve načítám z MPC počáteční odhad; poté se vlastní fit spustí automaticky…"
+                tr(
+                    "Nejprve načítám z MPC počáteční odhad; poté se vlastní fit spustí "
+                    "automaticky…",
+                )
             )
             self.load_orbit(auto=False)
             return
@@ -5291,9 +5576,9 @@ class MainWindow(QMainWindow):
         truncate_years = self.fit_interval.currentData()
         interval_label = self.fit_interval.currentText().lower()
         mode = f" — {interval_label}"
-        extra = " a následně original/future 1/a" if self.compute_original_future else ""
+        extra = tr(" a následně original/future 1/a") if self.compute_original_future else ""
         self.statusBar().showMessage(
-            f"Počítám vlastní dráhu z astrometrie{mode}{extra}…"
+            tr("Počítám vlastní dráhu z astrometrie{0}{1}…", mode, extra)
         )
         thread = QThread(self)
         worker = OrbitFitWorker(
@@ -5324,9 +5609,10 @@ class MainWindow(QMainWindow):
         progress_dialog.show()
         thread.start()
 
-    def _own_orbit_loaded(self, result: object) -> None:
+    def _own_orbit_loaded(self, payload: object) -> None:
+        result, fitted_observations = payload
         solution, rms, _used = result
-        # The worker fills O-C values directly into the shared observation objects.
+        apply_fitted_observations(self.current_observations, fitted_observations)
         self.observation_model.set_rows(self.current_observations)
         self._refresh_residual_actions()
         self.has_orbit = True
@@ -5343,9 +5629,11 @@ class MainWindow(QMainWindow):
             f"{rms:.1f}″ / {normalized:.2f}σ" if normalized is not None else f"{rms:.2f}″"
         )
         self.rms_metric.setToolTip(
-            "První hodnota je nevážené RMS v obloukových sekundách; druhá zohledňuje "
-            "nejistoty rmsRA/rmsDec uvedené v ADES a částečnou korelaci série "
-            "ze stejné stanice během jedné noci."
+            tr(
+                "První hodnota je nevážené RMS v obloukových sekundách; druhá zohledňuje "
+                "nejistoty rmsRA/rmsDec uvedené v ADES a částečnou korelaci série ze "
+                "stejné stanice během jedné noci.",
+            )
         )
         interval = f" • {self.fit_interval.currentText().lower()}"
         self.object_title.setText(
@@ -5353,24 +5641,29 @@ class MainWindow(QMainWindow):
         )
         count_text = apparition_observation_count_text(solution)
         linkage_text = apparition_linkage_summary(solution)
-        label_parts = ["Vlastní fit"]
+        label_parts = [tr("Vlastní fit")]
         if linkage_text:
             label_parts.append(linkage_text)
         if count_text:
             label_parts.append(count_text)
         self.object_label.setText(" • ".join(label_parts) + interval)
-        weighted_note = f", vážené RMS {normalized:.2f}σ" if normalized is not None else ""
+        weighted_note = tr(", vážené RMS {0:.2f}σ", normalized) if normalized is not None else ""
         dynamics_note = ""
         if solution.dynamical_1a:
             dynamics_note = (
-                "; original/future výpočet se nezdařil"
+                tr("; original/future výpočet se nezdařil")
                 if "error" in solution.dynamical_1a
-                else "; original/future 1/a dopočítáno"
+                else tr("; original/future 1/a dopočítáno")
             )
         linkage_note = f"; {linkage_text.lower()}" if linkage_text else ""
         self.statusBar().showMessage(
-            f"Vlastní dráha dokončena; RMS {rms:.2f} obloukové sekundy"
-            f"{weighted_note}{linkage_note}{dynamics_note}.", 20000
+            tr(
+                "Vlastní dráha dokončena; RMS {0:.2f} obloukové sekundy{1}{2}{3}.",
+                rms,
+                weighted_note,
+                linkage_note,
+                dynamics_note,
+            ), 20000
         )
         failed_linkage = [
             record for record in solution.apparition_linkage or ()
@@ -5380,25 +5673,27 @@ class MainWindow(QMainWindow):
             details = []
             for record in failed_linkage:
                 year = record.get("return_year") or "?"
-                reason = record.get("reason") or "bez podrobností"
-                details.append(f"Návrat {year}: {reason}")
+                reason = record.get("reason") or tr("bez podrobností")
+                details.append(tr("Návrat {0}: {1}", year, reason))
             QMessageBox.warning(
                 self,
-                "Společný dynamický model nepotvrdil všechny návraty",
-                "Výsledná dráha NENÍ společným řešením všech načtených návratů. "
-                "To samo o sobě nevyvrací jejich identitu: příčinou může být "
-                "proměnlivá kometární aktivita nebo nedostatečný silový model.\n\n"
+                tr("Společný dynamický model nepotvrdil všechny návraty"),
+                tr(
+                    "Výsledná dráha NENÍ společným řešením všech načtených návratů. To samo o "
+                    "sobě nevyvrací jejich identitu: příčinou může být proměnlivá kometární "
+                    "aktivita nebo nedostatečný silový model.\n\n",
+                )
                 + "\n".join(details)
-                + "\n\nPodrobný protokol je v záložce Elementy.",
+                + tr("\n\nPodrobný protokol je v záložce Elementy."),
             )
 
     def _own_orbit_failed(self, message: str) -> None:
-        QMessageBox.warning(self, "Výpočet dráhy", message)
-        self.statusBar().showMessage("Vlastní výpočet dráhy selhal.")
+        QMessageBox.warning(self, tr("Výpočet dráhy"), message)
+        self.statusBar().showMessage(tr("Vlastní výpočet dráhy selhal."))
 
     def _own_orbit_cancelled(self) -> None:
         self.statusBar().showMessage(
-            "Výpočet dráhy byl zrušen; předchozí řešení zůstalo zachováno.",
+            tr("Výpočet dráhy byl zrušen; předchozí řešení zůstalo zachováno."),
             10000,
         )
 

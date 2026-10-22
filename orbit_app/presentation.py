@@ -12,28 +12,29 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 
 from .domain import Observation, OrbitSolution
+from .i18n import tr
 from .orbit_engine import MU_SUN
 
 
 SKY_TRACK_HORIZONS = (
-    ("± 30 dní", 30),
-    ("± 60 dní", 60),
-    ("± 100 dní", 100),
-    ("± 150 dní", 150),
-    ("± 200 dní", 200),
-    ("± 300 dní", 300),
-    ("± 600 dní", 600),
-    ("± 2,5 roku", 913),
-    ("± 5 let", 1826),
-    ("± 10 let", 3652),
+    (tr("± 30 dní"), 30),
+    (tr("± 60 dní"), 60),
+    (tr("± 100 dní"), 100),
+    (tr("± 150 dní"), 150),
+    (tr("± 200 dní"), 200),
+    (tr("± 300 dní"), 300),
+    (tr("± 600 dní"), 600),
+    (tr("± 2,5 roku"), 913),
+    (tr("± 5 let"), 1826),
+    (tr("± 10 let"), 3652),
 )
 
 LINKAGE_STATUS_LABELS = {
-    "linked": "společně fitován",
-    "seed_only": "jen samostatný fit",
-    "failed": "společný dynamický model neprošel",
-    "not_attempted": "společný model nezkoušen",
-    "integrated_only": "jen integrovaná předpověď",
+    "linked": tr("společně fitován"),
+    "seed_only": tr("jen samostatný fit"),
+    "failed": tr("společný dynamický model neprošel"),
+    "not_attempted": tr("společný model nezkoušen"),
+    "integrated_only": tr("jen integrovaná předpověď"),
 }
 
 
@@ -100,10 +101,10 @@ def apparition_linkage_summary(solution: OrbitSolution) -> str | None:
         for record in records if record.get("status") == "linked"
     )
     if linked == len(records):
-        return f"NAVÁZÁNO {linked}/{len(records)} návratů ({years})"
+        return tr("NAVÁZÁNO {0}/{1} návratů ({2})", linked, len(records), years)
     if linked >= 2:
-        return f"ČÁSTEČNÝ SPOLEČNÝ FIT {linked}/{len(records)} návratů ({years})"
-    return f"SPOLEČNÝ MODEL NEPOTVRZEN — fit 1/{len(records)} návratů"
+        return tr("ČÁSTEČNÝ SPOLEČNÝ FIT {0}/{1} návratů ({2})", linked, len(records), years)
+    return tr("SPOLEČNÝ MODEL NEPOTVRZEN — fit 1/{0} návratů", len(records))
 
 
 def apparition_observation_count_text(solution: OrbitSolution) -> str:
@@ -112,8 +113,8 @@ def apparition_observation_count_text(solution: OrbitSolution) -> str:
     if used is None:
         return ""
     if available is not None and available > used:
-        return f"{used} reprezentativních z {available} v propojeném oblouku"
-    return f"{used} použitých"
+        return tr("{0} reprezentativních z {1} v propojeném oblouku", used, available)
+    return tr("{0} použitých", used)
 
 
 def perihelion_jd_from_solution(
@@ -225,14 +226,16 @@ def parse_output_epoch(value: str) -> datetime:
             return datetime.strptime(text, date_format)
         except ValueError:
             pass
-    raise ValueError("Neplatná výstupní epocha.")
+    raise ValueError(tr("Neplatná výstupní epocha."))
 
 
 def observations_to_tsv(observations: list[Observation]) -> str:
     """Create a clipboard-friendly astrometry table including both residuals."""
     lines = [
-        "Čas (UTC)\tRA (h m s)\tDec (° ′ ″)\tMag / pásmo\tStanice\t"
-        "Použít\tO−C RA [″]\tO−C Dec [″]\tVe fitu"
+        tr(
+            "Čas (UTC)\tRA (h m s)\tDec (° ′ ″)\tMag / pásmo\tStanice\tPoužít\tO−C RA "
+            "[″]\tO−C Dec [″]\tVe fitu",
+        )
     ]
     for observation in observations:
         magnitude = (
@@ -250,8 +253,8 @@ def observations_to_tsv(observations: list[Observation]) -> str:
             else f"{observation.residual_dec_arcsec:+.3f}"
         )
         used = (
-            "ano" if observation.used_in_fit is True
-            else "ne" if observation.used_in_fit is False else "—"
+            tr("ano") if observation.used_in_fit is True
+            else tr("ne") if observation.used_in_fit is False else "—"
         )
         lines.append("\t".join((
             observation.time or "—",
@@ -261,7 +264,7 @@ def observations_to_tsv(observations: list[Observation]) -> str:
             else format_dec_sexagesimal(observation.dec_deg),
             magnitude,
             observation.station or "—",
-            "ne" if observation.excluded_from_fit else "ano",
+            tr("ne") if observation.excluded_from_fit else tr("ano"),
             residual_ra,
             residual_dec,
             used,

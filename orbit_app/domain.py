@@ -62,6 +62,9 @@ class OrbitSolution:
     apparition_linkage: tuple[dict[str, Any], ...] | None = None
     fit_model_note: str | None = None
     data_source: str = "MPC"
+    # EvolutionResult of the integration made by the fit over the observed
+    # apparitions (orbit_evolution); shown by the Evolution tab without a rerun.
+    observed_evolution: Any = field(default=None, repr=False, compare=False)
 
 
 @dataclass(slots=True)

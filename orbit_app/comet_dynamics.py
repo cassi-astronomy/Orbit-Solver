@@ -4,6 +4,7 @@ import numpy as np
 from scipy.integrate import solve_ivp
 
 from .domain import OrbitSolution
+from .i18n import tr
 from .orbit_engine import MU_SUN, NBodyIntegrator, StateVector
 from .planetary import PLANETS
 
@@ -68,7 +69,7 @@ def _state_at_outbound_boundary(
     boundary_au: float = BOUNDARY_AU,
 ) -> tuple[float, np.ndarray]:
     if direction not in (-1, 1):
-        raise ValueError("Směr integrace musí být -1 nebo +1.")
+        raise ValueError(tr("Směr integrace musí být -1 nebo +1."))
     if np.linalg.norm(state[:3]) >= boundary_au:
         return solution.epoch_jd, np.asarray(state, dtype=float)
 
@@ -102,7 +103,7 @@ def _state_at_outbound_boundary(
     if not result.success:
         raise RuntimeError(result.message)
     if not result.t_events[0].size:
-        raise ValueError(f"Dráha nedosáhla hranice {boundary_au:g} AU.")
+        raise ValueError(tr("Dráha nedosáhla hranice {0:g} AU.", boundary_au))
     offset = float(result.t_events[0][0])
     return solution.epoch_jd + offset, np.asarray(result.y_events[0][0], dtype=float)
 
@@ -126,17 +127,17 @@ def _interpret(value: float, sigma: float | None, incoming: bool) -> str:
     lower = value - 3.0 * sigma if sigma is not None else value
     upper = value + 3.0 * sigma if sigma is not None else value
     if lower <= 0.0 <= upper:
-        return "nerozhodné — interval 3σ protíná parabolickou mez"
+        return tr("nerozhodné — interval 3σ protíná parabolickou mez")
     if upper < 0.0:
         return (
-            "nominálně mezihvězdná příchozí dráha"
-            if incoming else "pravděpodobně opustí Sluneční soustavu"
+            tr("nominálně mezihvězdná příchozí dráha")
+            if incoming else tr("pravděpodobně opustí Sluneční soustavu")
         )
     if incoming and value < 1e-4:
-        return "Oortův oblak; kandidát na dynamicky novou kometu"
+        return tr("Oortův oblak; kandidát na dynamicky novou kometu")
     if incoming:
-        return "vázaná dráha; pravděpodobně již dříve prošla oblastí planet"
-    return "zůstává vázaná a měla by se vrátit"
+        return tr("vázaná dráha; pravděpodobně již dříve prošla oblastí planet")
+    return tr("zůstává vázaná a měla by se vrátit")
 
 
 def analyze_original_future_orbit(
@@ -144,13 +145,17 @@ def analyze_original_future_orbit(
 ) -> dict[str, float | str]:
     """Integrate a comet to the inbound/outbound 250-au barycentric orbits."""
     if solution.position_au is None or solution.velocity_au_per_day is None:
-        raise ValueError("Dráha nemá kartézský stav.")
+        raise ValueError(tr("Dráha nemá kartézský stav."))
     if solution.eccentricity < 1.0 and solution.semi_major_axis_au > 0.0:
         aphelion = solution.semi_major_axis_au * (1.0 + solution.eccentricity)
         if aphelion < boundary_au:
             raise ValueError(
-                f"Vázaná dráha má afel jen {aphelion:.1f} AU a hranice "
-                f"{boundary_au:g} AU proto není pro tuto kometu použitelná."
+                tr(
+                    "Vázaná dráha má afel jen {0:.1f} AU a hranice {1:g} AU proto není pro "
+                    "tuto kometu použitelná.",
+                    aphelion,
+                    boundary_au,
+                )
             )
     state = StateVector(
         solution.epoch_jd,
@@ -165,9 +170,12 @@ def analyze_original_future_orbit(
         "original_interpretation": _interpret(original, None, True),
         "future_interpretation": _interpret(future, None, False),
         "model": (
-            f"N-body model planet ({PLANETS.model_name}); nejistota 1/a se "
-            "nezobrazuje, protože kovariance epochy nebyla propagována přes "
-            "planetární oblast až na hranici; nejde o publikovanou hodnotu MPC/JPL"
+            tr(
+                "N-body model planet ({0}); nejistota 1/a se nezobrazuje, protože "
+                "kovariance epochy nebyla propagována přes planetární oblast až na "
+                "hranici; nejde o publikovanou hodnotu MPC/JPL",
+                PLANETS.model_name,
+            )
         ),
     }
     return result

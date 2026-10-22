@@ -4,9 +4,11 @@ from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import numpy as np
 import requests
 
 from .domain import Observation
+from .i18n import tr
 
 
 AU_KM = 149_597_870.7
@@ -14,6 +16,27 @@ AU_KM = 149_597_870.7
 
 class MpcError(RuntimeError):
     pass
+
+
+def _sexagesimal(field: str, signed: bool) -> tuple[float, float]:
+    """Parse ``hh mm ss.ss`` / ``±dd mm ss.s`` with optional lower precision.
+
+    MPC80 permits historical positions given only to minutes (``00 36.1``
+    or ``+08 37.6``).  Returns the value in hours/degrees and the size of the
+    last published digit in seconds of the same unit.
+    """
+    parts = field.split()
+    if not 2 <= len(parts) <= 3:
+        raise ValueError(field)
+    negative = signed and parts[0].startswith("-")
+    numbers = [abs(float(part)) for part in parts]
+    value = numbers[0] + numbers[1] / 60.0 + (numbers[2] / 3600.0 if len(parts) == 3 else 0.0)
+    if any(not np.isfinite(number) for number in numbers) or numbers[1] >= 60.0:
+        raise ValueError(field)
+    last = parts[-1]
+    decimals = len(last.split(".", 1)[1]) if "." in last else 0
+    quantum = 10.0 ** -decimals * (1.0 if len(parts) == 3 else 60.0)
+    return (-value if negative else value), quantum
 
 
 def parse_mpc80(text: str, fallback_designation: str = "") -> list[Observation]:
@@ -53,27 +76,28 @@ def parse_mpc80(text: str, fallback_designation: str = "") -> list[Observation]:
                 )
             except (TypeError, ValueError, OverflowError) as exc:
                 raise MpcError(
-                    f"Řádek {line_number} není platná druhá část satelitního MPC pozorování."
+                    tr(
+                        "Řádek {0} není platná druhá část satelitního MPC pozorování.",
+                        line_number,
+                    )
                 ) from exc
             continue
         try:
             date_fields = line[15:32].split()
-            ra_fields = line[32:44].split()
-            dec_fields = line[44:56].split()
-            if len(date_fields) != 3 or len(ra_fields) != 3 or len(dec_fields) != 3:
+            if len(date_fields) != 3:
                 raise ValueError
             year, month = int(date_fields[0]), int(date_fields[1])
             decimal_day = float(date_fields[2])
             instant = datetime(year, month, 1, tzinfo=timezone.utc) + timedelta(days=decimal_day - 1.0)
-            ra_deg = 15.0 * (
-                float(ra_fields[0]) + float(ra_fields[1]) / 60.0 + float(ra_fields[2]) / 3600.0
-            )
-            sign = -1.0 if dec_fields[0].startswith("-") else 1.0
-            dec_deg = sign * (
-                abs(float(dec_fields[0])) + float(dec_fields[1]) / 60.0 + float(dec_fields[2]) / 3600.0
-            )
+            ra_hours, ra_quantum_s = _sexagesimal(line[32:44], signed=False)
+            dec_degrees, dec_quantum_arcsec = _sexagesimal(line[44:56], signed=True)
+            ra_deg = 15.0 * ra_hours
+            dec_deg = dec_degrees
         except (TypeError, ValueError, OverflowError) as exc:
-            raise MpcError(f"Řádek {line_number} není platné optické MPC 80-col pozorování.") from exc
+            raise MpcError(tr(
+                "Řádek {0} není platné optické MPC 80-col pozorování.",
+                line_number,
+            )) from exc
         magnitude = None
         try:
             magnitude_text = line[65:70].strip()
@@ -89,7 +113,17 @@ def parse_mpc80(text: str, fallback_designation: str = "") -> list[Observation]:
             magnitude=magnitude,
             band=line[70:71].strip(),
             station=line[77:80].strip() or "500",
-            raw={"mpc80": source, "mpc_note2": note2},
+            # Column 72 is the reference star catalogue (e.g. ``p`` = PPM,
+            # ``q`` = UCAC-4, ``W`` = Gaia DR3); note 2 encodes the technique.
+            catalog=line[71].strip(),
+            raw={
+                "mpc80": source, "mpc_note1": line[13], "mpc_note2": note2,
+                "mpc_catalog": line[71].strip(),
+                # Last published digit (arcsec): historical records are often
+                # rounded to 1 s of RA or 0.1' of Dec.
+                "mpc_ra_quantum_arcsec": 15.0 * ra_quantum_s * float(np.cos(np.radians(dec_deg))),
+                "mpc_dec_quantum_arcsec": dec_quantum_arcsec,
+            },
         )
         observations.append(observation)
         if note2 == "S":
@@ -99,7 +133,10 @@ def parse_mpc80(text: str, fallback_designation: str = "") -> list[Observation]:
         paired = satellite_observations.get(pair_key)
         if paired is None:
             raise MpcError(
-                f"Řádek {line_number} je poloha družice bez odpovídajícího řádku S s RA/Dec."
+                tr(
+                    "Řádek {0} je poloha družice bez odpovídajícího řádku S s RA/Dec.",
+                    line_number,
+                )
             )
         observation, _ = paired
         observation.raw["mpc80_spacecraft"] = source
@@ -108,10 +145,14 @@ def parse_mpc80(text: str, fallback_designation: str = "") -> list[Observation]:
     for pair_key, (_, line_number) in satellite_observations.items():
         if pair_key not in satellite_offsets:
             raise MpcError(
-                f"Satelitní pozorování na řádku {line_number} postrádá druhý řádek s polohou družice."
+                tr(
+                    "Satelitní pozorování na řádku {0} postrádá druhý řádek s polohou "
+                    "družice.",
+                    line_number,
+                )
             )
     if not observations:
-        raise MpcError("Text neobsahuje žádné platné MPC 80-col pozorování.")
+        raise MpcError(tr("Text neobsahuje žádné platné MPC 80-col pozorování."))
     return observations
 
 
@@ -128,7 +169,7 @@ class MpcClient:
     def observations(self, designation: str, confirmation_page: bool = False) -> list[Observation]:
         designation = designation.strip()
         if not designation:
-            raise MpcError("Zadejte označení objektu.")
+            raise MpcError(tr("Zadejte označení objektu."))
         if confirmation_page:
             endpoint = f"{self.BASE_URL}/get-obs-neocp"
             payload = {
@@ -148,11 +189,15 @@ class MpcClient:
             response.raise_for_status()
             body = response.json()
         except (requests.RequestException, ValueError) as exc:
-            raise MpcError(f"MPC dotaz selhal: {exc}") from exc
+            raise MpcError(tr("MPC dotaz selhal: {0}", exc)) from exc
         rows = self._extract_rows(body)
         if not rows:
             area = "NEOCP/PCCP" if confirmation_page else "MPC"
-            raise MpcError(f"Pro objekt „{designation}“ nebyla v {area} nalezena pozorování.")
+            raise MpcError(tr(
+                "Pro objekt „{0}“ nebyla v {1} nalezena pozorování.",
+                designation,
+                area,
+            ))
         return [self._to_observation(row, designation) for row in rows]
 
     @staticmethod
