@@ -19,7 +19,8 @@ from .observatories import (
     station_offsets_gcrs,
 )
 from .orbit_engine import (
-    LONG_ARC_DAYS, MU_SUN, STANDARD_TOLERANCES, NBodyIntegrator, StateVector,
+    DEFAULT_PERTURBERS, LONG_ARC_DAYS, MU_SUN, STANDARD_TOLERANCES, NBodyIntegrator,
+    StateVector,
     tolerances_for_span,
 )
 from .planetary import PLANETS, SplinePlanetEphemeris
@@ -128,6 +129,34 @@ def _dynamics_engine(
     return NBodyIntegrator(
         ephemeris, relative_tolerance=rtol, absolute_tolerance=atol,
         nongravitational_parameters=nongravitational_parameters,
+    )
+
+
+# Earth and Moon are the only perturbers kept in the cheap short-arc models:
+# for a body a few Earth radii to a few lunar distances away (2008 TC3,
+# temporarily captured minimoons) their attraction displaces it by degrees
+# within hours, while the other planets matter only for the final correction.
+_EARTH_MOON_PERTURBERS = tuple(
+    body for body in DEFAULT_PERTURBERS if body.name in ("earth", "moon")
+)
+# Smallest topocentric range (AU) reachable by the systematic range search
+# (about 1.6 Earth radii) and the first node of its coarse grid (about 3.5
+# Earth radii).  2024 BX1, observed until minutes before its impact, was
+# 36 000 km away in the middle of its discovery arc.
+MINIMUM_SEARCH_RANGE_AU = 7e-5
+SEARCH_GRID_START_AU = 1.5e-4
+
+
+def _short_arc_engine(
+    start_jd: float, end_jd: float, relative_tolerance: float, absolute_tolerance: float,
+) -> NBodyIntegrator:
+    """Sun + Earth + Moon over a short arc (TDB JD), for range search/screening."""
+    start = float(min(start_jd, end_jd)) - 2.0
+    end = float(max(start_jd, end_jd)) + 2.0
+    return NBodyIntegrator(
+        _InterpolatedPlanetEphemeris(PLANETS, start, end),
+        perturbers=_EARTH_MOON_PERTURBERS,
+        relative_tolerance=relative_tolerance, absolute_tolerance=absolute_tolerance,
     )
 
 
@@ -598,6 +627,20 @@ def initial_orbit_from_observations(
         except (TypeError, ValueError):
             pass
     else:
+        if reference_row[0].raw.get("observer_position_gcrs_au") is None:
+            # A ground station moves with the Earth's rotation (up to
+            # 0.46 km/s).  Negligible for ordinary ranges, but for a body a
+            # few lunar distances away (2024 BX1, 2008 TC3) it is several per
+            # cent of the topocentric angular motion and the range search would
+            # start degrees away from the astrometry.
+            step_days = 60.0 / 86400.0
+            shifted = [
+                (reference_row[0], reference_row[1] + timedelta(days=sign * step_days),
+                 reference_row[2], reference_row[3])
+                for sign in (-1.0, 1.0)
+            ]
+            behind, ahead = _observation_offsets_gcrs(shifted)
+            observer_velocity = observer_velocity + (ahead - behind) / (2.0 * step_days)
         spacecraft_indices = [
             index for index in local_indices
             if parsed[index][0].raw.get("observer_position_gcrs_au") is not None
@@ -644,12 +687,12 @@ def initial_orbit_from_observations(
     all_dec = np.asarray([item[3] for item in parsed])
     all_sigmas = _observation_sigmas(parsed)
     # Initial range/range-rate search needs only the broad basin of attraction.
-    # Over a short discovery arc a solar two-body model is sufficient and is
-    # far cheaper than evaluating all eight planetary perturbers hundreds of
-    # times.  The final differential correction below still uses the full
-    # N-body model.
-    engine = NBodyIntegrator(
-        PLANETS, perturbers=(), relative_tolerance=2e-9, absolute_tolerance=2e-11
+    # Over a short discovery arc the Sun with Earth and Moon is sufficient and
+    # far cheaper than all planetary perturbers evaluated hundreds of times;
+    # Earth cannot be omitted because very close approachers (2008 TC3) move
+    # on geocentric hyperbolae.  The final correction uses the full model.
+    engine = _short_arc_engine(
+        float(all_epochs[0]) - .1, float(all_epochs[-1]) + .1, 2e-9, 2e-11,
     )
 
     def state_for(parameters: np.ndarray) -> np.ndarray:
@@ -665,8 +708,10 @@ def initial_orbit_from_observations(
         ))
 
     def angular_residual(parameters: np.ndarray) -> np.ndarray:
+        return vector_residual(state_for(parameters))
+
+    def vector_residual(vector: np.ndarray) -> np.ndarray:
         try:
-            vector = state_for(parameters)
             state = StateVector(reference_epoch, vector[:3], vector[3:])
             propagated = engine.propagate(state, sample_epochs)
             light_time = np.linalg.norm(
@@ -685,8 +730,10 @@ def initial_orbit_from_observations(
 
     def full_arc_score(parameters: np.ndarray) -> float:
         """Robust RMS on all rows, used only to rank a few range branches."""
+        return vector_score(state_for(parameters))
+
+    def vector_score(vector: np.ndarray) -> float:
         try:
-            vector = state_for(parameters)
             state = StateVector(reference_epoch, vector[:3], vector[3:])
             propagated = engine.propagate(state, all_epochs)
             light_time = np.linalg.norm(
@@ -714,7 +761,10 @@ def initial_orbit_from_observations(
     seeds: list[tuple[float, np.ndarray]] = []
     raw_range_seeds: list[np.ndarray] = []
     if method == "systematic":
-        for distance in np.geomspace(0.03, 60.0, 14):
+        for distance in np.concatenate((
+            np.geomspace(SEARCH_GRID_START_AU, 0.03, 9, endpoint=False),
+            np.geomspace(0.03, 60.0, 14),
+        )):
             for radial_velocity in (-0.04, 0.0, 0.04):
                 parameters = np.array([np.log(distance), radial_velocity])
                 residual = angular_residual(parameters)
@@ -799,18 +849,51 @@ def initial_orbit_from_observations(
         # Preserve genuinely different range families.  With one global
         # distance bound every trial slid into the same nearest local minimum,
         # so the apparent multi-start search was illusory.
-        distance_lower = max(np.log(.005), float(seed[0]) - .32)
+        distance_lower = max(np.log(MINIMUM_SEARCH_RANGE_AU), float(seed[0]) - .32)
         distance_upper = min(np.log(120.0), float(seed[0]) + .32)
+        # Finite-difference steps must stand well above the integration noise
+        # of the cheap model (~1e-9 AU): with SciPy's default ~1e-8 relative
+        # step a body tens of thousands of km away saw pure noise as slopes.
         result = least_squares(
             search_residual, seed,
             bounds=([distance_lower, -0.12], [distance_upper, 0.12]),
-            loss="soft_l1", f_scale=5.0, max_nfev=24,
+            loss="soft_l1", f_scale=5.0, max_nfev=24, diff_step=1e-4,
         )
         score = full_arc_score(result.x)
         if np.isfinite(score):
             finalists.append((score, result.x.copy()))
         if np.isfinite(score) and (best is None or score < best[0]):
             best = (score, result.x)
+    refined_states: list[tuple[float, np.ndarray]] = []
+    if best is not None and best[0] > 3600.0 and method == "systematic":
+        # The two-parameter model keeps the sky-plane motion of one station
+        # fixed.  For a body a few lunar distances away (2024 BX1 hours
+        # before impact) the track bends so strongly that every such branch
+        # misses by degrees.  Relax all six state components on the sample
+        # (Sun, Earth and Moon) before giving up.
+        for score, parameters in sorted(finalists, key=lambda item: item[0])[:3]:
+            start = state_for(parameters)
+            distance = float(np.exp(parameters[0]))
+            scale = np.concatenate((
+                np.full(3, max(distance * 1e-2, 1e-7)), np.full(3, max(distance * 1e-2, 1e-7)),
+            ))
+            try:
+                refined = least_squares(
+                    lambda values: vector_residual(start + values * scale),
+                    np.zeros(6), loss="soft_l1", f_scale=50.0, max_nfev=70,
+                    x_scale="jac", diff_step=.1,
+                )
+            except (ValueError, FloatingPointError, RuntimeError):
+                continue
+            vector = start + refined.x * scale
+            refined_score = vector_score(vector)
+            if np.isfinite(refined_score) and refined_score < score:
+                refined_states.append((refined_score, vector))
+                if refined_score < 360.0:
+                    break  # a good basin: the full correction does the rest
+        refined_states.sort(key=lambda item: item[0])
+        if refined_states and refined_states[0][0] < best[0]:
+            best = (refined_states[0][0], None)
     if best is None or best[0] > 3600.0:
         raise OrbitFitError(tr(
             "Z astrometrie se nepodařilo sestavit použitelný počáteční odhad dráhy.",
@@ -823,7 +906,9 @@ def initial_orbit_from_observations(
     cometary = is_comet_designation(designation)
 
     def solution_for(parameters: np.ndarray) -> OrbitSolution:
-        vector = state_for(parameters)
+        return solution_for_vector(state_for(parameters))
+
+    def solution_for_vector(vector: np.ndarray) -> OrbitSolution:
         try:
             elements = cartesian_to_elements(vector[:3], vector[3:])
         except Exception as exc:
@@ -844,7 +929,9 @@ def initial_orbit_from_observations(
         )
 
     if return_candidates:
-        candidates: list[OrbitSolution] = []
+        candidates: list[OrbitSolution] = [
+            solution_for_vector(vector) for _score, vector in refined_states
+        ]
         # Retain distinct heliocentric energy/range families, not repeated
         # numerical variants of the same minimum.
         for _, parameters in sorted(finalists, key=lambda item: item[0]):
@@ -867,6 +954,8 @@ def initial_orbit_from_observations(
                 for parameters in sorted(raw_range_seeds, key=full_arc_score)
             )
         return candidates or [solution_for(best[1])]
+    if best[1] is None:
+        return solution_for_vector(refined_states[0][1])
     return solution_for(best[1])
 
 
@@ -979,10 +1068,7 @@ def _fit_orbit_once(
     # polish with the complete model below always follows.
     use_fast_differential_correction = arc_days <= 30.0 and not nongrav_names
     optimizer_engine = (
-        NBodyIntegrator(
-            PLANETS, perturbers=(), relative_tolerance=STANDARD_TOLERANCES[0],
-            absolute_tolerance=STANDARD_TOLERANCES[1],
-        )
+        _short_arc_engine(span_start, span_end, *STANDARD_TOLERANCES)
         if use_fast_differential_correction else full_engine
     )
 

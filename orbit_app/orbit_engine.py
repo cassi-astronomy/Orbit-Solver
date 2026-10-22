@@ -182,6 +182,35 @@ class StateVector:
         return np.concatenate((self.position_au, self.velocity_au_per_day)).astype(float)
 
 
+AU_KM = 149_597_870.7
+
+
+def _body_name(body: str) -> str:
+    names = {
+        "mercury": tr("Merkur"), "venus": tr("Venuše"), "earth": tr("Země"),
+        "moon": tr("Měsíc"), "mars": "Mars", "jupiter": "Jupiter", "saturn": "Saturn",
+        "uranus": tr("Uran"), "neptune": tr("Neptun"), "pluto": "Pluto",
+    }
+    return names.get(body, body)
+
+
+class ImpactDetected(RuntimeError):
+    """The integrated trajectory entered the body of a perturber.
+
+    A point-mass force model is meaningless inside a planet, so integration
+    stops.  ``epoch_jd`` (TDB) is the force evaluation that detected it, which
+    may be an intermediate Runge-Kutta stage; callers needing the precise
+    contact time locate it with an event integration
+    (:mod:`orbit_app.impact`).  Subclassing RuntimeError makes every fitting
+    stage treat such a trial orbit as an invalid point.
+    """
+
+    def __init__(self, body: str, epoch_jd: float) -> None:
+        super().__init__(tr("Trajektorie narazila do tělesa {0}.", _body_name(body)))
+        self.body = body
+        self.epoch_jd = float(epoch_jd)
+
+
 class PlanetEphemeris(Protocol):
     def position(self, body: str, jd: float) -> np.ndarray:
         """Heliocentric position in AU in a consistent inertial frame."""
@@ -191,19 +220,21 @@ class PlanetEphemeris(Protocol):
 class Perturber:
     name: str
     mu_au3_day2: float
+    # Mean (equatorial) radius; a trajectory inside it is a collision.
+    radius_km: float = 0.0
 
 
 DEFAULT_PERTURBERS = (
-    Perturber("mercury", MU_SUN * 1.660120e-7),
-    Perturber("venus", MU_SUN * 2.4478396e-6),
-    Perturber("earth", MU_SUN * 3.0034896e-6),
-    Perturber("moon", MU_SUN * 3.694303e-8),
-    Perturber("mars", MU_SUN * 3.227151e-7),
-    Perturber("jupiter", MU_SUN * 9.547919e-4),
-    Perturber("saturn", MU_SUN * 2.858856e-4),
-    Perturber("uranus", MU_SUN * 4.366244e-5),
-    Perturber("neptune", MU_SUN * 5.151389e-5),
-    Perturber("pluto", MU_SUN * 7.350478973e-9),
+    Perturber("mercury", MU_SUN * 1.660120e-7, 2439.7),
+    Perturber("venus", MU_SUN * 2.4478396e-6, 6051.8),
+    Perturber("earth", MU_SUN * 3.0034896e-6, 6378.137),
+    Perturber("moon", MU_SUN * 3.694303e-8, 1737.4),
+    Perturber("mars", MU_SUN * 3.227151e-7, 3396.19),
+    Perturber("jupiter", MU_SUN * 9.547919e-4, 71492.0),
+    Perturber("saturn", MU_SUN * 2.858856e-4, 60268.0),
+    Perturber("uranus", MU_SUN * 4.366244e-5, 25559.0),
+    Perturber("neptune", MU_SUN * 5.151389e-5, 24764.0),
+    Perturber("pluto", MU_SUN * 7.350478973e-9, 1188.3),
 )
 
 
@@ -243,6 +274,7 @@ class NBodyIntegrator:
         absolute_tolerance: float = 1e-14,
         nongravitational_parameters: dict[str, float] | None = None,
         include_solar_relativity: bool = True,
+        detect_collisions: bool = True,
     ) -> None:
         self.ephemeris = ephemeris
         self.perturbers = perturbers
@@ -252,6 +284,11 @@ class NBodyIntegrator:
         self.include_solar_relativity = bool(include_solar_relativity)
         self._names = tuple(body.name for body in perturbers)
         self._mu = np.asarray([body.mu_au3_day2 for body in perturbers], dtype=float)
+        self.detect_collisions = bool(detect_collisions)
+        self._radius2 = np.asarray(
+            [(body.radius_km / AU_KM) ** 2 for body in perturbers], dtype=float,
+        )
+        self._check_collisions = self.detect_collisions and bool(np.any(self._radius2 > 0.0))
         self._has_nongravitational = any(
             float(self.nongravitational_parameters.get(name, 0.0))
             for name in ("A1", "A2", "A3")
@@ -285,6 +322,17 @@ class NBodyIntegrator:
             relative_tolerance=self.rtol, absolute_tolerance=self.atol,
             nongravitational_parameters=nongravitational_parameters,
             include_solar_relativity=self.include_solar_relativity,
+            detect_collisions=self.detect_collisions,
+        )
+
+    def without_collision_detection(self) -> "NBodyIntegrator":
+        """Same model that keeps integrating inside a body (event searches)."""
+        return NBodyIntegrator(
+            self.ephemeris, perturbers=self.perturbers,
+            relative_tolerance=self.rtol, absolute_tolerance=self.atol,
+            nongravitational_parameters=self.nongravitational_parameters,
+            include_solar_relativity=self.include_solar_relativity,
+            detect_collisions=False,
         )
 
     def _planet_positions(self, jd: float) -> np.ndarray:
@@ -320,6 +368,10 @@ class NBodyIntegrator:
             planets = self._planet_positions(jd)
             relative = planets - position
             distance2 = (relative * relative).sum(axis=1)
+            if self._check_collisions:
+                inside = distance2 < self._radius2
+                if inside.any():
+                    raise ImpactDetected(self._names[int(np.argmax(inside))], jd)
             planet_radius2 = (planets * planets).sum(axis=1)
             valid = (distance2 > 0.0) & (planet_radius2 > 0.0)
             if not np.all(valid):

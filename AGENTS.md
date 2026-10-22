@@ -23,7 +23,9 @@
 - `orbit_app/linkage.py`: linkage of separate apparitions for any object (catalogue shortcut, anchor apparition, line-of-variations branch search, staged joint correction with per-apparition quality gate).
 - `orbit_app/orbit_engine.py`: state vectors, N-body integration, post-Newtonian solar correction, and non-gravitational acceleration laws.
 - `orbit_app/planetary.py`: analytic planetary fallback, optional JPL DE440 provider, and interpolated ephemerides.
-- `orbit_app/orbit_evolution.py`: perihelion returns, planetary encounters, captures, centered solutions, and exports.
+- `orbit_app/orbit_evolution.py`: perihelion returns, planetary encounters, captures, impacts, planet-relation series, centered solutions, and exports.
+- `orbit_app/planet_relations.py`: MOID, Tisserand parameter, period ratio and nodal distances of a heliocentric orbit relative to a planet (JPL mean planetary elements with rates).
+- `orbit_app/impact.py`: precise contact with a planet/the Moon (event integration), Earth entry/surface geographic location (WGS84, Astropy GCRS→ITRS), Monte Carlo uncertainty from the fit covariance.
 - `orbit_app/comet_dynamics.py`: original/future barycentric comet-orbit analysis.
 - `orbit_app/observatories.py`: MPC observatory catalogue, topocentric geometry, time scales, and horizontal coordinates.
 - `orbit_app/presentation.py`: deterministic formatting, report summaries, and plotting projections with no Qt/Matplotlib dependency.
@@ -34,6 +36,7 @@
 - `tests/data/`: small checked-in test fixtures.
 - `tests/test_linkage.py`: time scales, astrometric metadata, engine accuracy profiles, and an end-to-end synthetic linkage.
 - `tests/test_i18n.py`: catalogue consistency, coverage of every literal `tr()` template, language switching and the English default.
+- `tests/test_planet_relations.py`: MOID/Tisserand/resonance geometry, collision detection, geodetic round trip, 2008 TC3 impact vs. JPL (skipped without DE440), near-Earth range search, planetocentric-view gating.
 - `tests/test_mpc_cache.py`: cache round trip, normalization, damaged files, and the GUI cache/update paths.
 - `diagnose_78p.py`: focused developer diagnostic for comet 78P; not part of the normal application entry path.
 
@@ -122,6 +125,10 @@ formatter or static type checker; do not claim those checks passed.
 - A linked apparition must fit its own astrometry (`LINKAGE_ACCEPT_NORMALIZED_RMS`); joining it may move already linked apparitions only up to `LINKAGE_TENSION_NORMALIZED_RMS`, and such model tension must be reported, not hidden. Automatic rejection is bounded (`MAXIMUM_REJECTED_FRACTION_*`) and only allowed where most rows already fit; never rescue a wrong branch by discarding data.
 - Staged linkage corrections fit a representative sample and refresh O-C only on those rows. `_Linker.fit_once()` clears all O-C first; quality gates and rejection must never read O-C left behind by another trial orbit (this once made correctly joined 78P returns look 66″ off).
 - A return that fails to link is retried once after the set of linked returns has changed (it may then lie between linked returns); keep this bounded to one retry per return.
+- Every `NBodyIntegrator` raises `ImpactDetected` (a `RuntimeError`) when a force evaluation falls inside a perturber's radius (`Perturber.radius_km`): fitting stages treat such a trial orbit as invalid, the evolution locates the contact with `impact.locate_impact()` and ends the integration there. Use `without_collision_detection()` only for event searches.
+- After every own fit `impact.imminent_impact()` checks `IMPACT_CHECK_DAYS`; the prediction is stored in `OrbitSolution.impact` and shown by the Elements banner/report and a dialog. Preview propagation (`preview_orbit._propagate_until_collision`) returns NaN after an impact; every panel must handle NaN positions instead of raising.
+- Short-arc models (range search, fast correction) must keep Earth and Moon (`_short_arc_engine`); a pure two-body solar model cannot fit objects within a few lunar distances. The range search covers `MINIMUM_SEARCH_RANGE_AU` (≈1.6 Earth radii), adds the ground station's rotational velocity, and uses finite-difference steps (`diff_step`) well above the cheap model's integration noise; never return to SciPy's default relative step there.
+- Planetocentric osculating elements are offered only where the body is bound to the planet (`bound_centers`, capture intervals); for heliocentric bodies use the planet-relation quantities instead.
 - Apparition grouping (`_observing_apparition_groups`) uses observing gaps, never extrapolated perihelion times; a block longer than `MAXIMUM_APPARITION_SPAN_PERIODS` is split at its longest gap.
 - ADES field names are case-insensitive (the MPC service returns lower case, e.g. `astcat`, `permid`); read them through `MpcClient._first()` or a case-folded lookup.
 - Observation times before 1960 are UT; use `observatories.dynamical_jd()` (ΔT) rather than Astropy's UTC fallback. Never use Unix timestamps (`datetime.timestamp()`/`fromtimestamp()`) for observation epochs: they fail on Windows before 1970. Use `astrometry.seconds_since_j2000()`.

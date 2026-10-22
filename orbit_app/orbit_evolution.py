@@ -6,12 +6,17 @@ import re
 
 import numpy as np
 
+from scipy.optimize import minimize_scalar
+
 from .domain import OrbitSolution, is_comet_designation
 from .i18n import tr
+from .impact import ImpactPrediction, describe_impact, impact_uncertainty, locate_impact
 from .mpc_orbit import cartesian_to_elements
 from .orbit_engine import (
-    DEFAULT_PERTURBERS, MU_SUN, NBodyIntegrator, StateVector, tolerances_for_span,
+    AU_KM, DEFAULT_PERTURBERS, MU_SUN, ImpactDetected, NBodyIntegrator, StateVector,
+    tolerances_for_span,
 )
+from .planet_relations import planet_relation
 from .planetary import PLANETS, SplinePlanetEphemeris
 
 
@@ -28,6 +33,8 @@ PLANET_LABELS = {
     "jupiter": "Jupiter", "saturn": "Saturn", "uranus": tr("Uran"), "neptune": tr("Neptun"),
 }
 PLANET_MU = {item.name: item.mu_au3_day2 for item in DEFAULT_PERTURBERS}
+# Bodies that can be hit (impact reports); the Moon is a perturber too.
+BODY_LABELS = {**PLANET_LABELS, "moon": tr("Měsíc"), "pluto": "Pluto"}
 ELEMENT_CENTERS = (("sun", tr("Slunce")),) + tuple(PLANET_LABELS.items())
 
 
@@ -54,6 +61,13 @@ class PlanetEncounter:
     hill_radii: float
     relative_velocity_kms: float
     delta_reciprocal_a: float | None
+    # Hyperbolic excess speed relative to the planet (two-body estimate from
+    # the speed at closest approach); None for a planet-bound pass.
+    v_infinity_kms: float | None = None
+    # Change of the Tisserand parameter and of the MOID with respect to the
+    # same planet across the encounter (states before/after).
+    delta_tisserand: float | None = None
+    delta_moid_au: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +108,12 @@ class EvolutionResult:
     trajectory_epochs: np.ndarray | None = field(default=None, repr=False, compare=False)
     trajectory_states: np.ndarray | None = field(default=None, repr=False, compare=False)
     captures: tuple[CaptureInterval, ...] = field(default_factory=tuple)
+    # Collisions with a planet or the Moon; the integration ends there.
+    impacts: tuple[ImpactPrediction, ...] = field(default_factory=tuple)
+    # Heliocentric distance series to each planet at ``trajectory_epochs``.
+    planet_distances: dict[str, np.ndarray] = field(
+        default_factory=dict, repr=False, compare=False,
+    )
 
 
 def planet_velocity(body: str, epoch_jd: float, step_days: float = .02) -> np.ndarray:
@@ -190,7 +210,8 @@ def format_evolution_report(
         tr(
             "Typ\tDatum UTC\tFáze / návrat / planeta\tq [AU]\te\ta [AU]\tP [roky]\t1/a "
             "[AU^-1]\ti [deg]\tOmega [deg]\tomega [deg]\tVzdálenost [AU]\tHillovy "
-            "poloměry\tv rel. [km/s]\tDelta(1/a) [AU^-1]",
+            "poloměry\tv rel. [km/s]\tDelta(1/a) [AU^-1]\tv_inf [km/s]\tDelta T\t"
+            "Delta MOID [AU]",
         ),
     ]
     events: list[tuple[float, int, EvolutionReturn | EvolutionSnapshot | PlanetEncounter]] = []
@@ -221,6 +242,11 @@ def format_evolution_report(
                     item.relative_velocity_kms,
                     delta,
                 )
+                + "\t" + "\t".join((
+                    "" if item.v_infinity_kms is None else f"{item.v_infinity_kms:.5f}",
+                    "" if item.delta_tisserand is None else f"{item.delta_tisserand:+.6f}",
+                    "" if item.delta_moid_au is None else f"{item.delta_moid_au:+.9f}",
+                ))
             )
     if not events:
         lines.append(tr("Žádné perihelové průchody ani planetární setkání nebyly nalezeny."))
@@ -237,6 +263,8 @@ def format_evolution_report(
                     capture.minimum_hill_radii,
                 )
             )
+    for impact in result.impacts:
+        lines.extend(("", describe_impact(impact, BODY_LABELS.get(impact.body, impact.body))))
     lines.extend(("", tr("Vytvořeno programem Orbit Solver 1.0 — Martin Mašek")))
     return "\n".join(lines) + "\n"
 
@@ -366,6 +394,11 @@ def format_evolution_mpc_report(
                     delta,
                 )
             )
+    for impact in result.impacts:
+        lines.extend(
+            "# " + line
+            for line in describe_impact(impact, BODY_LABELS.get(impact.body, impact.body)).split("\n")
+        )
     for capture in result.captures:
         lines.append(
             tr(
@@ -530,6 +563,40 @@ def _states_near_samples(
     return output
 
 
+def _closest_approach_time(
+    engine: NBodyIntegrator, epochs: np.ndarray, states: np.ndarray,
+    distances: np.ndarray, index: int, planet: str,
+) -> float:
+    """Epoch (TDB) of minimum distance to ``planet`` around sample ``index``.
+
+    The sampled distances only bracket the encounter: a flyby lasting hours
+    is far shorter than the sample step, so a parabola through three samples
+    can miss the minimum by a large margin.  A bounded 1-D search with
+    integrations from the bracketing sample gives the actual minimum.
+    """
+    if index <= 0 or index >= len(epochs) - 1:
+        return float(epochs[index])
+    start = StateVector(float(epochs[index - 1]), states[index - 1, :3], states[index - 1, 3:])
+
+    def distance(epoch: float) -> float:
+        try:
+            state = engine.propagate(start, np.array([epoch]))[0]
+        except ImpactDetected:
+            return 0.0
+        return float(np.linalg.norm(state[:3] - PLANETS.position(planet, epoch)))
+
+    try:
+        result = minimize_scalar(
+            distance, bounds=(float(epochs[index - 1]), float(epochs[index + 1])),
+            method="bounded", options={"xatol": 1e-6},
+        )
+    except (RuntimeError, ValueError, FloatingPointError):
+        return _parabolic_vertex_time(epochs, distances, index)
+    if not np.isfinite(result.x) or result.fun > float(distances[index]) * (1.0 + 1e-9):
+        return _parabolic_vertex_time(epochs, distances, index)
+    return float(result.x)
+
+
 def perihelion_returns_between(
     solution: OrbitSolution, start_jd: float, end_jd: float,
     *, maximum_samples: int = 40001,
@@ -594,11 +661,33 @@ def calculate_orbit_evolution_between(
         desired_step = float(np.clip(period_days / 360.0, .25, 5.0))
     else:
         desired_step = 2.0
-    sample_count = min(maximum_samples, max(401, int(np.ceil(span_days / desired_step)) + 1))
-    sample_epochs = np.linspace(start_jd, end_jd, sample_count)
-    sample_step = float(sample_epochs[1] - sample_epochs[0])
     engine = _evolution_engine(solution, start_jd, end_jd)
-    states = engine.propagate(initial, sample_epochs)
+    impacts: list[ImpactPrediction] = []
+    while True:
+        sample_count = min(
+            maximum_samples, max(401, int(np.ceil((end_jd - start_jd) / desired_step)) + 1),
+        )
+        sample_epochs = np.linspace(start_jd, end_jd, sample_count)
+        sample_step = float(sample_epochs[1] - sample_epochs[0])
+        try:
+            states = engine.propagate(initial, sample_epochs)
+            break
+        except ImpactDetected as hit:
+            # A point-mass model is meaningless inside a planet: locate the
+            # contact and end the integration there (one end per direction).
+            if len(impacts) >= 2:
+                raise
+            prediction = locate_impact(engine, initial, hit.body, hit.epoch_jd)
+            if prediction is None:
+                raise
+            impacts.append(prediction)
+            boundary = (prediction.entry or prediction.surface).epoch_jd
+            if prediction.forward:
+                end_jd = min(end_jd, boundary - 1e-6)
+            else:
+                start_jd = max(start_jd, boundary + 1e-6)
+            if end_jd - start_jd < 1e-3:
+                raise
 
     radius = np.linalg.norm(states[:, :3], axis=1)
     minima = np.flatnonzero((radius[1:-1] < radius[:-2]) & (radius[1:-1] <= radius[2:])) + 1
@@ -616,9 +705,11 @@ def calculate_orbit_evolution_between(
 
     encounters: list[PlanetEncounter] = []
     captures: list[CaptureInterval] = []
+    planet_distances: dict[str, np.ndarray] = {}
     for planet, hill_radius in (HILL_RADII_AU.items() if include_encounters else ()):
         planet_positions = np.asarray(PLANETS.position_series(planet, sample_epochs), dtype=float)
         distances = np.linalg.norm(states[:, :3] - planet_positions, axis=1)
+        planet_distances[planet] = distances
         planet_velocities = np.gradient(planet_positions, sample_epochs, axis=0)
         relative_velocities = states[:, 3:] - planet_velocities
         specific_energy = (
@@ -647,7 +738,9 @@ def calculate_orbit_evolution_between(
             & (distances[1:-1] < 3.0 * hill_radius)
         ) + 1
         for sample_index in candidate_indices:
-            encounter_jd = _parabolic_vertex_time(sample_epochs, distances, int(sample_index))
+            encounter_jd = _closest_approach_time(
+                engine, sample_epochs, states, distances, int(sample_index), planet,
+            )
             influence_window = max(30.0, 3.0 * sample_step)
             evaluation = np.array([
                 encounter_jd - influence_window, encounter_jd, encounter_jd + influence_window,
@@ -668,12 +761,32 @@ def calculate_orbit_evolution_between(
             delta_1a = None
             if before != 0.0 and after != 0.0 and np.isfinite(before + after):
                 delta_1a = float(1.0 / after - 1.0 / before)
+            excess2 = relative_velocity ** 2 - 2.0 * PLANET_MU[planet] / max(separation, 1e-15)
+            delta_tisserand = delta_moid = None
+            try:
+                relation_before = planet_relation(encounter_states[0], planet, evaluation[0])
+                relation_after = planet_relation(encounter_states[2], planet, evaluation[2])
+                delta_tisserand = relation_after.tisserand - relation_before.tisserand
+                delta_moid = relation_after.moid_au - relation_before.moid_au
+            except (ValueError, FloatingPointError):
+                pass
             encounters.append(PlanetEncounter(
                 epoch_jd=float(encounter_jd), planet=planet,
                 distance_au=separation,
                 hill_radii=float(separation / hill_radius),
-                relative_velocity_kms=float(relative_velocity * 149597870.7 / 86400.0),
+                relative_velocity_kms=float(relative_velocity * AU_KM / 86400.0),
                 delta_reciprocal_a=delta_1a,
+                v_infinity_kms=(
+                    float(np.sqrt(excess2) * AU_KM / 86400.0) if excess2 > 0.0 else None
+                ),
+                delta_tisserand=(
+                    float(delta_tisserand) if delta_tisserand is not None
+                    and np.isfinite(delta_tisserand) else None
+                ),
+                delta_moid_au=(
+                    float(delta_moid) if delta_moid is not None and np.isfinite(delta_moid)
+                    else None
+                ),
             ))
     encounters.sort(key=lambda item: item.epoch_jd)
     # Keep the complete integrated trajectory for the Solar System animation,
@@ -729,7 +842,122 @@ def calculate_orbit_evolution_between(
         trajectory_epochs=np.asarray(sample_epochs, dtype=float),
         trajectory_states=np.asarray(states, dtype=float),
         captures=tuple(sorted(captures, key=lambda item: item.start_jd)),
+        impacts=tuple(impacts),
+        planet_distances=planet_distances,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class PlanetRelationSeries:
+    """Relation of an integrated orbit to one planet (see planet_relations)."""
+    planet: str
+    epochs: np.ndarray            # TDB JD of the osculating timeline
+    tisserand: np.ndarray
+    period_ratio: np.ndarray
+    ascending_node_au: np.ndarray
+    descending_node_au: np.ndarray
+    relative_inclination_deg: np.ndarray
+    moid_epochs: np.ndarray       # MOID is costlier: a representative subset
+    moid_au: np.ndarray
+    events: tuple                 # PlanetRelation for each return / phase
+
+
+MAXIMUM_MOID_POINTS = 300
+
+
+def planet_relation_series(
+    result: EvolutionResult, planet: str, cancel_callback=None,
+) -> PlanetRelationSeries:
+    """Tisserand, period ratio, nodes and MOID along the integrated orbit."""
+    timeline = result.timeline
+    epochs = np.array([item.epoch_jd for item in timeline], dtype=float)
+    columns: list[list[float]] = [[], [], [], [], []]
+    for item in timeline:
+        try:
+            relation = planet_relation(item.state, planet, item.epoch_jd, include_moid=False)
+            values = (
+                relation.tisserand, relation.period_ratio,
+                relation.ascending_node_distance_au, relation.descending_node_distance_au,
+                relation.relative_inclination_deg,
+            )
+        except (ValueError, FloatingPointError):
+            values = (np.nan,) * 5
+        for column, value in zip(columns, values):
+            column.append(value)
+    subset = (
+        np.unique(np.linspace(0, len(timeline) - 1, MAXIMUM_MOID_POINTS).astype(int))
+        if len(timeline) > MAXIMUM_MOID_POINTS else np.arange(len(timeline))
+    )
+    moid = []
+    for index in subset:
+        if cancel_callback is not None and cancel_callback():
+            raise RuntimeError("cancelled")
+        try:
+            moid.append(planet_relation(
+                timeline[index].state, planet, timeline[index].epoch_jd,
+            ).moid_au)
+        except (ValueError, FloatingPointError):
+            moid.append(np.nan)
+    events = []
+    for item in (result.snapshots or result.returns):
+        try:
+            events.append(planet_relation(item.state, planet, item.epoch_jd))
+        except (ValueError, FloatingPointError):
+            events.append(None)
+    return PlanetRelationSeries(
+        planet=planet, epochs=epochs,
+        tisserand=np.asarray(columns[0]), period_ratio=np.asarray(columns[1]),
+        ascending_node_au=np.asarray(columns[2]), descending_node_au=np.asarray(columns[3]),
+        relative_inclination_deg=np.asarray(columns[4]),
+        moid_epochs=epochs[subset] if len(epochs) else epochs,
+        moid_au=np.asarray(moid, dtype=float), events=tuple(events),
+    )
+
+
+def bound_centers(solution: OrbitSolution) -> tuple[str, ...]:
+    """Planets to which the state is gravitationally bound inside the Hill sphere.
+
+    Only for these do planetocentric osculating elements describe a real
+    orbit (SL9 around Jupiter, a temporarily captured minimoon).
+    """
+    if solution.position_au is None or solution.velocity_au_per_day is None:
+        return ()
+    position = np.asarray(solution.position_au, dtype=float)
+    velocity = np.asarray(solution.velocity_au_per_day, dtype=float)
+    centers = []
+    for planet, hill_radius in HILL_RADII_AU.items():
+        try:
+            relative = position - PLANETS.position(planet, solution.epoch_jd)
+            relative_velocity = velocity - planet_velocity(planet, solution.epoch_jd)
+        except (ValueError, RuntimeError):
+            continue
+        distance = float(np.linalg.norm(relative))
+        energy = .5 * float(relative_velocity @ relative_velocity) - PLANET_MU[planet] / distance
+        if distance <= hill_radius and energy < 0.0:
+            centers.append(planet)
+    return tuple(centers)
+
+
+def with_impact_uncertainties(
+    solution: OrbitSolution, result: EvolutionResult, cancel_callback=None,
+) -> EvolutionResult:
+    """Add the Monte Carlo spread of every detected impact (fit covariance)."""
+    if not result.impacts or solution.state_covariance is None:
+        return result
+    updated = []
+    for prediction in result.impacts:
+        engine = _evolution_engine(
+            solution, min(solution.epoch_jd, prediction.surface.epoch_jd),
+            max(solution.epoch_jd, prediction.surface.epoch_jd),
+        )
+        try:
+            uncertainty = impact_uncertainty(
+                solution, engine, prediction, cancel_callback=cancel_callback,
+            )
+        except (RuntimeError, ValueError, FloatingPointError, np.linalg.LinAlgError):
+            uncertainty = None
+        updated.append(replace(prediction, uncertainty=uncertainty))
+    return replace(result, impacts=tuple(updated))
 
 
 def return_solution(source: OrbitSolution, item: EvolutionReturn) -> OrbitSolution:

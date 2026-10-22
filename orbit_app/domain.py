@@ -65,6 +65,9 @@ class OrbitSolution:
     # EvolutionResult of the integration made by the fit over the observed
     # apparitions (orbit_evolution); shown by the Evolution tab without a rerun.
     observed_evolution: Any = field(default=None, repr=False, compare=False)
+    # impact.ImpactPrediction when the fitted orbit hits a planet or the Moon
+    # within impact.IMPACT_CHECK_DAYS after the epoch (checked after a fit).
+    impact: Any = field(default=None, repr=False, compare=False)
 
 
 @dataclass(slots=True)

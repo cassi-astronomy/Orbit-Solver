@@ -9,8 +9,8 @@ import numpy as np
 from .domain import OrbitSolution
 from .i18n import tr
 from .observatories import dynamical_jd
-from .orbit_engine import NBodyIntegrator, StateVector
-from .planetary import PLANETS
+from .orbit_engine import ImpactDetected, NBodyIntegrator, StateVector
+from .planetary import PLANETS, SplinePlanetEphemeris
 
 GAUSSIAN_K = 0.01720209895  # rad/day
 J2000_JD = 2451545.0
@@ -25,7 +25,121 @@ _NBODY_CACHE_LOCK = Lock()
 _NBODY_CACHE_LIMIT = 8
 
 
+_PREVIEW_BODIES = (
+    "mercury", "venus", "earth", "moon", "mars",
+    "jupiter", "saturn", "uranus", "neptune", "pluto",
+)
+# Interpolated planet positions for the perturbing forces (the observer and
+# the Earth in the sky geometry are always read from the kernel directly).
+# Same caches as the fit: 3-hour nodes within two years, daily nodes up to
+# 400 years; longer spans read the kernel at every step.
+_PREVIEW_EPHEMERIS: list = []
+_PREVIEW_EPHEMERIS_LOCK = Lock()
+
+
+def _preview_ephemeris(start_jd: float, end_jd: float):
+    span = float(end_jd - start_jd)
+    if span > 400.0 * 365.25:
+        return PLANETS
+    step = .125 if span <= 730.0 else 1.0
+    key = (id(PLANETS.jpl), PLANETS.model_name)
+    with _PREVIEW_EPHEMERIS_LOCK:
+        for item in _PREVIEW_EPHEMERIS:
+            if item[0] == key and item[1] <= start_jd and item[2] >= end_jd and item[3] <= step:
+                return item[4]
+    padding = max(30.0, .25 * span)
+    ephemeris = SplinePlanetEphemeris(
+        PLANETS, _PREVIEW_BODIES, start_jd - padding, end_jd + padding, step,
+    )
+    with _PREVIEW_EPHEMERIS_LOCK:
+        _PREVIEW_EPHEMERIS.insert(0, (key, start_jd - padding, end_jd + padding, step, ephemeris))
+        del _PREVIEW_EPHEMERIS[3:]
+    return ephemeris
+
+
+def _propagate_until_collision(
+    engine: NBodyIntegrator, start: StateVector, epochs: np.ndarray,
+    contacts: dict[str, float] | None = None,
+) -> np.ndarray:
+    """States at ``epochs``; rows after a collision with a planet are NaN.
+
+    A body that hits the Earth (2008 TC3) has no position afterwards.  Each
+    direction from ``start`` is integrated separately (a collision ends only
+    one of them); after a detection the contact time is located once with an
+    event integration and the epochs before it are integrated once more.
+    """
+    from .impact import locate_impact
+
+    states = np.full((len(epochs), 6), np.nan, dtype=float)
+    for indices in (
+        np.flatnonzero(epochs < start.epoch_jd), np.flatnonzero(epochs >= start.epoch_jd),
+    ):
+        if not indices.size:
+            continue
+        try:
+            states[indices] = engine.propagate(start, epochs[indices])
+            continue
+        except ImpactDetected as hit:
+            try:
+                prediction = locate_impact(engine, start, hit.body, hit.epoch_jd)
+            except (RuntimeError, ValueError, FloatingPointError):
+                prediction = None
+            contact = prediction.surface.epoch_jd if prediction is not None else hit.epoch_jd
+        forward = epochs[indices[0]] >= start.epoch_jd
+        if contacts is not None:
+            contacts["forward" if forward else "backward"] = float(contact)
+        usable = indices[
+            (epochs[indices] < contact) if forward else (epochs[indices] > contact)
+        ]
+        if usable.size:
+            try:
+                states[usable] = engine.propagate(start, epochs[usable])
+            except ImpactDetected:
+                pass
+    return states
+
+
+# Known collision epochs per solution: the animation asks for one instant per
+# frame, and re-detecting the same impact every frame cost a second each.
+_COLLISIONS: dict[int, tuple[OrbitSolution, float, float]] = {}
+
+
+def _known_collisions(solution: OrbitSolution) -> tuple[float, float]:
+    """(forward, backward) TDB epochs beyond which the body does not exist."""
+    with _NBODY_CACHE_LOCK:
+        entry = _COLLISIONS.get(id(solution))
+        if entry is not None and entry[0] is solution:
+            return entry[1], entry[2]
+    forward, backward = np.inf, -np.inf
+    prediction = getattr(solution, "impact", None)
+    if prediction is not None:
+        forward = float(prediction.surface.epoch_jd)
+    return forward, backward
+
+
+def _remember_collisions(solution: OrbitSolution, contacts: dict[str, float]) -> None:
+    forward, backward = _known_collisions(solution)
+    forward = min(forward, contacts.get("forward", np.inf))
+    backward = max(backward, contacts.get("backward", -np.inf))
+    with _NBODY_CACHE_LOCK:
+        _COLLISIONS[id(solution)] = (solution, forward, backward)
+        while len(_COLLISIONS) > _NBODY_CACHE_LIMIT:
+            _COLLISIONS.pop(next(iter(_COLLISIONS)))
+
+
 def _cached_nbody_states(solution: OrbitSolution, epochs: np.ndarray) -> np.ndarray:
+    forward_contact, backward_contact = _known_collisions(solution)
+    existing = (epochs < forward_contact) & (epochs > backward_contact)
+    if not np.all(existing):
+        # No position after a known impact: answer without integrating.
+        states = np.full((len(epochs), 6), np.nan, dtype=float)
+        if np.any(existing):
+            states[existing] = _cached_nbody_states_alive(solution, epochs[existing])
+        return states
+    return _cached_nbody_states_alive(solution, epochs)
+
+
+def _cached_nbody_states_alive(solution: OrbitSolution, epochs: np.ndarray) -> np.ndarray:
     key = id(solution)
     with _NBODY_CACHE_LOCK:
         entry = _NBODY_CACHE.get(key)
@@ -41,19 +155,27 @@ def _cached_nbody_states(solution: OrbitSolution, epochs: np.ndarray) -> np.ndar
 
     centre = float((epochs[0] + epochs[-1]) / 2.0)
     base_index = int(np.argmin(np.abs(cached_epochs - centre)))
+    base_epoch = float(cached_epochs[base_index])
     engine = NBodyIntegrator(
-        PLANETS,
+        _preview_ephemeris(
+            min(base_epoch, float(epochs[0])) - 1.0, max(base_epoch, float(epochs[-1])) + 1.0,
+        ),
         nongravitational_parameters=solution.nongravitational_parameters,
     )
-    states = engine.propagate(
+    contacts: dict[str, float] = {}
+    states = _propagate_until_collision(
+        engine,
         StateVector(
             float(cached_epochs[base_index]),
             cached_states[base_index, :3], cached_states[base_index, 3:],
         ),
-        epochs,
+        epochs, contacts,
     )
-    merged_epochs = np.concatenate((cached_epochs, epochs))
-    merged_states = np.vstack((cached_states, states))
+    if contacts:
+        _remember_collisions(solution, contacts)
+    finite = np.all(np.isfinite(states), axis=1)
+    merged_epochs = np.concatenate((cached_epochs, epochs[finite]))
+    merged_states = np.vstack((cached_states, states[finite]))
     order = np.argsort(merged_epochs)
     merged_epochs = merged_epochs[order]
     merged_states = merged_states[order]
@@ -158,12 +280,15 @@ def heliocentric_xyz(solution: OrbitSolution, jd: np.ndarray) -> np.ndarray:
         # A Keplerian preview would discard planetary perturbations and, when
         # present, A1/A2/A3/DT.  Cache the full integration because all preview
         # panels normally ask for overlapping epochs.
-        order = np.argsort(epochs)
-        sorted_epochs = epochs[order]
-        states = _cached_nbody_states(solution, sorted_epochs)
-        inverse = np.empty_like(order)
-        inverse[order] = np.arange(len(order))
-        return states[inverse, :3]
+        # Non-finite epochs (a light-time iteration after an impact) have
+        # no position either.
+        result = np.full((epochs.size, 3), np.nan, dtype=float)
+        finite = np.flatnonzero(np.isfinite(epochs))
+        if not finite.size:
+            return result
+        order = finite[np.argsort(epochs[finite])]
+        result[order] = _cached_nbody_states(solution, epochs[order])[:, :3]
+        return result
     if e < 1.0 and a > 0.0:
         n = GAUSSIAN_K / (a ** 1.5)
         mean = np.radians(solution.mean_anomaly_deg) + n * (epochs - solution.epoch_jd)

@@ -5,6 +5,7 @@ import os
 import json
 import re
 import hashlib
+import html
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -83,12 +84,15 @@ from .orbit_fit import (
 )
 from .orbit_engine import MU_SUN, NBodyIntegrator, StateVector
 from .orbit_evolution import (
-    ELEMENT_CENTERS, LONG_EVOLUTION_YEARS, EvolutionResult, HILL_RADII_AU,
-    PLANET_LABELS, PLANET_MU, approximate_year, clip_span_to_coverage,
+    BODY_LABELS, ELEMENT_CENTERS, LONG_EVOLUTION_YEARS, EvolutionResult, HILL_RADII_AU,
+    PLANET_LABELS, PLANET_MU, approximate_year, bound_centers, clip_span_to_coverage,
+    planet_relation_series, with_impact_uncertainties,
     calculate_orbit_evolution, centered_snapshot, centered_solution, evolution_span,
     usable_coverage,
     format_evolution_mpc_report, format_evolution_report, return_solution,
 )
+from .impact import IMPACT_CHECK_DAYS, describe_impact, imminent_impact
+from .planet_relations import RELATION_PLANETS, nearby_resonances, planet_period_years
 from .planetary import DE440_MD5, DE440_URL, PLANETS, de440_path
 from .photometry import estimate_absolute_magnitude, hg_phase_correction, power_law_magnitude
 from .presentation import (
@@ -736,6 +740,22 @@ class OrbitFitWorker(QObject):
                     raise OrbitFitCancelled()
                 solution = replace(solution, dynamical_1a=analysis)
                 result = (solution, result[1], result[2])
+            # Formal collision check: does the fitted orbit hit a planet or
+            # the Moon within the next year?  (Longer horizons: Orbit evolution.)
+            self.progress.emit(
+                tr("Kontroluji, zda dráha nevede ke srážce s planetou…"), 0, 0,
+            )
+            try:
+                prediction = imminent_impact(
+                    solution, cancel_callback=self.is_cancel_requested,
+                )
+            except (ValueError, RuntimeError, FloatingPointError, OverflowError):
+                prediction = None
+            if self.is_cancel_requested():
+                raise OrbitFitCancelled()
+            if prediction is not None:
+                solution = replace(solution, impact=prediction)
+                result = (solution, result[1], result[2])
             if (
                 solution.nongravitational_parameters
                 and solution.position_au is not None
@@ -867,9 +887,32 @@ class OrbitEvolutionWorker(QObject):
     @Slot()
     def run(self) -> None:
         try:
-            self.success.emit(calculate_orbit_evolution(
+            result = calculate_orbit_evolution(
                 self.solution, self.mode, self.past, self.future, span=self.span,
-            ))
+            )
+            # Impact location uncertainty from the fit covariance (Monte Carlo).
+            self.success.emit(with_impact_uncertainties(self.solution, result))
+        except Exception as exc:
+            self.error.emit(str(exc))
+        finally:
+            self.finished.emit()
+
+
+class PlanetRelationWorker(QObject):
+    """Background computation of MOID/Tisserand/... series for one planet."""
+    success = Signal(object)
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(self, result: EvolutionResult, planet: str) -> None:
+        super().__init__()
+        self.result = result
+        self.planet = planet
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.success.emit(planet_relation_series(self.result, self.planet))
         except Exception as exc:
             self.error.emit(str(exc))
         finally:
@@ -1015,12 +1058,24 @@ class OrbitEvolutionPanel(QWidget):
     GRAPH_METRICS = {
         "q": ("perihelion_au", tr("perihelová vzdálenost q [AU]"), tr("perihelové vzdálenosti")),
         "a": ("semi_major_axis_au", tr("velká poloosa a [AU]"), tr("velké poloosy")),
-        "e": ("eccentricity", tr("excentricita e"), "excentricity"),
+        "e": ("eccentricity", tr("excentricita e"), tr("excentricity")),
         "period": ("period_years", tr("oběžná doba P [roky]"), tr("oběžné doby")),
         "reciprocal_a": ("reciprocal_a", "1/a [AU⁻¹]", tr("reciproké velké poloosy")),
         "inclination": ("inclination_deg", tr("sklon i [°]"), tr("sklonu dráhy")),
         "node": ("node_deg", tr("délka výstupného uzlu Ω [°]"), tr("délky výstupného uzlu")),
         "arg_peri": ("arg_peri_deg", tr("argument perihelu ω [°]"), tr("argumentu perihelu")),
+    }
+
+    # Quantities describing a heliocentric orbit relative to a planet:
+    # key -> (axis label, title fragment).
+    RELATION_METRICS = {
+        "distance": (tr("vzdálenost od planety [AU]"), tr("vzdálenosti od planety")),
+        "moid": (tr("MOID [AU]"), tr("MOID")),
+        "tisserand": (tr("Tisserandův parametr T"), tr("Tisserandova parametru")),
+        "period_ratio": (tr("poměr oběžných dob P / P planety"), tr("poměru oběžných dob")),
+        "nodes": (
+            tr("vzdálenost uzlu od dráhy planety [AU]"), tr("uzlových vzdáleností"),
+        ),
     }
 
     show_return = Signal(object, object)
@@ -1031,6 +1086,10 @@ class OrbitEvolutionPanel(QWidget):
         self.solution = solution
         self.result: EvolutionResult | None = None
         self._centered_cache: dict[tuple[str, str], tuple] = {}
+        self._relation_cache: dict[str, object] = {}
+        self._relation_thread: QThread | None = None
+        self._relation_worker: PlanetRelationWorker | None = None
+        self._relation_pending: str | None = None
         self.thread: QThread | None = None
         self.worker: OrbitEvolutionWorker | None = None
 
@@ -1075,18 +1134,20 @@ class OrbitEvolutionPanel(QWidget):
 
         output_controls = QHBoxLayout()
         self.graph_metric = QComboBox()
-        self.graph_metric.addItem(tr("Graf: perihelová vzdálenost q"), "q")
-        self.graph_metric.addItem(tr("Graf: velká poloosa a"), "a")
-        self.graph_metric.addItem(tr("Graf: excentricita e"), "e")
-        self.graph_metric.addItem(tr("Graf: oběžná doba P"), "period")
-        self.graph_metric.addItem(tr("Graf: reciproká poloosa 1/a"), "reciprocal_a")
-        self.graph_metric.addItem(tr("Graf: sklon i"), "inclination")
-        self.graph_metric.addItem(tr("Graf: výstupný uzel Ω"), "node")
-        self.graph_metric.addItem(tr("Graf: argument perihelu ω"), "arg_peri")
         self.graph_metric.currentIndexChanged.connect(self._draw_result)
+        # What the plot and the left table describe: heliocentric elements,
+        # the relation to a planet, or planetocentric elements while the body
+        # is temporarily captured (offered only when a capture was detected).
         self.element_center = QComboBox()
-        for key, label in ELEMENT_CENTERS:
-            self.element_center.addItem(tr("Střed: {0}", label), key)
+        self.element_center.setToolTip(
+            tr(
+                "Vztah k planetě ukazuje vzdálenost, MOID, Tisserandův parametr, poměr "
+                "oběžných dob a uzlové vzdálenosti. Planetocentrické elementy se nabízejí "
+                "jen pro planetu, která těleso dočasně zachytila.",
+            )
+        )
+        self._populate_views()
+        self._populate_metrics("elements")
         self.element_center.currentIndexChanged.connect(self._center_changed)
         self.report_format = QComboBox()
         self.report_format.addItem(tr("TXT: čitelný přehled"), "readable")
@@ -1118,10 +1179,19 @@ class OrbitEvolutionPanel(QWidget):
         self.returns.horizontalHeader().setStretchLastSection(True)
         self.returns.cellDoubleClicked.connect(self._open_return)
         tables.addWidget(self.returns)
-        self.encounters = QTableWidget(0, 6)
+        self.encounters = QTableWidget(0, 9)
         self.encounters.setHorizontalHeaderLabels((
             tr("Datum (UTC)"), tr("Planeta"), tr("Vzdálenost [AU]"), tr("Hillovy poloměry"),
-            tr("v rel. [km/s]"), "Δ(1/a) [AU⁻¹]",
+            tr("v rel. [km/s]"), "v∞ [km/s]", "Δ(1/a) [AU⁻¹]", "ΔT", "ΔMOID [AU]",
+        ))
+        self.encounters.horizontalHeaderItem(5).setToolTip(tr(
+            "Hyperbolický přebytek rychlosti vůči planetě (dvoutělesový odhad).",
+        ))
+        self.encounters.horizontalHeaderItem(7).setToolTip(tr(
+            "Změna Tisserandova parametru vůči planetě během setkání.",
+        ))
+        self.encounters.horizontalHeaderItem(8).setToolTip(tr(
+            "Změna MOID vůči planetě během setkání.",
         ))
         self.encounters.setEditTriggers(QTableWidget.NoEditTriggers)
         self.encounters.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
@@ -1246,6 +1316,8 @@ class OrbitEvolutionPanel(QWidget):
         self._update_span_hint()
         self.result = None
         self._centered_cache.clear()
+        self._relation_cache.clear()
+        self._populate_views()
         self.returns.setRowCount(0); self.encounters.setRowCount(0)
         self.copy_report.setEnabled(False); self.save_report.setEnabled(False)
         self.canvas.axes.clear(); self.canvas.style_axes(); self.canvas.draw_idle()
@@ -1323,6 +1395,8 @@ class OrbitEvolutionPanel(QWidget):
     def _completed(self, result: EvolutionResult) -> None:
         self.result = result
         self._centered_cache.clear()
+        self._relation_cache.clear()
+        self._populate_views()
         self.copy_report.setEnabled(True); self.save_report.setEnabled(True)
         self.evolution_ready.emit(self.solution, result)
         phase_note = (
@@ -1354,39 +1428,148 @@ class OrbitEvolutionPanel(QWidget):
             )
         )
         self._populate_state_table()
-        self.encounters.setRowCount(len(result.encounters))
-        for row, item in enumerate(result.encounters):
+        rows: list[tuple[float, tuple[str, ...], str]] = []
+        for item in result.encounters:
             date = datetime_from_jd(item.epoch_jd)
-            values = (
+            rows.append((item.epoch_jd, (
                 date.strftime("%Y-%m-%d %H:%M") if date else f"JD {item.epoch_jd:.2f}",
                 PLANET_LABELS.get(item.planet, item.planet), f"{item.distance_au:.6f}",
                 f"{item.hill_radii:.3f}", f"{item.relative_velocity_kms:.2f}",
+                "—" if item.v_infinity_kms is None else f"{item.v_infinity_kms:.2f}",
                 "—" if item.delta_reciprocal_a is None else f"{item.delta_reciprocal_a:+.3e}",
-            )
+                "—" if item.delta_tisserand is None else f"{item.delta_tisserand:+.4f}",
+                "—" if item.delta_moid_au is None else f"{item.delta_moid_au:+.5f}",
+            ), ""))
+        for impact in result.impacts:
+            point = impact.entry or impact.surface
+            label = BODY_LABELS.get(impact.body, impact.body)
+            rows.append((point.epoch_jd, (
+                point.utc.strftime("%Y-%m-%d %H:%M:%S") if point.utc
+                else f"JD {point.epoch_jd:.5f}",
+                tr("{0} — DOPAD", label) if impact.forward else tr("{0} — KOLIZE", label),
+                "0", "0", f"{point.speed_kms:.2f}", "—", "—", "—", "—",
+            ), describe_impact(impact, label)))
+        rows.sort(key=lambda row: row[0])
+        self.encounters.setRowCount(len(rows))
+        for row, (_epoch, values, tooltip) in enumerate(rows):
             for column, value in enumerate(values):
-                self.encounters.setItem(row, column, QTableWidgetItem(value))
+                cell = QTableWidgetItem(value)
+                if tooltip:
+                    cell.setToolTip(tooltip)
+                    cell.setForeground(QColor("#ff8a7a"))
+                self.encounters.setItem(row, column, cell)
+        if result.impacts:
+            self.note.setText(
+                self.note.text() + "  " + "  ".join(
+                    describe_impact(item, BODY_LABELS.get(item.body, item.body)).replace(
+                        "\n", "; ",
+                    )
+                    for item in result.impacts
+                )
+            )
         if result.snapshots:
             reciprocal_index = self.graph_metric.findData("reciprocal_a")
             if reciprocal_index >= 0:
                 self.graph_metric.setCurrentIndex(reciprocal_index)
         self._draw_result()
+        if result.impacts and self.isVisible():
+            QMessageBox.warning(
+                self, tr("Vývoj dráhy — dopad"),
+                "\n\n".join(
+                    describe_impact(item, BODY_LABELS.get(item.body, item.body))
+                    for item in result.impacts
+                ) + tr(
+                    "\n\nIntegrace v tomto směru končí okamžikem dopadu. Místo na povrchu "
+                    "je průsečík vakuové dráhy s elipsoidem WGS84; brzdění a rozpad v "
+                    "atmosféře nejsou modelovány.",
+                ),
+            )
+
+    def _view(self) -> tuple[str, str]:
+        """(kind, body): ('elements', 'sun'), ('relation', planet) or ('captured', planet)."""
+        kind, _separator, body = str(self.element_center.currentData() or "elements:sun").partition(":")
+        return kind, body or "sun"
+
+    def _populate_views(self) -> None:
+        current = str(self.element_center.currentData() or "elements:sun")
+        captured = sorted({item.planet for item in self.result.captures}) if self.result else []
+        self.element_center.blockSignals(True)
+        self.element_center.clear()
+        self.element_center.addItem(tr("Pohled: heliocentrické elementy"), "elements:sun")
+        for planet in RELATION_PLANETS:
+            self.element_center.addItem(
+                tr("Pohled: vztah k planetě {0}", PLANET_LABELS.get(planet, planet)),
+                f"relation:{planet}",
+            )
+        for planet in captured:
+            self.element_center.addItem(
+                tr("Pohled: planetocentrické elementy — {0} (zachycení)",
+                   PLANET_LABELS.get(planet, planet)),
+                f"captured:{planet}",
+            )
+        index = self.element_center.findData(current)
+        self.element_center.setCurrentIndex(index if index >= 0 else 0)
+        self.element_center.blockSignals(False)
+        self._populate_metrics(self._view()[0])
+
+    def _populate_metrics(self, kind: str) -> None:
+        wanted = "relation" if kind == "relation" else "elements"
+        if self.graph_metric.property("metricKind") == wanted and self.graph_metric.count():
+            return
+        self.graph_metric.blockSignals(True)
+        self.graph_metric.clear()
+        if wanted == "relation":
+            for key, label in (
+                ("distance", tr("Graf: vzdálenost od planety")),
+                ("moid", tr("Graf: MOID (nejmenší vzdálenost drah)")),
+                ("tisserand", tr("Graf: Tisserandův parametr T")),
+                ("period_ratio", tr("Graf: poměr oběžných dob (rezonance)")),
+                ("nodes", tr("Graf: vzdálenosti uzlů od dráhy planety")),
+            ):
+                self.graph_metric.addItem(label, key)
+        else:
+            for key, label in (
+                ("q", tr("Graf: perihelová vzdálenost q")),
+                ("a", tr("Graf: velká poloosa a")),
+                ("e", tr("Graf: excentricita e")),
+                ("period", tr("Graf: oběžná doba P")),
+                ("reciprocal_a", tr("Graf: reciproká poloosa 1/a")),
+                ("inclination", tr("Graf: sklon i")),
+                ("node", tr("Graf: výstupný uzel Ω")),
+                ("arg_peri", tr("Graf: argument perihelu ω")),
+            ):
+                self.graph_metric.addItem(label, key)
+        self.graph_metric.setProperty("metricKind", wanted)
+        self.graph_metric.blockSignals(False)
 
     def _states_for_center(self, kind: str) -> tuple:
         if self.result is None:
             return ()
-        center = str(self.element_center.currentData() or "sun")
+        view, body = self._view()
+        center = body if view == "captured" else "sun"
         key = (center, kind)
         if key in self._centered_cache:
             return self._centered_cache[key]
-        source = (
-            (self.result.snapshots or self.result.returns)
-            if kind == "events" else self.result.timeline
-        )
         if center == "sun":
+            source = (
+                (self.result.snapshots or self.result.returns)
+                if kind == "events" else self.result.timeline
+            )
             converted = tuple(source)
         else:
+            # Planetocentric elements only while the planet holds the body.
+            intervals = [
+                (item.start_jd, item.end_jd) for item in self.result.captures
+                if item.planet == center
+            ]
+            inside = [
+                item for item in self.result.timeline
+                if any(start <= item.epoch_jd <= end for start, end in intervals)
+            ]
+            if kind == "events" and len(inside) > 40:
+                inside = [inside[index] for index in np.linspace(0, len(inside) - 1, 40).astype(int)]
             values = []
-            for item in source:
+            for item in inside:
                 try:
                     values.append(centered_snapshot(item, center))
                 except (ValueError, OrbitParseError, FloatingPointError):
@@ -1396,25 +1579,117 @@ class OrbitEvolutionPanel(QWidget):
         return converted
 
     def _center_changed(self, *_args) -> None:
+        self._populate_metrics(self._view()[0])
         self._populate_state_table()
         self._draw_result()
+
+    def _relation_series(self, planet: str):
+        """Cached relation series; starts a background computation if missing."""
+        if planet in self._relation_cache:
+            return self._relation_cache[planet]
+        if self.result is None:
+            return None
+        if self._relation_thread is None:
+            self._relation_pending = planet
+            thread = QThread(self)
+            worker = PlanetRelationWorker(self.result, planet)
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            result_identity = id(self.result)
+            worker.success.connect(
+                lambda series, identity=result_identity: self._relation_ready(series, identity)
+            )
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(self._relation_finished)
+            self._relation_thread = thread; self._relation_worker = worker
+            thread.start()
+        return None
+
+    def _relation_ready(self, series, identity: int) -> None:
+        if self.result is not None and id(self.result) == identity:
+            self._relation_cache[series.planet] = series
+            view, body = self._view()
+            if view == "relation" and body == series.planet:
+                self._populate_state_table()
+                self._draw_result()
+
+    def _relation_finished(self) -> None:
+        self._relation_thread = None; self._relation_worker = None
+        view, body = self._view()
+        if self.result is not None and view == "relation" and body not in self._relation_cache:
+            self._relation_series(body)
+
+    def _set_state_headers(self, labels: tuple[str, ...]) -> None:
+        for column, label in enumerate(labels):
+            self.returns.setHorizontalHeaderItem(column, QTableWidgetItem(label))
+
+    def _populate_relation_table(self, planet: str) -> None:
+        result = self.result
+        first = (tr("Fáze"), tr("Epocha (UTC)")) if result.snapshots else (
+            tr("Rok návratu"), tr("Perihelium (UTC)"),
+        )
+        self._set_state_headers(first + (
+            "MOID [AU]", "T", tr("P / P planety"), tr("☊ uzel [AU]"), tr("☋ uzel [AU]"),
+            tr("i vůči planetě [°]"), "",
+        ))
+        series = self._relation_series(planet)
+        events = result.snapshots or result.returns
+        if series is None:
+            self.returns.setRowCount(1)
+            self.returns.setItem(0, 0, QTableWidgetItem(tr("počítám…")))
+            for column in range(1, 9):
+                self.returns.setItem(0, column, QTableWidgetItem(""))
+            return
+        self.returns.setRowCount(len(events))
+        for row, (item, relation) in enumerate(zip(events, series.events)):
+            date = datetime_from_jd(item.epoch_jd)
+
+            def number(value: float, pattern: str) -> str:
+                return "—" if value is None or not np.isfinite(value) else format(value, pattern)
+
+            values = (
+                tr(item.phase) if result.snapshots else (
+                    str(date.year) if date else f"JD {item.epoch_jd:.0f}"
+                ),
+                date.strftime("%Y-%m-%d %H:%M") if date else f"JD {item.epoch_jd:.2f}",
+            ) + ((
+                number(relation.moid_au, ".6f"), number(relation.tisserand, ".4f"),
+                number(relation.period_ratio, ".4f"),
+                number(relation.ascending_node_distance_au, "+.5f"),
+                number(relation.descending_node_distance_au, "+.5f"),
+                number(relation.relative_inclination_deg, ".3f"), "",
+            ) if relation is not None else ("—",) * 7)
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(value)
+                cell.setTextAlignment(Qt.AlignCenter if column != 1 else Qt.AlignLeft | Qt.AlignVCenter)
+                self.returns.setItem(row, column, cell)
 
     def _populate_state_table(self) -> None:
         if self.result is None:
             self.returns.setRowCount(0)
             return
+        view, body = self._view()
+        if view == "relation":
+            self._populate_relation_table(body)
+            return
         displayed_states = self._states_for_center("events")
         result = self.result
-        if result.snapshots:
-            self.returns.setHorizontalHeaderItem(0, QTableWidgetItem(tr("Fáze")))
-            self.returns.setHorizontalHeaderItem(1, QTableWidgetItem(tr("Epocha (UTC)")))
+        element_headers = (
+            "q [AU]", "e", "a [AU]", tr("P [roky]"), "i [°]", "Ω [°]", "ω [°]",
+        )
+        if view == "captured":
+            self._set_state_headers((tr("Zachycení"), tr("Epocha (UTC)")) + element_headers)
+        elif result.snapshots:
+            self._set_state_headers((tr("Fáze"), tr("Epocha (UTC)")) + element_headers)
         else:
-            self.returns.setHorizontalHeaderItem(0, QTableWidgetItem(tr("Rok návratu")))
-            self.returns.setHorizontalHeaderItem(1, QTableWidgetItem(tr("Perihelium (UTC)")))
+            self._set_state_headers((tr("Rok návratu"), tr("Perihelium (UTC)")) + element_headers)
         self.returns.setRowCount(len(displayed_states))
         for row, item in enumerate(displayed_states):
             date = datetime_from_jd(item.epoch_jd)
             values = (
+                PLANET_LABELS.get(body, body) if view == "captured" else
                 tr(item.phase) if result.snapshots else (
                     str(date.year) if date else f"JD {item.epoch_jd:.0f}"
                 ),
@@ -1436,7 +1711,13 @@ class OrbitEvolutionPanel(QWidget):
             ax.text(.5, .5, tr("V zadaném rozsahu nejsou dostupné stavy dráhy."),
                     ha="center", va="center", transform=ax.transAxes, color="#afc2d8")
             self.canvas.draw_idle(); return
+        view, body = self._view()
+        if view == "relation":
+            self._draw_relation(body)
+            return
         metric_key = str(self.graph_metric.currentData() or "q")
+        if metric_key not in self.GRAPH_METRICS:
+            metric_key = "q"
         attribute, y_label, title_label = self.GRAPH_METRICS[metric_key]
         displayed_states = self._states_for_center("events")
         timeline = self._states_for_center("timeline") or displayed_states
@@ -1496,14 +1777,139 @@ class OrbitEvolutionPanel(QWidget):
                     color="#c9a8ff", fontsize=8)
         ax.set_xlabel(tr("rok"))
         ax.set_ylabel(y_label)
+        self._draw_impacts(ax)
         ax.set_title(
             tr(
-                "{0} — vývoj {1} ({2}-centrické elementy)",
+                "{0} — vývoj {1} (heliocentrické elementy)",
                 self.solution.display_name or self.solution.designation,
                 title_label,
-                self.element_center.currentText().replace('Střed: ', ''),
+            ) if view != "captured" else tr(
+                "{0} — vývoj {1} (planetocentrické elementy během zachycení: {2})",
+                self.solution.display_name or self.solution.designation,
+                title_label, PLANET_LABELS.get(body, body),
             )
         )
+        ax.grid(color="#273750", alpha=.55, lw=.6)
+        self.canvas.draw_idle()
+
+    def _draw_impacts(self, ax) -> None:
+        for impact in self.result.impacts if self.result else ():
+            point = impact.entry or impact.surface
+            x_value = 2000.0 + (point.epoch_jd - 2451545.0) / 365.25
+            ax.axvline(x_value, color="#ff6b5b", lw=1.6, alpha=.9)
+            ax.text(
+                x_value, .5, tr("dopad: {0}", BODY_LABELS.get(impact.body, impact.body)),
+                transform=ax.get_xaxis_transform(), rotation=90, ha="right", va="center",
+                color="#ff8a7a", fontsize=9,
+            )
+
+    def _draw_relation(self, planet: str) -> None:
+        """Distance, MOID, Tisserand, period ratio or nodes relative to a planet."""
+        ax = self.canvas.axes
+        result = self.result
+        metric = str(self.graph_metric.currentData() or "distance")
+        if metric not in self.RELATION_METRICS:
+            metric = "distance"
+        y_label, title_label = self.RELATION_METRICS[metric]
+        label = PLANET_LABELS.get(planet, planet)
+
+        def years(epochs) -> np.ndarray:
+            return 2000.0 + (np.asarray(epochs, dtype=float) - 2451545.0) / 365.25
+
+        series = None
+        if metric != "distance":
+            series = self._relation_series(planet)
+            if series is None:
+                ax.text(.5, .5, tr("Počítám vztah k planetě {0}…", label), ha="center",
+                        va="center", transform=ax.transAxes, color="#afc2d8")
+                self.canvas.draw_idle()
+                return
+        events = result.snapshots or result.returns
+        event_x = years([item.epoch_jd for item in events])
+        if metric == "distance":
+            distances = result.planet_distances.get(planet)
+            if distances is None or result.trajectory_epochs is None:
+                ax.text(.5, .5, tr("Vzdálenosti od planet nejsou pro tento výpočet uloženy."),
+                        ha="center", va="center", transform=ax.transAxes, color="#afc2d8")
+                self.canvas.draw_idle()
+                return
+            ax.semilogy(years(result.trajectory_epochs), distances, color="#67cfe8", lw=1.2)
+            hill = HILL_RADII_AU.get(planet)
+            if hill:
+                ax.axhline(hill, color="#b07cff", lw=.9, ls="--", alpha=.8)
+                ax.text(.005, hill, tr("Hillova sféra"), transform=ax.get_yaxis_transform(),
+                        va="bottom", color="#c9a8ff", fontsize=8)
+            if planet == "earth":
+                ax.axhline(.00257, color="#9fb3c8", lw=.8, ls=":", alpha=.8)
+                ax.text(.005, .00257, tr("vzdálenost Měsíce"), transform=ax.get_yaxis_transform(),
+                        va="bottom", color="#b9cbe0", fontsize=8)
+            for encounter in result.encounters:
+                if encounter.planet == planet:
+                    ax.scatter(years([encounter.epoch_jd]), [encounter.distance_au], color="#f0c85a",
+                               s=30, zorder=4)
+        elif metric == "moid":
+            values = np.where(series.moid_au > 0.0, series.moid_au, np.nan)
+            ax.semilogy(years(series.moid_epochs), values, color="#67cfe8", lw=1.3)
+            event_values = np.array([
+                np.nan if item is None else item.moid_au for item in series.events
+            ])
+            ax.scatter(event_x, np.where(event_values > 0, event_values, np.nan),
+                       color="#f1f5f9", edgecolor="#55e3e9", s=34, zorder=4)
+            if planet == "earth":
+                ax.axhline(.05, color="#f0a03c", lw=.9, ls="--", alpha=.8)
+                ax.text(.005, .05, tr("0,05 AU — mez potenciálně nebezpečných těles"),
+                        transform=ax.get_yaxis_transform(), va="bottom", color="#f0c08a",
+                        fontsize=8)
+        elif metric == "tisserand":
+            ax.plot(years(series.epochs), series.tisserand, color="#67cfe8", lw=1.3)
+            event_values = np.array([np.nan if item is None else item.tisserand for item in series.events])
+            ax.scatter(event_x, event_values, color="#f1f5f9", edgecolor="#55e3e9", s=34, zorder=4)
+            finite = series.tisserand[np.isfinite(series.tisserand)]
+            near = (
+                (lambda level: finite.size and finite.min() - 1.0 <= level <= finite.max() + 1.0)
+            )
+            if planet == "jupiter":
+                for level, text in ((2.0, tr("T = 2: Halleyova typu / Jupiterova rodina")),
+                                    (3.0, tr("T = 3: Jupiterova rodina / planetky"))):
+                    if not near(level):
+                        continue
+                    ax.axhline(level, color="#f0a03c", lw=.8, ls="--", alpha=.75)
+                    ax.text(.005, level, text, transform=ax.get_yaxis_transform(),
+                            va="bottom", color="#f0c08a", fontsize=8)
+        elif metric == "period_ratio":
+            ax.plot(years(series.epochs), series.period_ratio, color="#67cfe8", lw=1.3)
+            event_values = np.array([np.nan if item is None else item.period_ratio for item in series.events])
+            ax.scatter(event_x, event_values, color="#f1f5f9", edgecolor="#55e3e9", s=34, zorder=4)
+            finite = series.period_ratio[np.isfinite(series.period_ratio)]
+            if finite.size:
+                low, high = float(finite.min()), float(finite.max())
+                margin = max(.02, (high - low) * .15)
+                for value, text in nearby_resonances(low - margin, high + margin):
+                    ax.axhline(value, color="#f0a03c", lw=.7, ls=":", alpha=.7)
+                    ax.text(.995, value, text, transform=ax.get_yaxis_transform(), ha="right",
+                            va="bottom", color="#f0c08a", fontsize=8)
+                ax.set_ylim(low - margin, high + margin)
+            ax.text(.005, .02, tr("P planety = {0:.3f} roku", planet_period_years(planet, self.solution.epoch_jd)),
+                    transform=ax.transAxes, color="#b9cbe0", fontsize=8)
+        else:
+            ax.plot(years(series.epochs), series.ascending_node_au, color="#67cfe8", lw=1.3,
+                    label=tr("výstupný uzel ☊"))
+            ax.plot(years(series.epochs), series.descending_node_au, color="#f0c85a", lw=1.3,
+                    label=tr("sestupný uzel ☋"))
+            ax.axhline(0.0, color="#ff6b5b", lw=.8, alpha=.7)
+            legend = ax.legend(loc="best", fontsize=8, facecolor="#0e1828", edgecolor="#273750")
+            for text in legend.get_texts():
+                text.set_color("#d6e2f0")
+        for encounter in result.encounters:
+            if encounter.planet == planet:
+                ax.axvline(years([encounter.epoch_jd])[0], color="#f0c85a", lw=.8, alpha=.5, ls="--")
+        self._draw_impacts(ax)
+        ax.set_xlabel(tr("rok"))
+        ax.set_ylabel(y_label)
+        ax.set_title(tr(
+            "{0} — vývoj {1} vůči planetě {2}",
+            self.solution.display_name or self.solution.designation, title_label, label,
+        ))
         ax.grid(color="#273750", alpha=.55, lw=.6)
         self.canvas.draw_idle()
 
@@ -2829,6 +3235,30 @@ class SkyPanel(QWidget):
         dec = np.degrees(np.arcsin(np.clip(topocentric[:, 2] / delta, -1.0, 1.0)))
         return geom, ra, dec, delta
 
+    def _show_missing_target(self, time: datetime) -> None:
+        """The body no longer exists at ``time`` (it hit a planet)."""
+        ax = self.canvas.axes
+        ax.clear(); self.canvas.style_axes()
+        prediction = getattr(self.solution, "impact", None)
+        if prediction is not None:
+            point = prediction.entry or prediction.surface
+            when = point.utc.strftime("%Y-%m-%d %H:%M:%S UTC") if point.utc else ""
+            message = tr(
+                "Těleso v tomto okamžiku neexistuje: dopadlo na těleso {0} ({1}).\n"
+                "Zvolte čas před dopadem.",
+                BODY_LABELS.get(prediction.body, prediction.body), when,
+            )
+        else:
+            message = tr(
+                "Těleso v tomto okamžiku neexistuje: jeho dráha předtím narazila do planety.\n"
+                "Zvolte dřívější čas.",
+            )
+        ax.text(.5, .5, message, transform=ax.transAxes, ha="center", va="center",
+                color="#ffb3a8", fontsize=13)
+        ax.set_axis_off()
+        self.info.setText(message.replace("\n", " "))
+        self.canvas.draw_idle()
+
     def _rebuild_horizontal(self, time: datetime) -> None:
         ax = self.canvas.axes
         ax.clear(); self.canvas.style_axes()
@@ -2864,6 +3294,9 @@ class SkyPanel(QWidget):
         now_geom, now_ra, now_dec, now_delta = self._topocentric_coordinates(
             self.solution, np.array([jd0]), now_offsets
         )
+        if not np.isfinite(float(now_ra[0])):
+            self._show_missing_target(time)
+            return
         now_horizontal = observation_altaz_series(code, [time], now_ra, now_dec)
         if track_horizontal is None or now_horizontal is None:
             return
@@ -3034,6 +3467,9 @@ class SkyPanel(QWidget):
         horizon = int(self.horizon.currentData())
         jd, geom = self._sky_track_geometry(jd0, horizon)
         now = apparent_geometry(self.solution, np.array([jd0]))
+        if not np.isfinite(float(now["ra"][0])):
+            self._show_missing_target(time)
+            return
         if self.lock_target.isChecked() or self.free_center_ra is None or self.free_center_dec is None:
             center_ra = float(now["ra"][0])
             center_dec = float(now["dec"][0])
@@ -3566,6 +4002,37 @@ class EphemerisPanel(QWidget):
         geom, ra, dec, delta = self._coordinates_for_solution(
             self.solution, jd, observer_offsets
         )
+        # After an impact the body has no position: those rows are dropped.
+        valid = np.isfinite(ra) & np.isfinite(dec) & np.isfinite(delta)
+        impact_note = ""
+        if not np.all(valid):
+            impact = getattr(self.solution, "impact", None)
+            impact_note = tr(
+                "Těleso v tomto intervalu dopadlo ({0}); efemerida obsahuje jen okamžiky "
+                "před dopadem.",
+                (
+                    (impact.entry or impact.surface).utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+                    if impact is not None and (impact.entry or impact.surface).utc
+                    else tr("srážka s planetou")
+                ),
+            )
+            keep = np.flatnonzero(valid)
+            dates = [dates[index] for index in keep]
+            jd = jd[keep]
+            ra, dec, delta = ra[keep], dec[keep], delta[keep]
+            geom = {
+                key: (np.asarray(value)[keep] if np.ndim(value) and len(value) == len(valid)
+                      else value)
+                for key, value in geom.items()
+            }
+            if observer_offsets is not None:
+                observer_offsets = observer_offsets[keep]
+            count = len(dates)
+        self._impact_note = impact_note
+        if count == 0:
+            self.table.setRowCount(0)
+            self.uncertainty_status.setText(impact_note)
+            return
         altaz = observation_altaz_series(station_code, dates, ra, dec)
         mag = power_law_magnitude(
             self.solution.absolute_magnitude, delta, geom["r"],
@@ -3591,8 +4058,12 @@ class EphemerisPanel(QWidget):
                 self.table.setItem(row, column, QTableWidgetItem(value))
         if self._has_positional_covariance():
             self._start_uncertainty_job(request_id, jd, observer_offsets, dec)
+            if impact_note:
+                self.uncertainty_status.setText(
+                    impact_note + "  " + self.uncertainty_status.text()
+                )
         else:
-            self.uncertainty_status.setText("")
+            self.uncertainty_status.setText(impact_note)
 
     def _has_positional_covariance(self) -> bool:
         covariance = self.solution.state_covariance
@@ -3645,9 +4116,10 @@ class EphemerisPanel(QWidget):
         for row, value in enumerate(values):
             text = f"{value:.3f}" if value < 10.0 else f"{value:.2f}"
             self.table.setItem(row, 6, QTableWidgetItem(text))
-        self.uncertainty_status.setText(tr(
-            "Polohová nejistota 1σ byla dopočítána v úhlových vteřinách.",
-        ))
+        self.uncertainty_status.setText(
+            (getattr(self, "_impact_note", "") + "  " if getattr(self, "_impact_note", "") else "")
+            + tr("Polohová nejistota 1σ byla dopočítána v úhlových vteřinách.")
+        )
 
     @Slot(int, str)
     def _uncertainty_failed(self, request_id: int, detail: str) -> None:
@@ -3752,6 +4224,16 @@ class ElementsPanel(QWidget):
         self.epoch_note.setObjectName("muted"); self.epoch_note.setWordWrap(True)
         layout = QVBoxLayout(self)
         layout.addLayout(buttons); layout.addLayout(epoch_controls)
+        # Prominent banner for a predicted collision (set after the fit).
+        self.impact_banner = QLabel()
+        self.impact_banner.setWordWrap(True)
+        self.impact_banner.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.impact_banner.setStyleSheet(
+            "background: #3a1115; border: 1px solid #ff6b5b; border-radius: 6px; "
+            "color: #ffd7d2; padding: 8px 10px; font-size: 14px;"
+        )
+        self.impact_banner.setVisible(False)
+        layout.addWidget(self.impact_banner)
         layout.addWidget(self.epoch_note); layout.addWidget(self.text, 1)
         self.redraw()
 
@@ -3876,7 +4358,17 @@ class ElementsPanel(QWidget):
             epoch_line = (
                 f"Epoch {epoch.year:04d} {epoch:%b} {epoch_day:08.5f} TT = JDT {s.epoch_jd:.8f}"
             )
+        impact_lines: list[str] = []
+        prediction = getattr(self.solution, "impact", None)
+        if prediction is not None:
+            label = BODY_LABELS.get(prediction.body, prediction.body)
+            impact_lines = [
+                "*** " + tr("PŘEDPOVĚĎ DOPADU: {0}", label).upper() + " ***",
+                *describe_impact(prediction, label).split("\n")[1:],
+                "",
+            ]
         lines = [
+            *impact_lines,
             f"Orbital elements: {s.designation}",
             f"Element center: {dict(ELEMENT_CENTERS).get(str(self.element_center.currentData() or 'sun'))}",
             perihelion_line,
@@ -4052,7 +4544,42 @@ class ElementsPanel(QWidget):
         )
         self.redraw()
 
+    def _refresh_element_centers(self) -> None:
+        """Offer planetocentric elements only where the body is bound.
+
+        Osculating elements about a planet describe a real orbit only inside
+        its Hill sphere with negative planetocentric energy (SL9, a captured
+        minimoon); for a heliocentric body they would be formal numbers.
+        """
+        source = getattr(self, "_heliocentric_display_solution", None) or self.solution
+        try:
+            allowed = ("sun",) + bound_centers(source)
+        except (ValueError, RuntimeError):
+            allowed = ("sun",)
+        present = tuple(
+            self.element_center.itemData(index) for index in range(self.element_center.count())
+        )
+        if present == allowed:
+            return
+        current = str(self.element_center.currentData() or "sun")
+        labels = dict(ELEMENT_CENTERS)
+        self.element_center.blockSignals(True)
+        self.element_center.clear()
+        for key in allowed:
+            self.element_center.addItem(tr("Střed elementů: {0}", labels.get(key, key)), key)
+        index = self.element_center.findData(current)
+        self.element_center.setCurrentIndex(index if index >= 0 else 0)
+        self.element_center.blockSignals(False)
+        self.element_center.setEnabled(len(allowed) > 1)
+        self.element_center.setToolTip(
+            "" if len(allowed) > 1 else tr(
+                "Těleso obíhá Slunce; planetocentrické elementy se nabízejí jen při "
+                "gravitačním zachycení planetou.",
+            )
+        )
+
     def _apply_element_center(self, *_args) -> None:
+        self._refresh_element_centers()
         center = str(self.element_center.currentData() or "sun")
         try:
             self.display_solution = centered_solution(
@@ -4132,7 +4659,22 @@ class ElementsPanel(QWidget):
 
     def set_solution(self, solution: OrbitSolution) -> None:
         self.solution = solution
+        self._update_impact_banner()
         self._reset_output_epoch()
+
+    def _update_impact_banner(self) -> None:
+        prediction = getattr(self.solution, "impact", None)
+        if prediction is None:
+            self.impact_banner.setVisible(False)
+            return
+        label = BODY_LABELS.get(prediction.body, prediction.body)
+        details = describe_impact(prediction, label).split("\n")
+        self.impact_banner.setText(
+            "<b style='font-size:16px; color:#ff8a7a'>"
+            + html.escape(tr("⚠ PŘEDPOVĚĎ DOPADU: {0}", label).upper()) + "</b><br>"
+            + "<br>".join(html.escape(line) for line in details[1:])
+        )
+        self.impact_banner.setVisible(True)
 
 
 class De440DownloadDialog(QDialog):
@@ -5697,6 +6239,29 @@ class MainWindow(QMainWindow):
         progress_dialog.show()
         thread.start()
 
+    def _announce_impact(self, prediction) -> None:
+        label = BODY_LABELS.get(prediction.body, prediction.body)
+        self.statusBar().showMessage(
+            tr("POZOR: vypočtená dráha vede k dopadu na těleso {0}.", label), 0,
+        )
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Critical)
+        box.setWindowTitle(tr("Předpověď dopadu"))
+        box.setText(
+            "<b>" + html.escape(tr("Vypočtená dráha vede k dopadu na těleso {0}.", label))
+            + "</b>"
+        )
+        box.setInformativeText(
+            describe_impact(prediction, label)
+            + tr(
+                "\n\nKontroluje se {0:.0f} dní od epochy dráhy. Místo na povrchu je průsečík "
+                "vakuové dráhy s elipsoidem WGS84; brzdění a rozpad v atmosféře nejsou "
+                "modelovány. Podrobnosti jsou v záložce Elementy.",
+                IMPACT_CHECK_DAYS,
+            )
+        )
+        box.exec()
+
     def _own_orbit_loaded(self, payload: object) -> None:
         result, fitted_observations = payload
         solution, rms, _used = result
@@ -5706,6 +6271,8 @@ class MainWindow(QMainWindow):
         self.has_orbit = True
         self.tabs.setCurrentIndex(1)
         self._apply_solution(solution)
+        if solution.impact is not None:
+            QTimer.singleShot(0, lambda prediction=solution.impact: self._announce_impact(prediction))
         if self.fit_output_epoch:
             self.elements_panel.output_epoch.setText(self.fit_output_epoch)
             QTimer.singleShot(0, self.elements_panel._apply_output_epoch)

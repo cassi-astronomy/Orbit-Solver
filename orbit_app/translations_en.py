@@ -1287,4 +1287,140 @@ CATALOG: dict[str, str] = {
         "An integration over {0:.0f} years ({1:.0f}–{2:.0f}) may take many minutes, and such a distant extrapolation is very uncertain.\n\nContinue?",
     "\n\nTip: návraty byly propojeny čistě gravitačním modelem. Aktivní kometa (např. 1P/Halley) se přes více oběhů obvykle navázat nedá bez negravitačních parametrů; povolte A1 a A2 ve Vlastním nastavení a výpočet zopakujte.":
         "\n\nTip: the returns were linked by a purely gravitational model. An active comet (e.g. 1P/Halley) usually cannot be linked over several revolutions without non-gravitational parameters; enable A1 and A2 in Custom settings and repeat the calculation.",
+    "{0}: {1}{2}; rychlost {3:.2f} km/s; sklon dráhy {4:.1f}° pod obzorem":
+        "{0}: {1}{2}; speed {3:.2f} km/s; path {4:.1f}° below the horizon",
+    "Dopad na těleso {0}":
+        "Impact on {0}",
+    "Zpětná integrace začíná uvnitř tělesa {0}":
+        "The backward integration starts inside {0}",
+    "; šířka {0:+.3f}°, délka {1:+.3f}°":
+        "; latitude {0:+.3f}°, longitude {1:+.3f}°",
+    "Povrch (bez odporu atmosféry)":
+        "Surface (no atmospheric drag)",
+    "Monte Carlo: {0} z {1} klonů z kovariance fitu dopadá ({2:.0%}).":
+        "Monte Carlo: {0} of {1} clones from the fit covariance impact ({2:.0%}).",
+    "Vstup do atmosféry ({0:.0f} km)":
+        "Atmospheric entry ({0:.0f} km)",
+    "Nejistota místa dopadu 1σ: {0:.2f} × {1:.2f} km (delší osa azimut {2:.0f}°); času {3:.2f} s.":
+        "1σ impact-point uncertainty: {0:.2f} × {1:.2f} km (major axis azimuth {2:.0f}°); time {3:.2f} s.",
+    "excentricity":
+        "eccentricity",
+    "vzdálenost od planety [AU]":
+        "distance from the planet [AU]",
+    "vzdálenosti od planety":
+        "distance from the planet",
+    "MOID [AU]":
+        "MOID [AU]",
+    "MOID":
+        "MOID",
+    "Tisserandův parametr T":
+        "Tisserand parameter T",
+    "Tisserandova parametru":
+        "Tisserand parameter",
+    "poměr oběžných dob P / P planety":
+        "period ratio P / P planet",
+    "poměru oběžných dob":
+        "period ratio",
+    "vzdálenost uzlu od dráhy planety [AU]":
+        "node distance from the planet's orbit [AU]",
+    "uzlových vzdáleností":
+        "nodal distances",
+    "Vztah k planetě ukazuje vzdálenost, MOID, Tisserandův parametr, poměr oběžných dob a uzlové vzdálenosti. Planetocentrické elementy se nabízejí jen pro planetu, která těleso dočasně zachytila.":
+        "Relation to a planet shows the distance, MOID, Tisserand parameter, period ratio and nodal distances. Planetocentric elements are offered only for a planet that has temporarily captured the body.",
+    "Hyperbolický přebytek rychlosti vůči planetě (dvoutělesový odhad).":
+        "Hyperbolic excess speed relative to the planet (two-body estimate).",
+    "Změna Tisserandova parametru vůči planetě během setkání.":
+        "Change of the Tisserand parameter relative to the planet across the encounter.",
+    "Změna MOID vůči planetě během setkání.":
+        "Change of the MOID relative to the planet across the encounter.",
+    "Pohled: heliocentrické elementy":
+        "View: heliocentric elements",
+    "{0} — vývoj {1} vůči planetě {2}":
+        "{0} — evolution of the {1} relative to {2}",
+    "Vývoj dráhy — dopad":
+        "Orbit evolution — impact",
+    "Pohled: vztah k planetě {0}":
+        "View: relation to {0}",
+    "Pohled: planetocentrické elementy — {0} (zachycení)":
+        "View: planetocentric elements — {0} (capture)",
+    "{0} — vývoj {1} (heliocentrické elementy)":
+        "{0} — evolution of {1} (heliocentric elements)",
+    "{0} — vývoj {1} (planetocentrické elementy během zachycení: {2})":
+        "{0} — evolution of {1} (planetocentric elements during capture: {2})",
+    "dopad: {0}":
+        "impact: {0}",
+    "Těleso obíhá Slunce; planetocentrické elementy se nabízejí jen při gravitačním zachycení planetou.":
+        "The body orbits the Sun; planetocentric elements are offered only when a planet captures it gravitationally.",
+    "\n\nIntegrace v tomto směru končí okamžikem dopadu. Místo na povrchu je průsečík vakuové dráhy s elipsoidem WGS84; brzdění a rozpad v atmosféře nejsou modelovány.":
+        "\n\nThe integration in this direction ends at the moment of impact. The surface point is where the vacuum trajectory meets the WGS84 ellipsoid; atmospheric deceleration and fragmentation are not modelled.",
+    "Graf: vzdálenost od planety":
+        "Plot: distance from the planet",
+    "Graf: MOID (nejmenší vzdálenost drah)":
+        "Plot: MOID (minimum orbit intersection distance)",
+    "Graf: Tisserandův parametr T":
+        "Plot: Tisserand parameter T",
+    "Graf: poměr oběžných dob (rezonance)":
+        "Plot: period ratio (resonances)",
+    "Graf: vzdálenosti uzlů od dráhy planety":
+        "Plot: node distances from the planet's orbit",
+    "P / P planety":
+        "P / P planet",
+    "☊ uzel [AU]":
+        "☊ node [AU]",
+    "☋ uzel [AU]":
+        "☋ node [AU]",
+    "i vůči planetě [°]":
+        "i to planet [°]",
+    "Počítám vztah k planetě {0}…":
+        "Computing the relation to {0}…",
+    "Vzdálenosti od planet nejsou pro tento výpočet uloženy.":
+        "Planet distances are not stored for this calculation.",
+    "Hillova sféra":
+        "Hill sphere",
+    "vzdálenost Měsíce":
+        "lunar distance",
+    "Zachycení":
+        "Capture",
+    "0,05 AU — mez potenciálně nebezpečných těles":
+        "0.05 AU — potentially hazardous object limit",
+    "{0} — DOPAD":
+        "{0} — IMPACT",
+    "{0} — KOLIZE":
+        "{0} — COLLISION",
+    "P planety = {0:.3f} roku":
+        "P planet = {0:.3f} years",
+    "T = 2: Halleyova typu / Jupiterova rodina":
+        "T = 2: Halley type / Jupiter family",
+    "T = 3: Jupiterova rodina / planetky":
+        "T = 3: Jupiter family / asteroids",
+    "výstupný uzel ☊":
+        "ascending node ☊",
+    "sestupný uzel ☋":
+        "descending node ☋",
+    "Trajektorie narazila do tělesa {0}.":
+        "The trajectory hit {0}.",
+    "Typ\tDatum UTC\tFáze / návrat / planeta\tq [AU]\te\ta [AU]\tP [roky]\t1/a [AU^-1]\ti [deg]\tOmega [deg]\tomega [deg]\tVzdálenost [AU]\tHillovy poloměry\tv rel. [km/s]\tDelta(1/a) [AU^-1]\tv_inf [km/s]\tDelta T\tDelta MOID [AU]":
+        "Type\tDate UTC\tPhase / return / planet\tq [AU]\te\ta [AU]\tP [years]\t1/a [AU^-1]\ti [deg]\tOmega [deg]\tomega [deg]\tDistance [AU]\tHill radii\tv rel. [km/s]\tDelta(1/a) [AU^-1]\tv_inf [km/s]\tDelta T\tDelta MOID [AU]",
+    "Těleso v tomto intervalu dopadlo ({0}); efemerida obsahuje jen okamžiky před dopadem.":
+        "The body impacted within this interval ({0}); the ephemeris contains only instants before the impact.",
+    "srážka s planetou":
+        "collision with a planet",
+    "⚠ PŘEDPOVĚĎ DOPADU: {0}":
+        "⚠ IMPACT PREDICTION: {0}",
+    "PŘEDPOVĚĎ DOPADU: {0}":
+        "IMPACT PREDICTION: {0}",
+    "Kontroluji, zda dráha nevede ke srážce s planetou…":
+        "Checking whether the orbit leads to a collision with a planet…",
+    "POZOR: vypočtená dráha vede k dopadu na těleso {0}.":
+        "WARNING: the computed orbit leads to an impact on {0}.",
+    "Předpověď dopadu":
+        "Impact prediction",
+    "Vypočtená dráha vede k dopadu na těleso {0}.":
+        "The computed orbit leads to an impact on {0}.",
+    "\n\nKontroluje se {0:.0f} dní od epochy dráhy. Místo na povrchu je průsečík vakuové dráhy s elipsoidem WGS84; brzdění a rozpad v atmosféře nejsou modelovány. Podrobnosti jsou v záložce Elementy.":
+        "\n\n{0:.0f} days after the orbit epoch are checked. The surface point is where the vacuum trajectory meets the WGS84 ellipsoid; atmospheric deceleration and fragmentation are not modelled. Details are in the Elements tab.",
+    "Těleso v tomto okamžiku neexistuje: dopadlo na těleso {0} ({1}).\nZvolte čas před dopadem.":
+        "The body does not exist at this moment: it hit {0} ({1}).\nChoose a time before the impact.",
+    "Těleso v tomto okamžiku neexistuje: jeho dráha předtím narazila do planety.\nZvolte dřívější čas.":
+        "The body does not exist at this moment: its trajectory hit a planet earlier.\nChoose an earlier time.",
 }

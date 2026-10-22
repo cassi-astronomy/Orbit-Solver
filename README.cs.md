@@ -27,6 +27,13 @@ zapamatuje i pro další spuštění.
   data včetně nových pozorování a cache přepíše (objekty z NEOCP/PCCP se
   kvůli rychlým změnám neukládají);
 - import pozorování ze souboru a vložení ze schránky ve formátu MPC 80-column;
+- krátké oblouky těles velmi blízko Země (až několik zemských poloměrů, např.
+  2008 TC3 hodinu a 2024 BX1 minuty před dopadem): předběžné hledání
+  vzdálenosti sahá až k 10 000 km, zahrnuje rotaci Země u pozorovatele, Zemi i
+  Měsíc, při neúspěchu hrubého hledání doladí všech šest složek stavu a
+  trajektorie procházející planetou se odmítne jako srážka; u 2024 BX1
+  souhlasí předpovězený vstup (00:32:37 UTC, 15,20 km/s, 75,6°) s pozorovaným
+  bolidem;
 - podpora družicových pozorování a topocentrické paralaxy podle kódu stanice MPC;
 - vlastní šestiparametrový fit kartézského stavu s planetárními perturbacemi;
 - rychlý fit velkých souborů z časově i početně reprezentativního vzorku;
@@ -95,7 +102,10 @@ zapamatuje i pro další spuštění.
   soustavě – bez nového spouštění integrace; tlačítko Spustit integraci slouží
   jen pro jiný rozsah;
 - převod elementů na uživatelem zvolenou epochu;
-- přepočet oskulačních elementů vůči Slunci nebo zvolené planetě;
+- oskulační elementy vůči Slunci; elementy vůči planetě se nabízejí jen tehdy,
+  když je těleso k planetě gravitačně vázané (uvnitř Hillovy sféry se zápornou
+  planetocentrickou energií, např. Shoemaker–Levy 9 u Jupiteru nebo dočasně
+  zachycený měsíček Země);
 - kopírovatelný textový výstup a MPC 1-line elements;
 - geocentrická nebo topocentrická efemerida pro zvolenou MPC stanici;
 - numerická N-body propagace z kartézského stavu i u čistě gravitační dráhy,
@@ -143,7 +153,29 @@ zapamatuje i pro další spuštění.
   tenké a tlumené; významné planetární setkání je označené jako dynamická
   „výhybka“ a v okamžiku průletu se zvýraznění přepne z příchozí na odchozí
   větev; animovaná poloha sleduje i skutečnou změnu dráhy po setkání;
-- volitelný lokální planetocentrický pohled pro zachycené objekty; lunární
+- **vztah k planetě** pro těleso obíhající Slunce: vzdálenost od planety v čase
+  (logaritmicky, s Hillovou sférou a u Země se vzdáleností Měsíce), MOID –
+  nejmenší vzdálenost obou drah – (u Země s mezí 0,05 AU pro potenciálně
+  nebezpečná tělesa), Tisserandův parametr vůči planetě (u Jupiteru s mezemi
+  tříd T = 2 a T = 3), poměr oběžných dob P / P planety s blízkými
+  rezonancemi a uzlové vzdálenosti (kde dráha protíná rovinu dráhy planety);
+  dráhy planet používají střední elementy JPL se sekulárními změnami;
+- tabulka setkání uvádí i hyperbolický přebytek rychlosti v∞ a změnu
+  Tisserandova parametru a MOID způsobenou setkáním; okamžik největšího
+  přiblížení se hledá jednorozměrnou minimalizací nad přesnými integracemi,
+  takže se neztratí ani průlet trvající několik hodin;
+- každý vlastní fit se zkontroluje na srážku s planetou nebo Měsícem do jednoho
+  roku od epochy; předpověď dopadu program ohlásí dialogem a výrazně ji
+  zobrazí v záložce Elementy (čas, místo, nejistota); efemerida, pohled ze Země
+  i ostatní náhledy končí okamžikem dopadu;
+- **dopady**: trajektorie, která vstoupí do planety nebo Měsíce, ukončí
+  integraci okamžikem dotyku; u Země program uvede čas, zeměpisné souřadnice,
+  rychlost vůči atmosféře a sklon dráhy při vstupu do atmosféry (100 km) i
+  bod na povrchu pro vakuovou dráhu (WGS84), s nejistotou Monte Carlo z
+  kovariance fitu (podíl dopadajících klonů, elipsa 1σ na zemi, čas); u
+  2008 TC3 souhlasí vstup s předpovědí JPL do 1 s a 1,4 km;
+- planetocentrické elementy během zachycení planetou;
+  volitelný lokální planetocentrický pohled pro zachycené objekty; lunární
   perturbace jsou zahrnuty (z DE440, nebo přibližným modelem bez něj).
 - fragmenty komety Shoemaker–Levy 9 lze načíst jejich úplným označením, například
   `D/1993 F2-A`; pokud MPC neposkytne kartézský stav, program automaticky použije
@@ -284,6 +316,9 @@ aplikací nutné porovnat s MPC, JPL Horizons nebo jiným nezávislým softwarem
   pro přímé navádění dalekohledu je nutný převod na zdánlivé souřadnice nebo
   na zobrazené topocentrické hodnoty azimutu a výšky. Atmosférická refrakce se
   bez místního tlaku a teploty neodhaduje.
+- Místo dopadu na povrchu je průsečík vakuové dráhy s elipsoidem WGS84;
+  brzdění v atmosféře, rozpad ani vítr se nemodelují, nejde tedy o předpověď
+  pole meteoritů. Rozptyl Monte Carlo vychází jen z formální kovariance stavu.
 - Jediná předběžná dráha z velmi krátkého oblouku není jednoznačné řešení.
   Slouží jako počáteční odhad pro diferenciální korekci; efemerida se v tomto
   režimu přednastaví po 10 minutách na následujících 48 hodin a její skutečná
@@ -337,6 +372,8 @@ Orbit-Solver/
 │   ├── linkage.py           # navazování návratů hledáním po linii variací
 │   ├── orbit_engine.py      # numerická N-body propagace
 │   ├── orbit_evolution.py   # návraty a planetární přiblížení
+│   ├── planet_relations.py  # MOID, Tisserandův parametr, rezonance, uzlové vzdálenosti
+│   ├── impact.py            # místo dopadu a jeho nejistota Monte Carlo
 │   ├── comet_dynamics.py    # original/future barycentrická dráha komet
 │   ├── observatories.py     # stanice, paralaxa a obzorové souřadnice
 │   ├── presentation.py      # čisté formátování a projekce bez závislosti na Qt

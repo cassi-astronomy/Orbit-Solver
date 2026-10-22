@@ -28,6 +28,13 @@ new language and remembers the choice for the next start.
   cache (NEOCP/PCCP objects change quickly and are not cached);
 - import of observations from a file or from the clipboard in the MPC
   80-column format;
+- short arcs of objects very close to the Earth (down to a few Earth radii,
+  e.g. 2008 TC3 an hour and 2024 BX1 minutes before impact): the preliminary
+  range search reaches 10 000 km, includes the Earth's rotation of the
+  observer, the Earth and the Moon, relaxes all six state components when the
+  coarse search misses, and a trajectory passing through a planet is rejected
+  as a collision; for 2024 BX1 the predicted entry (00:32:37 UTC, 15.20 km/s,
+  75.6°) matches the observed bolide;
 - support for satellite observations and topocentric parallax from the MPC
   station code;
 - own six-parameter fit of the Cartesian state with planetary perturbations;
@@ -102,7 +109,10 @@ new language and remembers the choice for the next start.
   trajectory in the Solar System – without running the integration again;
   the **Run integration** button is only for a different range;
 - conversion of the elements to a user-selected epoch;
-- osculating elements relative to the Sun or a selected planet;
+- osculating elements relative to the Sun; elements relative to a planet are
+  offered only when the body is gravitationally bound to it (inside its Hill
+  sphere with negative planetocentric energy, e.g. Shoemaker–Levy 9 around
+  Jupiter or a temporarily captured minimoon);
 - copyable text output and MPC 1-line elements;
 - geocentric or topocentric ephemeris for a selected MPC station;
 - numerical N-body propagation from the Cartesian state even for a purely
@@ -158,7 +168,32 @@ new language and remembers the choice for the next start.
   as a dynamical “switch” and at the moment of the flyby the highlight moves
   from the incoming to the outgoing branch; the animated position follows the
   real change of the orbit after the encounter;
-- optional local planetocentric view for captured objects; lunar
+- **relation to a planet** for a body orbiting the Sun: distance from the
+  planet over time (logarithmic, with the Hill sphere and for the Earth the
+  lunar distance), MOID — the minimum distance between the two orbits — (for
+  the Earth with the 0.05 AU limit of potentially hazardous objects), the
+  Tisserand parameter with respect to the planet (for Jupiter with the
+  T = 2 and T = 3 class limits), the period ratio P / P_planet with nearby
+  mean-motion resonances, and the nodal distances (where the orbit crosses
+  the planet's orbital plane); planet orbits use the JPL mean elements with
+  their secular rates;
+- the encounter table also lists the hyperbolic excess speed v∞ and the
+  changes of the Tisserand parameter and of the MOID caused by the encounter;
+  the time of closest approach is found by a 1-D search on precise
+  integrations, so even a flyby of a few hours is not missed;
+- every own fit is checked for a collision with a planet or the Moon within
+  one year after its epoch; a predicted impact is announced in a dialog and
+  shown prominently in the Elements tab (time, place, uncertainty); the
+  ephemeris, the view from Earth and the other previews end at the impact;
+- **impacts**: a trajectory entering a planet or the Moon ends the
+  integration at the moment of contact; for the Earth the program gives the
+  time, geographic coordinates, air-relative speed and path angle of the
+  atmospheric entry (100 km) and of the surface point of the vacuum
+  trajectory (WGS84), with a Monte Carlo uncertainty from the fit covariance
+  (impacting fraction of clones, 1σ ellipse on the ground, time); for
+  2008 TC3 the entry agrees with the JPL prediction within 1 s and 1.4 km;
+- optional planetocentric elements while a planet holds the body (capture);
+  optional local planetocentric view for captured objects; lunar
   perturbations are included (from DE440, or with an approximate model
   without it);
 - fragments of comet Shoemaker–Levy 9 can be loaded by their full
@@ -310,6 +345,10 @@ software.
   to apparent coordinates or the displayed topocentric azimuth and altitude.
   Atmospheric refraction is not estimated without the local pressure and
   temperature.
+- The impact point on the ground is where the vacuum trajectory meets the
+  WGS84 ellipsoid; atmospheric deceleration, fragmentation and wind are not
+  modelled, so it is not a strewn-field prediction. The Monte Carlo spread
+  reflects the formal fit covariance of the state only.
 - A single preliminary orbit from a very short arc is not a unique solution.
   It serves as an initial estimate for the differential correction; in this
   mode the ephemeris is preset to 10-minute steps over the next 48 hours and
@@ -363,6 +402,8 @@ Orbit-Solver/
 │   ├── linkage.py           # linkage of returns by line-of-variations search
 │   ├── orbit_engine.py      # numerical N-body propagation
 │   ├── orbit_evolution.py   # returns and planetary approaches
+│   ├── planet_relations.py  # MOID, Tisserand parameter, resonances, nodal distances
+│   ├── impact.py            # impact location and its Monte Carlo uncertainty
 │   ├── comet_dynamics.py    # original/future barycentric comet orbits
 │   ├── observatories.py     # stations, parallax and horizontal coordinates
 │   ├── presentation.py      # pure formatting and projections without Qt
