@@ -192,6 +192,62 @@ class EngineTests(unittest.TestCase):
         np.testing.assert_allclose(engine.acceleration(epoch, position), expected, rtol=1e-12)
 
 
+    def test_fast_nongravitational_law_matches_reference_formula(self):
+        from orbit_app.orbit_engine import nongravitational_acceleration
+
+        position = np.array([.4, .45, .05]); velocity = np.array([-.012, .016, .002])
+        ephemeris = SplinePlanetEphemeris(PLANETS, ("jupiter",), 2451540.0, 2451550.0)
+        for parameters in (
+            {"A1": 6.5e-10, "A2": 1.55e-10},
+            {"A1": 1e-9, "A2": -2e-10, "A3": 3e-11, "DT": 25.0},
+            {"A2": -3e-14, "R_EXPONENT": 2.0},
+        ):
+            with self.subTest(parameters=parameters):
+                engine = NBodyIntegrator(ephemeris, nongravitational_parameters=parameters)
+                np.testing.assert_allclose(
+                    engine._nongravitational_acceleration(position, velocity),  # noqa: SLF001
+                    nongravitational_acceleration(position, velocity, parameters),
+                    rtol=1e-13, atol=0.0,
+                )
+
+    def test_direct_spline_evaluation_matches_scipy(self):
+        ephemeris = SplinePlanetEphemeris(
+            PLANETS, ("jupiter", "earth", "moon"), 2400000.5, 2410000.5,
+        )
+        epochs = np.concatenate((
+            ephemeris.epochs[[0, 1, 4567, -2, -1]],
+            np.random.default_rng(7).uniform(2400000.5, 2410000.5, 500),
+        ))
+        for epoch in epochs:
+            np.testing.assert_allclose(
+                ephemeris.positions_array(("jupiter", "earth", "moon"), epoch),
+                ephemeris.spline(epoch), rtol=0.0, atol=1e-14,
+            )
+        np.testing.assert_allclose(
+            ephemeris.positions_array(("moon", "jupiter"), epochs[7]),
+            ephemeris.spline(epochs[7])[[2, 0]], rtol=0.0, atol=1e-14,
+        )
+
+    def test_gravity_jacobian_matches_numerical_derivative(self):
+        epoch = 2451545.0
+        ephemeris = SplinePlanetEphemeris(PLANETS, ("jupiter", "earth"), epoch - 5, epoch + 5)
+        engine = NBodyIntegrator(ephemeris, perturbers=tuple(
+            body for body in NBodyIntegrator(ephemeris).perturbers
+            if body.name in ("jupiter", "earth")
+        ), include_solar_relativity=False)
+        position = np.array([4.9, .8, .1]); velocity = np.zeros(3)
+        analytic = engine._acceleration_partials(  # noqa: SLF001
+            epoch, position, velocity, (), np.empty(0),
+        )[0]
+        step = 1e-6
+        numeric = np.column_stack([
+            (engine.acceleration(epoch, position + step * axis)
+             - engine.acceleration(epoch, position - step * axis)) / (2 * step)
+            for axis in np.eye(3)
+        ])
+        np.testing.assert_allclose(analytic, numeric, rtol=1e-6, atol=1e-14)
+
+
 class ApparitionGroupingTests(unittest.TestCase):
     def test_gap_of_half_a_period_starts_a_new_apparition(self):
         observations = [
@@ -216,6 +272,24 @@ class ApparitionGroupingTests(unittest.TestCase):
         groups = _observing_apparition_groups(observations, modern)
         self.assertEqual([len(group) for group in groups], [3, 3])
 
+    def test_survey_coverage_does_not_merge_consecutive_returns(self):
+        # 78P (P = 7.2 yr): followed 2011-2015, then again from 2018.  The
+        # 2015-2018 gap is shorter than half a period, but one block may not
+        # span most of a revolution.
+        observations = [
+            Observation(time=f"{year}-{month:02d}-15T00:00:00Z", ra_deg=1.0, dec_deg=2.0)
+            for year, month in (
+                (2011, 6), (2011, 12), (2012, 6), (2013, 1), (2014, 2), (2015, 4),
+                (2018, 5), (2019, 3), (2020, 6), (2021, 4),
+            )
+        ]
+        gehrels = OrbitSolution("78P", 2456000.5, 3.739, .463, 6.26, 210.6, 192.8, 0.3)
+        groups = _observing_apparition_groups(observations, gehrels)
+        self.assertEqual(
+            [(group[0].time[:4], group[-1].time[:4]) for group in groups],
+            [("2011", "2015"), ("2018", "2021")],
+        )
+
 
 class QualityGateTests(unittest.TestCase):
     @staticmethod
@@ -238,6 +312,24 @@ class QualityGateTests(unittest.TestCase):
             observations, groups, None, None, None, None, None, lambda *a, **k: None, None,
         )
 
+    def test_each_correction_forgets_o_c_of_earlier_orbits(self):
+        # A correction fits a sample and refreshes O-C only on its rows; stale
+        # O-C (e.g. from the appraisal of the catalogue seed) must not enter
+        # the quality gate of the new apparition.
+        linker = self._linker([1.0, 60.0])
+        fitted = linker.groups[1][:2]
+
+        def fit_once(rows, *args, **kwargs):
+            for observation in rows:
+                observation.residual_ra_arcsec = observation.residual_dec_arcsec = 0.5
+            return None, 0.5, len(rows)
+
+        linker._fit_once = fit_once  # noqa: SLF001
+        linker.fit_once(fitted)
+        self.assertEqual(linker.group_quality(1)[2], 2)
+        self.assertLess(linker.group_quality(1)[0], 1.0)
+        self.assertTrue(all(item.residual_ra_arcsec is None for item in linker.groups[0]))
+
     def test_new_apparition_must_fit_its_own_astrometry(self):
         linker = self._linker([1.0, 4.0])
         self.assertFalse(linker.accepted([0, 1], new=[1]))
@@ -246,6 +338,44 @@ class QualityGateTests(unittest.TestCase):
         linker = self._linker([5.0, 1.0])
         self.assertTrue(linker.accepted([0, 1], new=[1]))
         self.assertFalse(self._linker([7.0, 1.0]).accepted([0, 1], new=[1]))
+
+
+class LinkageRetryTests(unittest.TestCase):
+    def test_failed_return_is_retried_after_another_return_is_linked(self):
+        # 1P with a gravity-only start: 1910 misses while only 1986 is linked,
+        # but lies between 1835 and 1986 once 1835 has been joined.
+        from unittest import mock
+
+        from orbit_app.linkage import LinkageFailed, _Linker
+
+        groups = [
+            [Observation(time=f"{year}-{month:02d}-01T00:00:00Z", ra_deg=1.0, dec_deg=2.0)
+             for month in range(1, 13)][:size]
+            for year, size in ((1835, 3), (1910, 6), (1986, 12))
+        ]
+        observations = [item for group in groups for item in group]
+        linker = _Linker(
+            observations, groups, None, None, None, None, None, lambda *a, **k: None, None,
+        )
+        seed = OrbitSolution("1P", 2446470.5, 17.9, .967, 162.2, 58.9, 111.9, 0.0)
+        attempts: list[tuple[int, tuple[int, ...]]] = []
+
+        def link_next(linked, current, index):
+            attempts.append((index, tuple(linked)))
+            if index == 1 and linked == [2]:
+                raise LinkageFailed("miss")
+            return seed, 1.0, 10
+
+        with mock.patch.multiple(
+            linker, catalogue_shortcut=lambda: False,
+            fit_anchor=lambda index: (seed, 1.0, 10), well_predicted=lambda *a: [],
+            link_next=link_next, final_fit=lambda linked, current: (seed, 1.0, 10),
+            _report_unfitted=lambda *a: None, accepted=lambda *a, **k: True,
+            group_quality=lambda index: (1.0, 1.0, 3),
+        ):
+            _result, records, _note = linker.run()
+        self.assertEqual(attempts, [(1, (2,)), (0, (2,)), (1, (0, 2))])
+        self.assertEqual([record["status"] for record in records], ["linked"] * 3)
 
 
 class LineOfVariationsTests(unittest.TestCase):

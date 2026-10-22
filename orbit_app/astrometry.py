@@ -226,7 +226,8 @@ _ADES_CATALOG_RANK = {
     "UCAC3": 78, "CMC15": 76, "UCAC2": 72, "2MASS": 70, "NOMAD": 66,
     "CMC14": 64, "TYCHO2": 60, "USNOB1": 55, "GSC2.3": 52, "GSC23": 52,
     "SDSS7": 50, "SDSS8": 50, "HIP2": 50, "PPM": 40, "USNOA2": 30,
-    "USNOSA2": 30, "USNOA1": 25,
+    "USNOSA2": 30, "USNOA1": 25, "GSCACT": 20, "GSC1.2": 18, "GSC12": 18,
+    "GSC": 15,
 }
 
 

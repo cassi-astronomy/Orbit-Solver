@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+import math
+
 import numpy as np
 from scipy.integrate import solve_ivp
 from .i18n import tr
@@ -25,11 +27,11 @@ def solar_post_newtonian_acceleration(
     """
     r_vector = np.asarray(position, dtype=float)
     v_vector = np.asarray(velocity, dtype=float)
-    radius = float(np.linalg.norm(r_vector))
+    radius = math.sqrt(float(r_vector @ r_vector))
     if radius <= 0.0:
         raise ValueError(tr("Těleso nemůže být ve středu Slunce."))
-    speed2 = float(np.dot(v_vector, v_vector))
-    radial_product = float(np.dot(r_vector, v_vector))
+    speed2 = float(v_vector @ v_vector)
+    radial_product = float(r_vector @ v_vector)
     factor = MU_SUN / (C_AU_PER_DAY**2 * radius**3)
     return factor * (
         (4.0 * MU_SUN / radius - speed2) * r_vector
@@ -164,7 +166,7 @@ def nongravitational_acceleration(
         distance_factor = radius ** -exponent
     else:
         activity_radius = delayed_heliocentric_radius(
-            position, velocity, float(parameters.get(tr("DT"), 0.0)),
+            position, velocity, float(parameters.get("DT", 0.0)),
         )
         distance_factor = float(marsden_water_ice_law(activity_radius))
     return distance_factor * direction
@@ -254,6 +256,25 @@ class NBodyIntegrator:
             float(self.nongravitational_parameters.get(name, 0.0))
             for name in ("A1", "A2", "A3")
         )
+        # Force-law constants resolved once; the integrator evaluates the law
+        # millions of times per fit (same formulas as
+        # nongravitational_acceleration()).
+        parameters = self.nongravitational_parameters
+        self._ng_coefficients = tuple(
+            float(parameters.get(name, 0.0)) for name in ("A1", "A2", "A3")
+        )
+        self._ng_exponent = (
+            float(parameters["R_EXPONENT"]) if "R_EXPONENT" in parameters else None
+        )
+        if self._ng_exponent is not None and not (
+            np.isfinite(self._ng_exponent) and self._ng_exponent > 0.0
+        ):
+            raise FloatingPointError(tr("Exponent negravitačního modelu musí být kladný."))
+        self._ng_delay = float(parameters.get("DT", 0.0))
+        # Last perturber positions: the variational derivative needs them
+        # twice (acceleration and its partials) at the same instant.
+        self._planet_cache_jd: float | None = None
+        self._planet_cache: np.ndarray | None = None
 
     def with_parameters(
         self, nongravitational_parameters: dict[str, float] | None,
@@ -270,9 +291,13 @@ class NBodyIntegrator:
         """Heliocentric perturber positions as an ``(N, 3)`` array in AU."""
         if not self._names:
             return np.empty((0, 3), dtype=float)
+        if jd == self._planet_cache_jd:
+            return self._planet_cache
         array_method = getattr(self.ephemeris, "positions_array", None)
         if callable(array_method):
-            return array_method(self._names, jd)
+            values = array_method(self._names, jd)
+            self._planet_cache_jd, self._planet_cache = jd, values
+            return values
         batch_method = getattr(self.ephemeris, "positions", None)
         if callable(batch_method):
             values = batch_method(self._names, jd)
@@ -294,28 +319,53 @@ class NBodyIntegrator:
         if self._names:
             planets = self._planet_positions(jd)
             relative = planets - position
-            distance = np.sqrt(np.einsum("ij,ij->i", relative, relative))
-            planet_radius = np.sqrt(np.einsum("ij,ij->i", planets, planets))
-            valid = (distance > 0.0) & (planet_radius > 0.0)
+            distance2 = (relative * relative).sum(axis=1)
+            planet_radius2 = (planets * planets).sum(axis=1)
+            valid = (distance2 > 0.0) & (planet_radius2 > 0.0)
             if not np.all(valid):
                 relative = relative[valid]
                 planets = planets[valid]
-                distance = distance[valid]
-                planet_radius = planet_radius[valid]
+                distance2 = distance2[valid]
+                planet_radius2 = planet_radius2[valid]
                 mu = self._mu[valid]
             else:
                 mu = self._mu
             acceleration = acceleration + (
-                mu[:, None] * (
-                    relative / distance[:, None] ** 3
-                    - planets / planet_radius[:, None] ** 3
-                )
-            ).sum(axis=0)
+                (mu / (distance2 * np.sqrt(distance2))) @ relative
+                - (mu / (planet_radius2 * np.sqrt(planet_radius2))) @ planets
+            )
         if velocity is not None and self._has_nongravitational:
-            acceleration = acceleration + nongravitational_acceleration(
-                position, velocity, self.nongravitational_parameters
+            acceleration = acceleration + self._nongravitational_acceleration(
+                position, velocity,
             )
         return acceleration
+
+    def _activity_law(self, position: np.ndarray, velocity: np.ndarray, radius: float) -> float:
+        """g(r) of the configured law (Marsden water ice, or r^-m)."""
+        if self._ng_exponent is not None:
+            return radius ** -self._ng_exponent
+        activity_radius = (
+            radius if abs(self._ng_delay) < 1e-12
+            else delayed_heliocentric_radius(position, velocity, self._ng_delay)
+        )
+        scaled = max(activity_radius, 1e-12) / 2.808
+        return 0.111262 * scaled ** -2.15 * (1.0 + scaled ** 5.093) ** -4.6142
+
+    def _nongravitational_acceleration(
+        self, position: np.ndarray, velocity: np.ndarray,
+    ) -> np.ndarray:
+        """A1/A2/A3 in RTN; identical to nongravitational_acceleration()."""
+        radius = math.sqrt(float(position @ position))
+        radial = position / radius
+        normal_vector = _cross(position, velocity)
+        normal_norm = math.sqrt(float(normal_vector @ normal_vector))
+        if normal_norm <= 1e-18:
+            return np.zeros(3, dtype=float)
+        normal = normal_vector / normal_norm
+        transverse = _cross(normal, radial)
+        a1, a2, a3 = self._ng_coefficients
+        direction = a1 * radial + a2 * transverse + a3 * normal
+        return self._activity_law(position, velocity, radius) * direction
 
     def _acceleration_partials(
         self, jd: float, position: np.ndarray, velocity: np.ndarray,
@@ -332,23 +382,24 @@ class NBodyIntegrator:
         differenced.  ``parameter_scales`` maps optimizer units to the physical
         units used by the force model (AU/day² for A1--A3, days for DT).
         """
-        identity = np.eye(3)
-        radius = float(np.linalg.norm(position))
-        position_jacobian = MU_SUN * (
-            3.0 * np.outer(position, position) / radius**5
-            - identity / radius**3
-        )
+        radius = math.sqrt(float(position @ position))
+        inverse3 = MU_SUN / radius**3
+        position_jacobian = (3.0 * inverse3 / (radius * radius)) * np.outer(position, position)
+        trace_term = inverse3
         if self._names:
             relative = self._planet_positions(jd) - position
-            distance = np.sqrt(np.einsum("ij,ij->i", relative, relative))
-            valid = distance > 0.0
-            relative = relative[valid]
-            distance = distance[valid]
-            mu = self._mu[valid]
-            position_jacobian = position_jacobian + (
-                3.0 * np.einsum("k,ki,kj->ij", mu / distance**5, relative, relative)
-                - identity * float(np.sum(mu / distance**3))
-            )
+            distance2 = (relative * relative).sum(axis=1)
+            if np.all(distance2 > 0.0):
+                mu = self._mu
+            else:
+                valid = distance2 > 0.0
+                relative, distance2, mu = relative[valid], distance2[valid], self._mu[valid]
+            weight3 = mu / (distance2 * np.sqrt(distance2))
+            position_jacobian += (3.0 * relative.T * (weight3 / distance2)) @ relative
+            trace_term += float(weight3.sum())
+        position_jacobian[0, 0] -= trace_term
+        position_jacobian[1, 1] -= trace_term
+        position_jacobian[2, 2] -= trace_term
         # Non-gravitational accelerations are ~1e-8 of solar gravity; their
         # own dependence on r and v is negligible in a Gauss-Newton Jacobian.
         velocity_jacobian = np.zeros((3, 3), dtype=float)
@@ -358,17 +409,12 @@ class NBodyIntegrator:
         parameters = self.nongravitational_parameters
         radial = position / radius
         normal = _cross(position, velocity)
-        normal_norm = float(np.linalg.norm(normal))
+        normal_norm = math.sqrt(float(normal @ normal))
         if normal_norm <= 1e-18:
             return position_jacobian, velocity_jacobian, parameter_jacobian
         normal = normal / normal_norm
         transverse = _cross(normal, radial)
-        if "R_EXPONENT" in parameters:
-            law = radius ** -float(parameters["R_EXPONENT"])
-        else:
-            law = float(marsden_water_ice_law(delayed_heliocentric_radius(
-                position, velocity, float(parameters.get(tr("DT"), 0.0)),
-            )))
+        law = self._activity_law(position, velocity, radius)
         directions = {"A1": radial, "A2": transverse, "A3": normal}
         for column, (name, scale) in enumerate(zip(parameter_names, parameter_scales)):
             if name in directions:

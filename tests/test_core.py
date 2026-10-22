@@ -283,6 +283,16 @@ $$EOE
         self.assertEqual(observation.station, "F51")
         self.assertAlmostEqual(observation.dec_deg or 0.0, -2.25)
 
+    def test_lowercase_ades_names_from_mpc_service_are_mapped(self):
+        # The MPC get-obs service returns ADES names in lower case.
+        observation = MpcClient._to_observation({
+            "permid": "78P", "obstime": "2004-10-07T07:58:00.480Z", "ra": 10.0,
+            "dec": 5.0, "stn": "699", "astcat": "UCAC2", "mode": "CCD",
+        }, "fallback")
+        self.assertEqual(observation.designation, "78P")
+        self.assertEqual(observation.catalog, "UCAC2")
+        self.assertEqual(observation.time, "2004-10-07T07:58:00.480Z")
+
     def test_ades_dict_response_mapping(self):
         body = {"ADES_DF": [{"provID": "2026 AB", "ra": "1", "dec": "2"}]}
         self.assertEqual(len(MpcClient._extract_rows(body)), 1)
@@ -1275,6 +1285,55 @@ class NativeIntegratorTests(unittest.TestCase):
         start, stop = evolution_span(solution, "years", 150, 200)
         self.assertAlmostEqual(solution.epoch_jd - start, 150 * 365.25)
         self.assertAlmostEqual(stop - solution.epoch_jd, 200 * 365.25)
+
+    def test_evolution_span_is_clipped_to_planetary_coverage(self):
+        from orbit_app.orbit_evolution import COVERAGE_MARGIN_DAYS, clip_span_to_coverage
+        from orbit_app.planetary import DE440_COVERAGE
+
+        start, stop = clip_span_to_coverage(2000000.0, 3000000.0, DE440_COVERAGE)
+        self.assertEqual(start, DE440_COVERAGE[0] + COVERAGE_MARGIN_DAYS)
+        self.assertEqual(stop, DE440_COVERAGE[1] - COVERAGE_MARGIN_DAYS)
+        self.assertEqual(clip_span_to_coverage(1.0, 2.0, None), (1.0, 2.0))
+        with self.assertRaises(ValueError):
+            clip_span_to_coverage(1000000.0, 1100000.0, DE440_COVERAGE)
+
+    def test_evolution_panel_guards_ranges_beyond_de440(self):
+        # 200 returns of 78P (P = 7.2 yr) instead of 200 years: about 1450
+        # years each way, far outside DE440.
+        from unittest import mock
+
+        from PySide6.QtWidgets import QApplication, QMessageBox
+
+        from orbit_app import main_window
+        from orbit_app.planetary import DE440_COVERAGE
+
+        _application = QApplication.instance() or QApplication([])
+        planets = mock.Mock(coverage_jd=DE440_COVERAGE, model_name="JPL DE440")
+        solution = OrbitSolution(
+            "78P", 2456000.5, 3.739, .463, 6.26, 210.6, 192.8, 0.3,
+            position_au=(2.0, 0.0, 0.0), velocity_au_per_day=(0.0, .015, 0.0),
+        )
+        with mock.patch.object(main_window, "PLANETS", planets):
+            panel = main_window.OrbitEvolutionPanel(solution)
+            panel.set_solution(solution)
+            panel.past.setValue(200); panel.future.setValue(200)
+            self.assertIn("f0a03c", panel.span_hint.styleSheet())
+            with mock.patch.object(
+                main_window.QMessageBox, "question", return_value=QMessageBox.No,
+            ):
+                self.assertIsNone(panel._confirmed_span())  # noqa: SLF001
+            with mock.patch.object(
+                main_window.QMessageBox, "question", return_value=QMessageBox.Yes,
+            ) as question:
+                start, stop = panel._confirmed_span()  # noqa: SLF001
+            self.assertGreater(start, DE440_COVERAGE[0])
+            self.assertLess(stop, DE440_COVERAGE[1])
+            self.assertEqual(question.call_count, 1)  # ~1100 yr clipped: no 2nd prompt
+            panel.past.setValue(5); panel.future.setValue(5)
+            self.assertEqual(panel.span_hint.styleSheet(), "")
+            with mock.patch.object(main_window.QMessageBox, "question") as question:
+                self.assertIsNotNone(panel._confirmed_span())  # noqa: SLF001
+            question.assert_not_called()
 
     def test_return_range_rejects_open_orbit(self):
         solution = OrbitSolution("Open", 2451545.0, -10.0, 1.1, 0.0, 0.0, 0.0, 0.0)

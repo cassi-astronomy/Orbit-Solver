@@ -16,7 +16,7 @@ CATALOG: dict[str, str] = {
     "    od {0} {1:.6f} AU":
         "    from {0} {1:.6f} AU",
     "  Detekováno planetocentrické zachycení: ":
-        "  Planetocentric capture detected:",
+        "  Planetocentric capture detected: ",
     "  budoucí":
         "  future",
     " a následně original/future 1/a":
@@ -198,7 +198,7 @@ CATALOG: dict[str, str] = {
     "Fit zůstane kvůli numerické stabilitě v epoše uprostřed pozorování; výsledné oskulační elementy se po výpočtu převedou na tuto epochu.":
         "For numerical stability the fit stays at an epoch in the middle of the observations; the resulting osculating elements are converted to this epoch afterwards.",
     "Fixace elementů je vynucena během diferenciální korekce. Pro parabolickou hypotézu lze nastavit e = 1. ":
-        "Element constraints are enforced during the differential correction. For a parabolic hypothesis set e = 1.",
+        "Element constraints are enforced during the differential correction. For a parabolic hypothesis set e = 1. ",
     "Fixovat objekt ve středu":
         "Keep the object centred",
     "Fáze":
@@ -328,7 +328,7 @@ CATALOG: dict[str, str] = {
     "MPC kód observatoře; 500 znamená geocentrickou efemeridu.":
         "MPC observatory code; 500 means a geocentric ephemeris.",
     "MPC neposkytlo počáteční dráhu, proto bude nejprve určena z astrometrie; fixace elementů se zpřístupní po prvním úspěšném fitu. ":
-        "The MPC did not provide an initial orbit, so it will first be determined from the astrometry; element constraints become available after the first successful fit.",
+        "The MPC did not provide an initial orbit, so it will first be determined from the astrometry; element constraints become available after the first successful fit. ",
     "MPC nevrátil použitelné kartézské elementy dráhy.":
         "The MPC did not return usable Cartesian orbital elements.",
     "MPC orbitální dotaz selhal: {0}":
@@ -362,7 +362,7 @@ CATALOG: dict[str, str] = {
     "Najde a označí nejhorší dosud nevyřazené pozorování podle většího z absolutních reziduí RA a Dec.":
         "Finds and marks the worst observation not yet excluded, by the larger of the absolute RA and Dec residuals.",
     "Napětí modelu (nad {0:g}σ) v návratech ":
-        "Model tension (above {0:g}σ) in returns",
+        "Model tension (above {0:g}σ) in returns ",
     "Navázáno {0} z {1} návratů; ostatní jsou jen předpovědí.":
         "Linked {0} of {1} returns; the others are predictions only.",
     "Navázání pozorovaných návratů:":
@@ -752,7 +752,7 @@ CATALOG: dict[str, str] = {
     "Střed intervalu:":
         "Interval centre:",
     "Střed: ":
-        "Centre:",
+        "Centre: ",
     "Střed: {0}":
         "Centre: {0}",
     "Střední anomálie M [°]":
@@ -988,7 +988,7 @@ CATALOG: dict[str, str] = {
     "Závislost na vzdálenosti:":
         "Distance dependence:",
     "Závěrečná korekce návrat nepotvrdila: ":
-        "The final correction did not confirm the return:",
+        "The final correction did not confirm the return: ",
     "Závěrečná přesná korekce všech navázaných návratů…":
         "Final precise correction of all linked returns…",
     "analytický model":
@@ -1090,7 +1090,7 @@ CATALOG: dict[str, str] = {
     "propagace na návrat selhala: {0}":
         "propagation to the return failed: {0}",
     "předběžná dráha z krátkého oblouku: ":
-        "preliminary orbit from the short arc:",
+        "preliminary orbit from the short arc: ",
     "přímá korekce":
         "direct correction",
     "přímá předpověď: medián {0:.1f}σ":
@@ -1190,7 +1190,7 @@ CATALOG: dict[str, str] = {
     "{0} — vývoj {1} ({2}-centrické elementy)":
         "{0} — evolution of {1} ({2}-centric elements)",
     "{0} — {1}-centrický pohled — ":
-        "{0} — {1}-centric view —",
+        "{0} — {1}-centric view — ",
     "{0} • Graf viditelnosti • {1} {2} • {3}\nstřed {4:%Y-%m-%d %H:%M} {5}":
         "{0} • Visibility plot • {1} {2} • {3}\ncentre {4:%Y-%m-%d %H:%M} {5}",
     "{0} • uplynulo: {1} • {2}":
@@ -1246,7 +1246,7 @@ CATALOG: dict[str, str] = {
     "Řádek {0} není platné optické MPC 80-col pozorování.":
         "Line {0} is not a valid optical MPC 80-col observation.",
     "Řádků: ":
-        "Rows:",
+        "Rows: ",
     "Žádné perihelové průchody ani planetární setkání nebyly nalezeny.":
         "No perihelion passages or planetary encounters were found.",
     "Žádné zařazené pozorování nemá reziduum větší než 2″.":
@@ -1273,4 +1273,18 @@ CATALOG: dict[str, str] = {
         "Downloads the complete astrometry from the MPC again (including new observations) and overwrites the local cache.",
     " z místní cache (staženo z MPC {0:%Y-%m-%d %H:%M} UTC; pro nová data použijte Aktualizovat astrometrii z MPC)":
         " from the local cache (downloaded from the MPC {0:%Y-%m-%d %H:%M} UTC; use Update astrometry from the MPC for new data)",
+    "Návraty byly navázány postupně od nejlépe pozorovaného ({0}); každý další byl připojen přímou korekcí navázané dráhy.":
+        "Returns were linked one by one, starting from the best observed one ({0}); each further return was joined by a direct correction of the linked orbit.",
+    "Zvolený rozsah leží celý mimo pokrytí planetární efemeridy.":
+        "The selected range lies entirely outside the coverage of the planetary ephemeris.",
+    "≈ {0:.0f}–{1:.0f} ({2:.0f} let)":
+        "≈ {0:.0f}–{1:.0f} ({2:.0f} years)",
+    "Rozsah přesahuje pokrytí planetární efemeridy {0} ({1:.0f}–{2:.0f}).":
+        "The range exceeds the coverage of the planetary ephemeris {0} ({1:.0f}–{2:.0f}).",
+    "Požadovaný rozsah {0:.0f}–{1:.0f} ({2:.0f} let) přesahuje pokrytí planetární efemeridy {3} ({4:.0f}–{5:.0f}).\n\nIntegrovat jen v rámci pokrytí, tedy {6:.0f}–{7:.0f}?":
+        "The requested range {0:.0f}–{1:.0f} ({2:.0f} years) exceeds the coverage of the planetary ephemeris {3} ({4:.0f}–{5:.0f}).\n\nIntegrate only within the coverage, i.e. {6:.0f}–{7:.0f}?",
+    "Integrace přes {0:.0f} let ({1:.0f}–{2:.0f}) může trvat mnoho minut a tak vzdálená extrapolace je velmi nejistá.\n\nPokračovat?":
+        "An integration over {0:.0f} years ({1:.0f}–{2:.0f}) may take many minutes, and such a distant extrapolation is very uncertain.\n\nContinue?",
+    "\n\nTip: návraty byly propojeny čistě gravitačním modelem. Aktivní kometa (např. 1P/Halley) se přes více oběhů obvykle navázat nedá bez negravitačních parametrů; povolte A1 a A2 ve Vlastním nastavení a výpočet zopakujte.":
+        "\n\nTip: the returns were linked by a purely gravitational model. An active comet (e.g. 1P/Halley) usually cannot be linked over several revolutions without non-gravitational parameters; enable A1 and A2 in Custom settings and repeat the calculation.",
 }

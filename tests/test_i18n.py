@@ -27,6 +27,15 @@ class TranslationCatalogTests(unittest.TestCase):
             with self.subTest(czech=czech):
                 self.assertEqual(_fields(czech), _fields(english))
 
+    def test_translations_keep_edge_whitespace(self):
+        # Fragments are joined with values ("Centre: " + name), so leading
+        # and trailing spaces/newlines are part of the template.
+        for czech, english in CATALOG.items():
+            with self.subTest(czech=czech):
+                self.assertEqual(czech[:len(czech) - len(czech.lstrip())],
+                                 english[:len(english) - len(english.lstrip())])
+                self.assertEqual(czech[len(czech.rstrip()):], english[len(english.rstrip()):])
+
     def test_translations_contain_no_czech_words(self):
         czech_letters = set("áčďěíňřšťúůýžÁČĎĚÍŇŘŠŤÚŮÝŽ")
         allowed = ("Ondřejov", "Mašek", "Väisälä")

@@ -31,9 +31,9 @@ __all__ = [
 ]
 
 C_AU_PER_DAY = 173.1446326846693
-NONGRAVITATIONAL_NAMES = ("A1", "A2", "A3", tr("DT"))
+NONGRAVITATIONAL_NAMES = ("A1", "A2", "A3", "DT")
 # Optimizer units: A1–A3 are fitted in units of 1e-8 AU/day², DT in days.
-_NONGRAV_SCALE = {"A1": 1e-8, "A2": 1e-8, "A3": 1e-8, tr("DT"): 1.0}
+_NONGRAV_SCALE = {"A1": 1e-8, "A2": 1e-8, "A3": 1e-8, "DT": 1.0}
 _PLANET_NAMES = (
     "mercury", "venus", "earth", "moon", "mars",
     "jupiter", "saturn", "uranus", "neptune", "pluto",
@@ -309,7 +309,7 @@ def _formal_element_uncertainties(
         })
         for index, name in enumerate(nongrav_names, start=6):
             # A parameters are scaled by 1e-8 inside the optimiser; DT is days.
-            scale = 1.0 if name == tr("DT") else 1e-8
+            scale = 1.0 if name == "DT" else 1e-8
             uncertainties[name] = float(
                 np.sqrt(max(0.0, parameter_covariance[index, index])) * scale
             )
@@ -1087,7 +1087,7 @@ def _fit_orbit_once(
         astrometry = projected(propagated)
         column_steps = np.concatenate((
             np.array([1e-6, 1e-6, 1e-6, 1e-8, 1e-8, 1e-8]),
-            np.array([.05 if name == tr("DT") else 5e-3 for name in nongrav_names]),
+            np.array([.05 if name == "DT" else 5e-3 for name in nongrav_names]),
         ))
         jacobian = np.empty((astrometry.size, 6 + len(nongrav_names)), dtype=float)
         # Only the cheap sky projection is differenced; the expensive dynamical
@@ -1123,11 +1123,12 @@ def _fit_orbit_once(
         return residual_values, jacobian_values
 
     def optimizer_residuals(vector: np.ndarray) -> np.ndarray:
-        if use_variational_jacobian:
-            try:
-                return variational_evaluation(vector)[0]
-            except (RuntimeError, ValueError, FloatingPointError, OverflowError):
-                return np.full(residual_size, 1e12, dtype=float)
+        # Residuals always come from the plain state integration, which is
+        # also used for the reported O-C.  The augmented variational system
+        # is controlled by an RMS error over all 6+6(6+P) components, so its
+        # *state* is markedly less accurate (1P near the 1986 perihelion:
+        # 1e-6 AU against 7e-8 AU, i.e. tenths of an arcsecond); it only
+        # supplies the Jacobian, whose small errors merely shape the step.
         return residuals_with_engine(vector, optimizer_engine)
 
     fine_scale = np.concatenate((
@@ -1137,7 +1138,7 @@ def _fit_orbit_once(
     # The scaled A limit of 100 means 1e-6 AU/day^2, already far above the
     # usual Marsden parameters, while still admitting a larger supplied seed.
     nongrav_limits = np.array([
-        max(365.0, abs(initial_nongrav.get(name, 0.0)) * 2.0 + 30.0) if name == tr("DT")
+        max(365.0, abs(initial_nongrav.get(name, 0.0)) * 2.0 + 30.0) if name == "DT"
         else max(100.0, abs(initial_nongrav.get(name, 0.0)) / 1e-8 * 10.0 + 10.0)
         for name in nongrav_names
     ])
@@ -1145,7 +1146,7 @@ def _fit_orbit_once(
     upper_bounds = np.concatenate((np.full(6, np.inf), nongrav_limits))
     derivative_steps = np.concatenate((
         np.array([1e-5, 1e-5, 1e-5, 1e-9, 1e-9, 1e-9]),
-        np.array([.1 if name == tr("DT") else 1e-3 for name in nongrav_names]),
+        np.array([.1 if name == "DT" else 1e-3 for name in nongrav_names]),
     ))
 
     def optimizer_jacobian(vector: np.ndarray) -> np.ndarray:
@@ -1408,6 +1409,9 @@ def _orbital_period_days(solution: OrbitSolution | None) -> float | None:
 # Shortest observing gap that separates two apparitions (days): longer than the
 # seasonal solar-conjunction gap within one apparition.
 MINIMUM_APPARITION_GAP_DAYS = 300.0
+# Longest time span of one apparition as a fraction of the orbital period; a
+# longer block of observations contains consecutive returns.
+MAXIMUM_APPARITION_SPAN_PERIODS = 0.75
 
 
 def _observing_apparition_groups(
@@ -1422,6 +1426,12 @@ def _observing_apparition_groups(
     seed's osculating period at other epochs: extrapolating a perihelion time
     through Jupiter encounters can put a boundary in the middle of an
     apparition.  Without a bound orbit the minimum gap alone is used.
+
+    Modern surveys follow a short-period comet far from perihelion, so the
+    half-period rule alone may merge consecutive returns (78P: 2011-2015 and
+    2018-2021).  A block longer than ``MAXIMUM_APPARITION_SPAN_PERIODS``
+    periods is therefore split at its longest gap of at least the minimum
+    gap, repeatedly; one return never spans most of a revolution.
     """
     dated: list[tuple[datetime, Observation]] = []
     for observation in observations:
@@ -1447,7 +1457,27 @@ def _observing_apparition_groups(
             blocks.append([item[1] for item in dated[start:index]])
             start = index
     blocks.append([item[1] for item in dated[start:]])
-    return blocks
+    if period_days is None:
+        return blocks
+    maximum_span_days = MAXIMUM_APPARITION_SPAN_PERIODS * period_days
+    pending = blocks[::-1]
+    result: list[list[Observation]] = []
+    while pending:
+        block = pending.pop()
+        instants = [parse_observation_time(item.time) for item in block]
+        if (instants[-1] - instants[0]).total_seconds() / 86400.0 <= maximum_span_days:
+            result.append(block)
+            continue
+        gaps = [
+            ((instants[index] - instants[index - 1]).total_seconds() / 86400.0, index)
+            for index in range(1, len(block))
+        ]
+        gap, split = max(gaps)
+        if gap < MINIMUM_APPARITION_GAP_DAYS:
+            result.append(block)
+            continue
+        pending.extend((block[split:], block[:split]))
+    return result
 
 
 def _apparition_linkage_record(

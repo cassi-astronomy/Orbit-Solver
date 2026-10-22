@@ -411,6 +411,39 @@ def _solution_state(solution: OrbitSolution) -> StateVector:
     )
 
 
+# Margin kept inside the planetary-kernel coverage (days) for the spline padding
+# and the light-time iteration.
+COVERAGE_MARGIN_DAYS = 5.0
+# Integrations longer than this (years) are confirmed in the GUI first: they
+# take long and a distant extrapolation is dominated by orbit uncertainty.
+LONG_EVOLUTION_YEARS = 1000.0
+
+
+def approximate_year(jd: float) -> float:
+    """Decimal calendar year of a Julian date (display only)."""
+    return 2000.0 + (float(jd) - 2451545.0) / JULIAN_YEAR_DAYS
+
+
+def usable_coverage(coverage: tuple[float, float] | None) -> tuple[float, float] | None:
+    """Planetary-model coverage minus the integration margin (TDB JD)."""
+    if coverage is None:
+        return None
+    return coverage[0] + COVERAGE_MARGIN_DAYS, coverage[1] - COVERAGE_MARGIN_DAYS
+
+
+def clip_span_to_coverage(
+    start_jd: float, end_jd: float, coverage: tuple[float, float] | None,
+) -> tuple[float, float]:
+    """Restrict an integration interval to the usable planetary coverage."""
+    limits = usable_coverage(coverage)
+    if limits is None:
+        return start_jd, end_jd
+    start, end = max(start_jd, limits[0]), min(end_jd, limits[1])
+    if end <= start:
+        raise ValueError(tr("Zvolený rozsah leží celý mimo pokrytí planetární efemeridy."))
+    return start, end
+
+
 def evolution_span(
     solution: OrbitSolution, mode: str, past: int, future: int,
 ) -> tuple[float, float]:
@@ -522,10 +555,16 @@ def _snapshot_from_state(phase: str, epoch: float, state: np.ndarray) -> Evoluti
 
 def calculate_orbit_evolution(
     solution: OrbitSolution, mode: str, past: int, future: int,
-    *, maximum_samples: int = 80001,
+    *, maximum_samples: int = 80001, span: tuple[float, float] | None = None,
 ) -> EvolutionResult:
-    """Integrate over a UI-selected range of returns or years."""
-    start_jd, end_jd = evolution_span(solution, mode, past, future)
+    """Integrate over a UI-selected range of returns or years.
+
+    ``span`` (TDB JD) replaces the interval derived from ``mode`` when the GUI
+    has restricted it, e.g. to the coverage of the planetary ephemeris.
+    """
+    start_jd, end_jd = span if span is not None else evolution_span(
+        solution, mode, past, future,
+    )
     result = calculate_orbit_evolution_between(
         solution, start_jd, end_jd, maximum_samples=maximum_samples,
     )

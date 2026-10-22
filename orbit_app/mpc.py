@@ -216,8 +216,18 @@ class MpcClient:
 
     @staticmethod
     def _first(row: dict[str, Any], keys: Iterable[str], default: Any = "") -> Any:
+        """First non-empty value; ADES field names are matched case-insensitively.
+
+        The MPC ``get-obs`` service returns ADES names in lower case
+        (``obstime``, ``astcat``, ``permid``), files use camelCase.
+        """
         for key in keys:
             value = row.get(key)
+            if value not in (None, ""):
+                return value
+        lowered = {str(name).casefold(): value for name, value in row.items()}
+        for key in keys:
+            value = lowered.get(str(key).casefold())
             if value not in (None, ""):
                 return value
         return default

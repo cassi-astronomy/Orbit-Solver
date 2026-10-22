@@ -356,14 +356,36 @@ class _Linker:
             else float(catalogue[name])
             for name, value in self.requested.items()
         }
-        self.fit_once = fit_once
+        self._fit_once = fit_once
         self.evaluate = evaluate
         self.report_progress = report_progress
         self.cancel_callback = cancel_callback
         self.records = [_apparition_linkage_record(group, initial) for group in groups]
         self.rejections: dict[int, list[Observation]] = {}
+        # Whether any return was joined from a line-of-variations seed (for
+        # the provenance note).
+        self.used_line_of_variations = False
 
     # -- helpers ----------------------------------------------------------
+    def clear_residuals(self) -> None:
+        """Forget O-C from earlier trial orbits.
+
+        A staged correction fits a representative sample and refreshes O-C
+        only on those rows.  Quality gates and blunder rejection read every
+        row that carries O-C, so values left behind by another orbit (for
+        example the appraisal of the catalogue seed) would be mixed in and
+        could make a correctly joined return look tens of arcseconds off.
+        """
+        for observation in self.observations:
+            observation.residual_ra_arcsec = None
+            observation.residual_dec_arcsec = None
+            observation.used_in_fit = False
+
+    def fit_once(self, *args, **kwargs) -> tuple[OrbitSolution, float, int]:
+        """One correction; afterwards only its own rows carry O-C."""
+        self.clear_residuals()
+        return self._fit_once(*args, **kwargs)
+
     def check_cancelled(self) -> None:
         if self.cancel_callback is not None and self.cancel_callback():
             raise OrbitFitCancelled(tr("Výpočet dráhy byl zrušen uživatelem."))
@@ -903,9 +925,9 @@ class _Linker:
         except (RuntimeError, ValueError, FloatingPointError, OverflowError) as exc:
             raise LinkageFailed(tr("propagace na návrat selhala: {0}", exc)) from exc
         failures = [tr("přímá předpověď: medián {0:.1f}σ", predicted_miss)]
-        seeds: list[tuple[str, OrbitSolution]] = []
+        seeds: list[tuple[str, OrbitSolution, bool]] = []
         if predicted_miss <= DIRECT_CORRECTION_MEDIAN_SIGMA:
-            seeds.append((tr("přímá korekce"), current))
+            seeds.append((tr("přímá korekce"), current, False))
         scanned = False
 
         def scan() -> None:
@@ -913,7 +935,7 @@ class _Linker:
             candidates = _scan_line_of_variations(current, target, force, self.check_cancelled)
             for score, k, vector in candidates:
                 failures.append(tr("LOV {0:+.2f}σ: medián {1:.1f}σ", k, score))
-                seeds.append((f"LOV {k:+.2f}σ", _with_state(current, vector)))
+                seeds.append((f"LOV {k:+.2f}σ", _with_state(current, vector), True))
 
         while True:
             if not seeds:
@@ -922,7 +944,7 @@ class _Linker:
                 scanned = True
                 scan()
                 continue
-            name, seed = seeds.pop(0)
+            name, seed, from_line_of_variations = seeds.pop(0)
             # A stage spanning a full revolution determines the requested
             # A1/A2 itself; otherwise the force law stays fixed first and
             # A1/A2 are released only if the fixed law cannot join the return.
@@ -949,6 +971,7 @@ class _Linker:
                     trial = None
                     continue
                 if self.accepted(stage, new=[index]):
+                    self.used_line_of_variations |= from_line_of_variations
                     return trial
                 failures.append(f"{label_free}: {self.quality_text(stage)}")
             self.rollback(checkpoint)
@@ -1011,6 +1034,8 @@ class _Linker:
         all_indices = list(range(len(self.groups)))
         result: tuple[OrbitSolution, float, int] | None = None
         failed: dict[int, str] = {}
+        failed_with: dict[int, tuple[int, ...]] = {}
+        retried: set[int] = set()
         if self.catalogue_shortcut():
             self.report_progress(tr(
                 "Výchozí dráha předpovídá všechny návraty; koriguji je společně…",
@@ -1035,34 +1060,52 @@ class _Linker:
             current = self.fit_anchor(anchor)[0]
             linked = [anchor]
             remaining = [index for index in all_indices if index != anchor]
-            while remaining:
-                first = min(self._start(index) for index in linked)
-                last = max(self._end(index) for index in linked)
-                remaining.sort(key=lambda index: min(
-                    abs(self._end(index) - first), abs(self._start(index) - last),
-                ))
-                batch = self.well_predicted(current, remaining)
-                if len(batch) > 1:
-                    trial = self.link_batch(linked, current, batch)
-                    if trial is not None:
-                        linked = sorted(linked + batch)
-                        current = trial[0]
-                        remaining = [index for index in remaining if index not in batch]
+            while True:
+                while remaining:
+                    first = min(self._start(index) for index in linked)
+                    last = max(self._end(index) for index in linked)
+                    remaining.sort(key=lambda index: min(
+                        abs(self._end(index) - first), abs(self._start(index) - last),
+                    ))
+                    batch = self.well_predicted(current, remaining)
+                    if len(batch) > 1:
+                        trial = self.link_batch(linked, current, batch)
+                        if trial is not None:
+                            linked = sorted(linked + batch)
+                            current = trial[0]
+                            remaining = [index for index in remaining if index not in batch]
+                            continue
+                    index = remaining.pop(0)
+                    try:
+                        trial = self.link_next(linked, current, index)
+                    except LinkageFailed as exc:
+                        failed[index] = str(exc)
+                        failed_with[index] = tuple(linked)
+                        self.restore_rejections(index)
                         continue
-                index = remaining.pop(0)
-                try:
-                    trial = self.link_next(linked, current, index)
-                except LinkageFailed as exc:
-                    failed[index] = str(exc)
-                    self.restore_rejections(index)
-                    continue
-                linked = sorted(linked + [index])
-                current = trial[0]
+                    linked = sorted(linked + [index])
+                    current = trial[0]
+                # A return that failed while fewer returns were linked gets one
+                # more attempt: it may now lie between two linked returns and
+                # be far better predicted (1P: 1910 between 1835 and 1986).
+                remaining = [
+                    index for index in sorted(failed)
+                    if failed_with.get(index) != tuple(linked) and index not in retried
+                ]
+                if not remaining:
+                    break
+                retried.update(remaining)
+                for index in remaining:
+                    del failed[index]
             result = self.final_fit(linked, current)
             source = (
                 tr(
                     "Návraty byly navázány postupně od nejlépe pozorovaného ({0}) hledáním "
                     "větve podél linie variací.",
+                    self.label(anchor),
+                ) if self.used_line_of_variations else tr(
+                    "Návraty byly navázány postupně od nejlépe pozorovaného ({0}); každý "
+                    "další byl připojen přímou korekcí navázané dráhy.",
                     self.label(anchor),
                 )
             )

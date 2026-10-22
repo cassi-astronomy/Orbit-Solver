@@ -291,6 +291,11 @@ class PlanetEphemerisProvider:
         return np.stack([provider.position(body, float(epoch)) for epoch in epochs])
 
     @property
+    def coverage_jd(self) -> tuple[float, float] | None:
+        """TDB Julian-date coverage of the active model (``None``: unlimited)."""
+        return DE440_COVERAGE if self.jpl is not None else None
+
+    @property
     def model_name(self) -> str:
         return "JPL DE440" if self.jpl is not None else tr("analytický model")
 
@@ -335,6 +340,32 @@ class SplinePlanetEphemeris:
             for body in self.bodies
         ], axis=1)
         self.spline = CubicSpline(self.epochs, values, axis=0)
+        # Direct evaluation of the same piecewise cubic: the grid is uniform,
+        # so the interval follows from arithmetic instead of SciPy's generic
+        # search and wrappers (the dominant cost inside solve_ivp).  Each row
+        # holds the four coefficients of one interval, highest power first.
+        self._coefficients = np.ascontiguousarray(
+            np.moveaxis(self.spline.c, 0, 1).reshape(count - 1, 4, -1)
+        )
+        self._start = float(self.epochs[0])
+        self._step = float(self.epochs[1] - self.epochs[0])
+        self._shape = values.shape[1:]
+        self._identity_bodies: dict[tuple[str, ...], bool] = {}
+
+    def _evaluate(self, epoch: float) -> np.ndarray:
+        """Spline value at ``epoch`` (inside the grid), shape (bodies, 3)."""
+        epochs = self.epochs
+        last = epochs.size - 2
+        index = min(max(int((epoch - self._start) / self._step), 0), last)
+        # Guard against rounding of the uniform grid (same interval choice as
+        # CubicSpline: x[i] <= epoch < x[i+1], the last interval closed).
+        while index > 0 and epoch < epochs[index]:
+            index -= 1
+        while index < last and epoch >= epochs[index + 1]:
+            index += 1
+        offset = epoch - epochs[index]
+        c = self._coefficients[index]
+        return (((c[0] * offset + c[1]) * offset + c[2]) * offset + c[3]).reshape(self._shape)
 
     def _indices(self, bodies: tuple[str, ...]) -> np.ndarray:
         indices = self._index_cache.get(bodies)
@@ -349,9 +380,7 @@ class SplinePlanetEphemeris:
         epoch = float(jd)
         if epoch < self.epochs[0] or epoch > self.epochs[-1]:
             return np.asarray(self.source.position(body, epoch), dtype=float)
-        return np.asarray(
-            self.spline(epoch)[self.body_indices[body.lower()]], dtype=float,
-        )
+        return self._evaluate(epoch)[self.body_indices[body.lower()]].copy()
 
     def positions_array(self, bodies: tuple[str, ...], jd: float) -> np.ndarray:
         """Return heliocentric positions of ``bodies`` as an ``(N, 3)`` array."""
@@ -360,7 +389,12 @@ class SplinePlanetEphemeris:
             return np.asarray(
                 [self.source.position(body, epoch) for body in bodies], dtype=float,
             )
-        return np.asarray(self.spline(epoch), dtype=float)[self._indices(bodies)]
+        values = self._evaluate(epoch)
+        identity = self._identity_bodies.get(bodies)
+        if identity is None:
+            identity = tuple(body.lower() for body in bodies) == self.bodies
+            self._identity_bodies[bodies] = identity
+        return values if identity else values[self._indices(bodies)]
 
     def positions(self, bodies: tuple[str, ...], jd: float) -> tuple[np.ndarray, ...]:
         return tuple(self.positions_array(bodies, jd))

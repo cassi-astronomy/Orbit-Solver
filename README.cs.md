@@ -52,7 +52,9 @@ zapamatuje i pro další spuštění.
   z rekonstrukce rotace Země (Espenak & Meeus), ne pevným posunem 32,184 s;
 - navazování vzdálených návratů pro jakékoli těleso (periodické komety,
   víceopoziční planetky): pozorování se rozdělí na aparice podle mezer delších
-  než polovina oběžné doby (nejméně 300 dní); pokud výchozí dráha všechny
+  než polovina oběžné doby (nejméně 300 dní) a jedna aparice nikdy nepřesáhne
+  tři čtvrtiny oběžné doby, takže několikaleté sledování přehlídkami nesloučí
+  po sobě jdoucí návraty; pokud výchozí dráha všechny
   aparice předpovídá, opraví se společně; jinak se samostatně napasuje nejlépe
   pozorovaný návrat (z katalogové dráhy, případně z vlastních úhlů postupným
   rozšiřováním oblouku) a další návraty se připojují po jednom, časově
@@ -64,6 +66,8 @@ zapamatuje i pro další spuštění.
   přitom smějí posunout nejvýše do 6σ a takové napětí modelu (typicky
   proměnlivá aktivita komety) program výslovně vypíše; návraty, které již
   navázaná dráha dobře předpovídá, se připojí najednou v jedné korekci;
+  návrat, který se nepodařilo připojit, se zkusí znovu poté, co přibudou
+  další navázané návraty;
   požadované A1/A2 se fitují, jakmile oblouk pokrývá celý oběh (dvě perihelia),
   ostatní požadované parametry v závěrečném společném řešení; takto se např. 206P/Barnard–Boattini (1892
   a 2008, 20 oběhů a tři přiblížení k Jupiteru) naváže i bez katalogové dráhy;
@@ -120,7 +124,9 @@ zapamatuje i pro další spuštění.
 ### Dlouhodobý vývoj dráhy
 
 - integrace podle počtu minulých/budoucích návratů nebo podle samostatného počtu
-  let v obou směrech;
+  let v obou směrech; panel ukazuje, jaké kalendářní roky volba pokrývá, rozsah
+  mimo aktivní planetární efemeridu (DE440: 1549–2650) program nabídne omezit
+  na její pokrytí a integrace delší než 1000 let vyžaduje potvrzení;
 - tabulka oskulačních elementů v jednotlivých perihelových průchodech, označených
   přímo rokem návratu;
 - hledání přiblížení k planetám, vzdálenost v AU a Hillových poloměrech,

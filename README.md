@@ -56,7 +56,9 @@ new language and remembers the choice for the next start.
   a fixed 32.184 s offset;
 - linkage of distant returns for any body (periodic comets, multi-opposition
   asteroids): observations are split into apparitions by gaps longer than half
-  the orbital period (at least 300 days); if the initial orbit predicts all
+  the orbital period (at least 300 days), and one apparition never spans more
+  than three quarters of a period, so years of survey coverage do not merge
+  consecutive returns; if the initial orbit predicts all
   apparitions, they are corrected together; otherwise the best observed
   return is fitted on its own (from the catalogue orbit, or from its own
   angles by gradually extending the arc) and the other returns are joined one
@@ -68,7 +70,8 @@ new language and remembers the choice for the next start.
   bounded and visible rejection of blunders); previously linked returns may
   shift by at most 6σ, and such model tension (typically variable cometary
   activity) is reported explicitly; returns that the linked orbit already
-  predicts well are joined at once in a single correction; requested A1/A2 are
+  predicts well are joined at once in a single correction; a return that
+  failed is tried once more after further returns have been linked; requested A1/A2 are
   fitted as soon as the arc covers a full revolution (two perihelia), other
   requested parameters in the final joint solution; this way, e.g.,
   206P/Barnard–Boattini (1892 and 2008, 20 revolutions and three approaches to
@@ -133,7 +136,10 @@ new language and remembers the choice for the next start.
 ### Long-term orbit evolution
 
 - integration by the number of past/future returns or by a separate number
-  of years in both directions;
+  of years in both directions; the panel shows the calendar years the choice
+  covers, a range beyond the active planetary ephemeris (DE440: 1549–2650) is
+  offered to be restricted to its coverage, and an integration over more than
+  1000 years asks for confirmation;
 - table of osculating elements at individual perihelion passages, labelled
   directly by the year of the return;
 - search for planetary approaches, distance in AU and Hill radii, relative

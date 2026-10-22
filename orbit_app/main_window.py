@@ -83,9 +83,10 @@ from .orbit_fit import (
 )
 from .orbit_engine import MU_SUN, NBodyIntegrator, StateVector
 from .orbit_evolution import (
-    ELEMENT_CENTERS, EvolutionResult, HILL_RADII_AU,
-    PLANET_LABELS, PLANET_MU,
-    calculate_orbit_evolution, centered_snapshot, centered_solution,
+    ELEMENT_CENTERS, LONG_EVOLUTION_YEARS, EvolutionResult, HILL_RADII_AU,
+    PLANET_LABELS, PLANET_MU, approximate_year, clip_span_to_coverage,
+    calculate_orbit_evolution, centered_snapshot, centered_solution, evolution_span,
+    usable_coverage,
     format_evolution_mpc_report, format_evolution_report, return_solution,
 )
 from .planetary import DE440_MD5, DE440_URL, PLANETS, de440_path
@@ -854,18 +855,20 @@ class OrbitEvolutionWorker(QObject):
 
     def __init__(
         self, solution: OrbitSolution, mode: str, past: int, future: int,
+        span: tuple[float, float] | None = None,
     ) -> None:
         super().__init__()
         self.solution = solution
         self.mode = mode
         self.past = past
         self.future = future
+        self.span = span
 
     @Slot()
     def run(self) -> None:
         try:
             self.success.emit(calculate_orbit_evolution(
-                self.solution, self.mode, self.past, self.future
+                self.solution, self.mode, self.past, self.future, span=self.span,
             ))
         except Exception as exc:
             self.error.emit(str(exc))
@@ -1044,9 +1047,16 @@ class OrbitEvolutionPanel(QWidget):
         self.calculate.setObjectName("primary")
         self.calculate.clicked.connect(self.start)
         self.mode.currentIndexChanged.connect(self._mode_changed)
+        # Shows the calendar years a choice of returns/years really means, so
+        # "200 returns" typed instead of "200 years" is obvious before starting.
+        self.span_hint = QLabel()
+        self.span_hint.setObjectName("muted")
+        self.past.valueChanged.connect(self._update_span_hint)
+        self.future.valueChanged.connect(self._update_span_hint)
         controls.addWidget(QLabel(tr("Rozsah:"))); controls.addWidget(self.mode)
         controls.addWidget(self.past_label); controls.addWidget(self.past)
         controls.addWidget(self.future_label); controls.addWidget(self.future)
+        controls.addWidget(self.span_hint)
         controls.addWidget(self.calculate); controls.addStretch()
         layout.addLayout(controls)
 
@@ -1156,10 +1166,84 @@ class OrbitEvolutionPanel(QWidget):
             self.past.setValue(200); self.future.setValue(200)
         elif not years and (self.past.value() > 50 or self.future.value() > 50):
             self.past.setValue(5); self.future.setValue(5)
+        self._update_span_hint()
+
+    def _requested_span(self) -> tuple[float, float]:
+        return evolution_span(
+            self.solution, str(self.mode.currentData()), self.past.value(), self.future.value(),
+        )
+
+    def _update_span_hint(self, *_args) -> None:
+        try:
+            start, end = self._requested_span()
+        except (ValueError, TypeError, ZeroDivisionError):
+            self.span_hint.setText("")
+            return
+        limits = usable_coverage(PLANETS.coverage_jd)
+        outside = limits is not None and (start < limits[0] or end > limits[1])
+        self.span_hint.setText(tr(
+            "≈ {0:.0f}–{1:.0f} ({2:.0f} let)",
+            approximate_year(start), approximate_year(end), (end - start) / 365.25,
+        ))
+        self.span_hint.setStyleSheet("color: #f0a03c; font-weight: 600;" if outside else "")
+        self.span_hint.setToolTip(
+            tr(
+                "Rozsah přesahuje pokrytí planetární efemeridy {0} ({1:.0f}–{2:.0f}).",
+                PLANETS.model_name, approximate_year(limits[0]), approximate_year(limits[1]),
+            ) if outside else ""
+        )
+
+    def _confirmed_span(self) -> tuple[float, float] | None:
+        """Requested interval, restricted or confirmed by the user; None = cancel."""
+        try:
+            start, end = self._requested_span()
+        except ValueError as exc:
+            QMessageBox.warning(self, tr("Vývoj dráhy"), str(exc))
+            return None
+        limits = usable_coverage(PLANETS.coverage_jd)
+        if limits is not None and (start < limits[0] or end > limits[1]):
+            try:
+                clipped = clip_span_to_coverage(start, end, PLANETS.coverage_jd)
+            except ValueError as exc:
+                QMessageBox.warning(self, tr("Vývoj dráhy"), str(exc))
+                return None
+            answer = QMessageBox.question(
+                self, tr("Vývoj dráhy"),
+                tr(
+                    "Požadovaný rozsah {0:.0f}–{1:.0f} ({2:.0f} let) přesahuje pokrytí "
+                    "planetární efemeridy {3} ({4:.0f}–{5:.0f}).\n\nIntegrovat jen v rámci "
+                    "pokrytí, tedy {6:.0f}–{7:.0f}?",
+                    approximate_year(start), approximate_year(end), (end - start) / 365.25,
+                    PLANETS.model_name, approximate_year(limits[0]),
+                    approximate_year(limits[1]), approximate_year(clipped[0]),
+                    approximate_year(clipped[1]),
+                ),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            )
+            if answer != QMessageBox.Yes:
+                return None
+            # The user has just confirmed this interval; the kernel coverage
+            # itself bounds its length, so no second question follows.
+            return clipped
+        years = (end - start) / 365.25
+        if years > LONG_EVOLUTION_YEARS:
+            answer = QMessageBox.question(
+                self, tr("Vývoj dráhy"),
+                tr(
+                    "Integrace přes {0:.0f} let ({1:.0f}–{2:.0f}) může trvat mnoho minut a "
+                    "tak vzdálená extrapolace je velmi nejistá.\n\nPokračovat?",
+                    years, approximate_year(start), approximate_year(end),
+                ),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return None
+        return start, end
 
     def set_solution(self, solution: OrbitSolution) -> None:
         self.solution = solution
         self._update_source_note()
+        self._update_span_hint()
         self.result = None
         self._centered_cache.clear()
         self.returns.setRowCount(0); self.encounters.setRowCount(0)
@@ -1200,6 +1284,9 @@ class OrbitEvolutionPanel(QWidget):
                 "Alespoň jeden směr musí mít nenulový rozsah.",
             ))
             return
+        span = self._confirmed_span()
+        if span is None:
+            return
         self.calculate.setEnabled(False)
         self.calculate.setText(tr("Integruji…"))
         self.note.setText(
@@ -1210,7 +1297,8 @@ class OrbitEvolutionPanel(QWidget):
         )
         thread = QThread(self)
         worker = OrbitEvolutionWorker(
-            self.solution, str(self.mode.currentData()), self.past.value(), self.future.value()
+            self.solution, str(self.mode.currentData()), self.past.value(), self.future.value(),
+            span,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -3815,7 +3903,7 @@ class ElementsPanel(QWidget):
                 )
             else:
                 lines.append("Nongravitational parameters (Marsden water-ice model):")
-            for name in ("A1", "A2", "A3", tr("DT")):
+            for name in ("A1", "A2", "A3", "DT"):
                 if name in s.nongravitational_parameters:
                     value = s.nongravitational_parameters[name]
                     uncertainty = (s.element_uncertainties or {}).get(name)
@@ -3823,8 +3911,8 @@ class ElementsPanel(QWidget):
                         f" +/- {uncertainty:.3e}" if uncertainty is not None
                         and np.isfinite(uncertainty) else ""
                     )
-                    unit = "days" if name == tr("DT") else "AU/day^2"
-                    value_text = f"{value:+.6f}" if name == tr("DT") else f"{value:+.6e}"
+                    unit = "days" if name == "DT" else "AU/day^2"
+                    value_text = f"{value:+.6f}" if name == "DT" else f"{value:+.6e}"
                     lines.append(f"{name}   {value_text}{suffix} {unit}")
         if s.dynamical_1a:
             dynamics = s.dynamical_1a
@@ -4290,17 +4378,17 @@ class OrbitConstraintsDialog(QDialog):
             ("A1", tr("A1 radiální [10⁻⁸ AU/den²]")),
             ("A2", tr("A2 příčný [10⁻⁸ AU/den²]")),
             ("A3", tr("A3 normálový [10⁻⁸ AU/den²]")),
-            (tr("DT"), tr("DT zpoždění aktivity [dny]")),
+            ("DT", tr("DT zpoždění aktivity [dny]")),
         ):
             enabled = QCheckBox(tr("fitovat"))
             editor = QDoubleSpinBox()
             editor.setDecimals(6)
             editor.setRange(
-                -1_000.0 if name == tr("DT") else -10_000.0,
-                1_000.0 if name == tr("DT") else 10_000.0,
+                -1_000.0 if name == "DT" else -10_000.0,
+                1_000.0 if name == "DT" else 10_000.0,
             )
-            editor.setSingleStep(.5 if name == tr("DT") else .1)
-            scale = 1.0 if name == tr("DT") else 1e-8
+            editor.setSingleStep(.5 if name == "DT" else .1)
+            scale = 1.0 if name == "DT" else 1e-8
             editor.setValue(float(current_ng.get(name, 0.0)) / scale)
             enabled.setChecked(name in (nongravitational or {}))
             row = QWidget(); row_layout = QHBoxLayout(row)
@@ -4308,7 +4396,7 @@ class OrbitConstraintsDialog(QDialog):
             row_layout.addWidget(enabled); row_layout.addWidget(editor, 1)
             form.addRow(label, row)
             self.ng_controls[name] = (enabled, editor)
-        dt_enabled, dt_editor = self.ng_controls[tr("DT")]
+        dt_enabled, dt_editor = self.ng_controls["DT"]
         a_checks = [self.ng_controls[name][0] for name in ("A1", "A2", "A3")]
 
         def sync_ng_model() -> None:
@@ -4432,15 +4520,15 @@ class OrbitConstraintsDialog(QDialog):
 
     def selected_nongravitational(self) -> dict[str, float]:
         selected = {
-            name: editor.value() * (1.0 if name == tr("DT") else 1e-8)
+            name: editor.value() * (1.0 if name == "DT" else 1e-8)
             for name, (enabled, editor) in self.ng_controls.items()
             if enabled.isChecked()
         }
-        if tr("DT") in selected and not any(name in selected for name in ("A1", "A2", "A3")):
-            selected.pop(tr("DT"))
+        if "DT" in selected and not any(name in selected for name in ("A1", "A2", "A3")):
+            selected.pop("DT")
         if any(name in selected for name in ("A1", "A2", "A3")):
             if self.ng_model.currentData() == "power":
-                selected.pop(tr("DT"), None)
+                selected.pop("DT", None)
                 selected["R_EXPONENT"] = self.ng_exponent.value()
         return selected
 
@@ -5445,7 +5533,7 @@ class MainWindow(QMainWindow):
                 )
                 self.fit_output_epoch = ""
         fitted_ng_names = [
-            name for name in ("A1", "A2", "A3", tr("DT"))
+            name for name in ("A1", "A2", "A3", "DT")
             if name in self.nongravitational_fit
         ]
         count = (
@@ -5684,6 +5772,17 @@ class MainWindow(QMainWindow):
                     "aktivita nebo nedostatečný silový model.\n\n",
                 )
                 + "\n".join(details)
+                + (
+                    tr(
+                        "\n\nTip: návraty byly propojeny čistě gravitačním modelem. Aktivní "
+                        "kometa (např. 1P/Halley) se přes více oběhů obvykle navázat nedá bez "
+                        "negravitačních parametrů; povolte A1 a A2 ve Vlastním nastavení a "
+                        "výpočet zopakujte.",
+                    )
+                    if not solution.nongravitational_parameters
+                    and is_comet_designation(self.current_designation or solution.designation)
+                    else ""
+                )
                 + tr("\n\nPodrobný protokol je v záložce Elementy."),
             )
 
