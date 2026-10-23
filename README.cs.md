@@ -15,6 +15,18 @@ Výchozím jazykem je angličtina. Češtinu zvolíte v levém panelu přepína�
 **Language / Jazyk**; program se restartuje v novém jazyce a volbu si
 zapamatuje i pro další spuštění.
 
+## Ukázka: kometa 206P/Barnard–Boattini
+
+Dráhové elementy načtené z MPC včetně kartézského stavu a jednořádkového
+formátu MPC:
+
+![Dráhové elementy komety 206P/Barnard–Boattini v programu Orbit Solver](docs/images/orbit-solver-206p-elements-cs.png)
+
+Heliocentrický pohled v ekliptikální soustavě J2000 zobrazuje dráhu komety
+společně s drahami planet a jejich aktuálními polohami:
+
+![Pohled na Sluneční soustavu s kometou 206P/Barnard–Boattini v programu Orbit Solver](docs/images/orbit-solver-206p-solar-system-cs.png)
+
 ## Hlavní možnosti
 
 ### Astrometrie a určení dráhy

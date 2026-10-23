@@ -15,6 +15,18 @@ English is the default language. Czech can be selected with the
 **Language / Jazyk** switch in the left panel; the application restarts in the
 new language and remembers the choice for the next start.
 
+## Example: comet 206P/Barnard-Boattini
+
+Orbital elements loaded from the MPC, including the Cartesian state and the
+MPC one-line representation:
+
+![Orbital elements of comet 206P/Barnard-Boattini in Orbit Solver](docs/images/orbit-solver-206p-elements-en.png)
+
+The heliocentric J2000 ecliptic view shows the comet's orbit together with the
+planetary orbits and their current positions:
+
+![Solar System view of comet 206P/Barnard-Boattini in Orbit Solver](docs/images/orbit-solver-206p-solar-system-en.png)
+
 ## Main features
 
 ### Astrometry and orbit determination
