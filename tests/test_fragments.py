@@ -12,6 +12,13 @@ from orbit_app.astrometry import (  # noqa: E402
 )
 from orbit_app.mpc import MpcClient, parse_mpc80  # noqa: E402
 
+
+# Keep the QApplication wrapper alive for the rest of the test process.  If the
+# last Python reference disappears while Qt still owns shared objects created by
+# MainWindow, Linux/Qt may abort during interpreter shutdown even though every
+# assertion passed.
+_QT_APPLICATION = None
+
 # 205P/Giacobini, split in 2008 (MPC astrometry): undivided comet in 1896 and
 # early 2008 under the provisional designation, labelled components A/B/C
 # measured on the same exposures, and unlabelled survey rows in 2015.
@@ -250,21 +257,32 @@ class SecondaryTrackBudgetTests(unittest.TestCase):
 
 
 class FragmentSelectorWindowTests(unittest.TestCase):
-    def setUp(self):
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from unittest import mock
+    @classmethod
+    def setUpClass(cls):
+        global _QT_APPLICATION
 
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6.QtWidgets import QApplication
+
+        _QT_APPLICATION = QApplication.instance() or QApplication([])
+        cls._application = _QT_APPLICATION
+
+    def setUp(self):
+        from unittest import mock
 
         from orbit_app.main_window import MainWindow
 
-        self._application = QApplication.instance() or QApplication([])
         self.window = MainWindow()
         self.window.mpc_network.observations = mock.Mock()
 
     def tearDown(self):
+        from PySide6.QtCore import QEvent
+        from PySide6.QtWidgets import QApplication
+
         self.window.close()
         self.window.deleteLater()
+        QApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        self._application.processEvents()
 
     def test_split_comet_offers_components_and_fits_the_principal_one(self):
         rows = parse_mpc80(FIXTURE_205P)
