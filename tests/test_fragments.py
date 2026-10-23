@@ -1,4 +1,5 @@
 """Split comets: fragment labels, component selection and the GUI selector."""
+import atexit
 import os
 import unittest
 from dataclasses import replace
@@ -18,6 +19,24 @@ from orbit_app.mpc import MpcClient, parse_mpc80  # noqa: E402
 # MainWindow, Linux/Qt may abort during interpreter shutdown even though every
 # assertion passed.
 _QT_APPLICATION = None
+_QT_SHUTDOWN_REGISTERED = False
+
+
+def _shutdown_qt_application() -> None:
+    """Destroy Qt explicitly before PySide's interpreter-shutdown cleanup."""
+    global _QT_APPLICATION
+
+    from PySide6.QtCore import QEvent
+    from PySide6.QtWidgets import QApplication
+
+    application = QApplication.instance()
+    if application is None:
+        return
+    QApplication.closeAllWindows()
+    QApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    application.processEvents()
+    application.shutdown()
+    _QT_APPLICATION = None
 
 # 205P/Giacobini, split in 2008 (MPC astrometry): undivided comet in 1896 and
 # early 2008 under the provisional designation, labelled components A/B/C
@@ -259,12 +278,15 @@ class SecondaryTrackBudgetTests(unittest.TestCase):
 class FragmentSelectorWindowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        global _QT_APPLICATION
+        global _QT_APPLICATION, _QT_SHUTDOWN_REGISTERED
 
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6.QtWidgets import QApplication
 
         _QT_APPLICATION = QApplication.instance() or QApplication([])
+        if not _QT_SHUTDOWN_REGISTERED:
+            atexit.register(_shutdown_qt_application)
+            _QT_SHUTDOWN_REGISTERED = True
         cls._application = _QT_APPLICATION
 
     def setUp(self):
