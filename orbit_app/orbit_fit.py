@@ -9,7 +9,7 @@ from scipy.optimize import least_squares
 
 from .astrometry import (
     is_deprecated, is_fit_candidate, mark_duplicate_measurements, normal_place_observations,
-    observation_sigma_arcsec, observation_sigmas, parse_observation_time,
+    observation_sigma_arcsec, observation_sigmas, parse_observation_time, seconds_since_j2000,
 )
 from .domain import Observation, OrbitSolution, is_comet_designation
 from .i18n import tr
@@ -32,9 +32,14 @@ __all__ = [
 ]
 
 C_AU_PER_DAY = 173.1446326846693
-NONGRAVITATIONAL_NAMES = ("A1", "A2", "A3", "DT")
-# Optimizer units: A1–A3 are fitted in units of 1e-8 AU/day², DT in days.
-_NONGRAV_SCALE = {"A1": 1e-8, "A2": 1e-8, "A3": 1e-8, "DT": 1.0}
+# A1H–A3H are the historical coefficients that replace A1–A3 before SPLIT_JD
+# (orbit_engine.HISTORICAL_NONGRAVITATIONAL); SPLIT_JD itself is fixed metadata.
+NONGRAVITATIONAL_NAMES = ("A1", "A2", "A3", "DT", "A1H", "A2H", "A3H")
+# Optimizer units: A1–A3 (and A1H–A3H) are fitted in units of 1e-8 AU/day²,
+# DT in days.
+_NONGRAV_SCALE = {
+    "A1": 1e-8, "A2": 1e-8, "A3": 1e-8, "DT": 1.0, "A1H": 1e-8, "A2H": 1e-8, "A3H": 1e-8,
+}
 _PLANET_NAMES = (
     "mercury", "venus", "earth", "moon", "mars",
     "jupiter", "saturn", "uranus", "neptune", "pluto",
@@ -1418,6 +1423,129 @@ def _is_automatic_rejection_candidate(
     )
 
 
+# Simultaneous double track: one station measured two objects on the same
+# exposures (an unlabelled fragment or a misidentified field object).  Rows of
+# one station closer in time than this are taken from the same exposure (days).
+DOUBLE_TRACK_MAXIMUM_SPACING_DAYS = 7e-4
+# The two members of a pair differ by at least this much in O-C (arcsec);
+# re-reductions of one measurement are much closer.
+DOUBLE_TRACK_MINIMUM_SEPARATION_ARCSEC = 8.0
+# Coherent pairs needed on one station and night.
+DOUBLE_TRACK_MINIMUM_PAIRS = 3
+# The secondary track must lie at least this many times farther from the
+# reference (the other astrometry of the same weeks) than its partner track;
+# otherwise the two tracks are not told apart.
+DOUBLE_TRACK_OFFSET_RATIO = 2.0
+# Reference O-C: unpaired rows within this many days of the double track
+# (the O-C of a return predicted by a provisional orbit drifts slowly), at
+# least this many of them; otherwise the whole set, then the orbit itself.
+DOUBLE_TRACK_REFERENCE_DAYS = 30.0
+DOUBLE_TRACK_MINIMUM_REFERENCE_ROWS = 3
+
+
+def _simultaneous_double_track_candidates(
+    observations: list[Observation],
+) -> list[Observation]:
+    """Find the secondary member of simultaneous double tracks.
+
+    Unlike :func:`_coherent_secondary_track_candidates` this does not require
+    the nominal track to be already well fitted.  The pairing in time
+    identifies the two tracks; which one is the object is decided against
+    the other astrometry of the same weeks (``DOUBLE_TRACK_REFERENCE_DAYS``),
+    not against the trial orbit.  When a return is joined to a gravity-only
+    orbit the whole return may still be tens of arcseconds off: 205P in 2021
+    was predicted 35″ east by the 2008-2016 orbit at every station, ZTF's
+    comet track included, while its second track (65″ west of the comet)
+    lay 31″ west – equally far from the orbit, but 65″ from all other
+    stations.  A second track of comparable weight in a single-return fit
+    is handled the same way.
+    """
+    rows: list[tuple[float, Observation, np.ndarray]] = []
+    groups: dict[tuple[str, str], list[tuple[float, Observation]]] = {}
+    for observation in observations:
+        if (
+            not _is_weighted(observation)
+            or observation.residual_ra_arcsec is None
+            or observation.residual_dec_arcsec is None
+            or not observation.station or not observation.time
+        ):
+            continue
+        try:
+            instant = parse_observation_time(observation.time)
+        except ValueError:
+            continue
+        day = seconds_since_j2000(instant) / 86400.0
+        rows.append((day, observation, np.array((
+            float(observation.residual_ra_arcsec), float(observation.residual_dec_arcsec),
+        ))))
+        key = (observation.station.strip().upper(), instant.date().isoformat())
+        groups.setdefault(key, []).append((day, observation))
+    residual = {id(item): vector for _day, item, vector in rows}
+
+    pairs_by_group: list[tuple[list[tuple[float, Observation]], list[tuple]]] = []
+    paired: set[int] = set()
+    for group in groups.values():
+        group.sort(key=lambda item: item[0])
+        pairs = [
+            (day_a, first, second)
+            for (day_a, first), (day_b, second) in zip(group, group[1:])
+            if day_b - day_a <= DOUBLE_TRACK_MAXIMUM_SPACING_DAYS
+            and float(np.linalg.norm(residual[id(first)] - residual[id(second)]))
+            >= DOUBLE_TRACK_MINIMUM_SEPARATION_ARCSEC
+        ]
+        if len(pairs) >= DOUBLE_TRACK_MINIMUM_PAIRS:
+            pairs_by_group.append((group, pairs))
+            paired.update(id(item) for _day, first, second in pairs for item in (first, second))
+    if not pairs_by_group:
+        return []
+    unpaired = [(day, vector) for day, item, vector in rows if id(item) not in paired]
+
+    def reference(day: float) -> np.ndarray:
+        """Median O-C of the unpaired astrometry around ``day`` (arcsec)."""
+        for window in (DOUBLE_TRACK_REFERENCE_DAYS, np.inf):
+            nearby = [vector for when, vector in unpaired if abs(when - day) <= window]
+            if len(nearby) >= DOUBLE_TRACK_MINIMUM_REFERENCE_ROWS:
+                return np.median(np.asarray(nearby), axis=0)
+        # No independent astrometry: fall back to the trial orbit itself.
+        return np.zeros(2)
+
+    selected: list[Observation] = []
+    for group, pairs in pairs_by_group:
+        centre = reference(float(np.median([day for day, _first, _second in pairs])))
+        near: list[Observation] = []
+        far: list[Observation] = []
+        for _day, first, second in pairs:
+            if (
+                np.linalg.norm(residual[id(first)] - centre)
+                <= np.linalg.norm(residual[id(second)] - centre)
+            ):
+                near.append(first); far.append(second)
+            else:
+                near.append(second); far.append(first)
+        near_vectors = np.asarray([residual[id(item)] for item in near])
+        far_vectors = np.asarray([residual[id(item)] for item in far])
+        near_centre = np.median(near_vectors, axis=0)
+        far_centre = np.median(far_vectors, axis=0)
+        separation = float(np.linalg.norm(far_centre - near_centre))
+        radius = max(2.5, 0.15 * separation)
+        if (
+            separation < DOUBLE_TRACK_MINIMUM_SEPARATION_ARCSEC
+            or float(np.median(np.linalg.norm(near_vectors - near_centre, axis=1))) > radius
+            or float(np.median(np.linalg.norm(far_vectors - far_centre, axis=1))) > radius
+            or float(np.linalg.norm(far_centre - centre))
+            < DOUBLE_TRACK_OFFSET_RATIO * float(np.linalg.norm(near_centre - centre))
+        ):
+            continue
+        # Unpaired rows of the same night that sit on the secondary track.
+        selected.extend(
+            item for _day, item in group
+            if float(np.linalg.norm(residual[id(item)] - far_centre)) <= radius
+            and float(np.linalg.norm(residual[id(item)] - far_centre))
+            < float(np.linalg.norm(residual[id(item)] - near_centre))
+        )
+    return list({id(item): item for item in selected}.values())
+
+
 def _coherent_secondary_track_candidates(
     observations: list[Observation],
 ) -> list[Observation]:
@@ -1471,14 +1599,16 @@ def _coherent_secondary_track_candidates(
         if len(members) < 3:
             continue
         selected.extend(group[int(index)] for index in members)
+    selected.extend(_simultaneous_double_track_candidates(observations))
     return list({id(item): item for item in selected}.values())
 
 
 def _is_weighted(observation: Observation) -> bool:
-    """Enabled row that carries weight (not a duplicate or deprecated record)."""
+    """Enabled row that carries weight (not a duplicate, deprecated or other fragment)."""
     return bool(
         not observation.excluded_from_fit
         and not observation.raw.get("duplicate_measurement")
+        and not observation.raw.get("inactive_fragment")
         and not is_deprecated(observation)
     )
 
@@ -1876,6 +2006,8 @@ def fit_orbit(
     nongravitational: dict[str, float] | None = None,
     progress_callback: ProgressCallback | None = None,
     cancel_callback: CancelCallback | None = None,
+    historical_nongravitational: bool = False,
+    accept_model_tension: bool = False,
 ) -> tuple[OrbitSolution, float, int]:
     """Fit an orbit to astrometry.
 
@@ -1890,6 +2022,11 @@ def fit_orbit(
 
     ``nongravitational`` lists A1/A2/A3/DT to be fitted (with seed values) and
     may carry fixed force-law metadata such as ``R_EXPONENT``.
+
+    Linkage options (several apparitions only): ``historical_nongravitational``
+    fits separate A1H/A2H/A3H before the longest observing gap;
+    ``accept_model_tension`` joins a return up to
+    ``linkage.LINKAGE_RELAXED_NORMALIZED_RMS`` and reports it as tension.
     """
     progress_step = 0
     progress_total = 0
@@ -1975,6 +2112,8 @@ def fit_orbit(
             constraints=constraints, nongravitational=nongravitational,
             fit_once=fit_once, evaluate=_evaluate_solution_observations,
             report_progress=report_progress, cancel_callback=cancel_callback,
+            historical_nongravitational=historical_nongravitational,
+            accept_model_tension=accept_model_tension,
         )
     else:
         report_progress(tr("Provádím diferenciální korekci dráhy…"), 3)
@@ -2102,10 +2241,47 @@ def _fit_short_arc_branches(
     return result
 
 
+# A secondary track never outweighs the astrometry it is separated from.
+MAXIMUM_DOUBLE_TRACK_FRACTION = 0.25
+
+
+def _reject_simultaneous_double_tracks(
+    observations, result, constraints, truncate_years, nongravitational,
+    short_arc, fit_once, report_progress,
+) -> tuple[OrbitSolution, float, int]:
+    """Separate an unlabelled second track before rejecting isolated blunders."""
+    secondary = _simultaneous_double_track_candidates(observations)
+    weighted = sum(_is_weighted(item) for item in observations)
+    if (
+        not secondary
+        or len(secondary) > MAXIMUM_DOUBLE_TRACK_FRACTION * weighted
+        or weighted - len(secondary) < 6
+    ):
+        return result
+    for observation in secondary:
+        observation.excluded_from_fit = True
+        observation.raw["automatic_exclusion"] = True
+        observation.raw["coherent_secondary_track"] = True
+        observation.raw["automatic_exclusion_reason"] = tr(
+            "Souvislá vedlejší astrometrická stopa; možný fragment nebo sekundární jádro.",
+        )
+    report_progress(tr("Přepočítávám dráhu po vyřazení odlehlých měření…"))
+    return fit_once(
+        observations, result[0], constraints, truncate_years,
+        _fitted_nongravitational(nongravitational, result[0]),
+        maximum_observations=None if nongravitational or short_arc else 120,
+        max_nfev=12,
+    )
+
+
 def _reject_isolated_blunders(
     observations, result, constraints, truncate_years, nongravitational,
     short_arc, fit_once, report_progress,
 ) -> tuple[OrbitSolution, float, int]:
+    result = _reject_simultaneous_double_tracks(
+        observations, result, constraints, truncate_years, nongravitational,
+        short_arc, fit_once, report_progress,
+    )
     candidates = [
         item for item in observations
         if _is_weighted(item) and _is_automatic_rejection_candidate(item, result[1])

@@ -42,6 +42,7 @@ from .domain import Observation, OrbitSolution
 from .i18n import tr
 from .observatories import dynamical_jd, earth_heliocentric_ecliptic
 from .orbit_engine import MU_SUN, SCAN_TOLERANCES, NBodyIntegrator, StateVector
+from .orbit_engine import HISTORICAL_NONGRAVITATIONAL, NONGRAVITATIONAL_SPLIT_KEY
 from .orbit_fit import (
     NONGRAVITATIONAL_NAMES, _PLANET_NAMES, OrbitFitCancelled, OrbitFitError,
     _apparition_linkage_record, _coherent_secondary_track_candidates, _equatorial_direction, _local_light_time_states,
@@ -59,6 +60,12 @@ LINKAGE_ACCEPT_NORMALIZED_RMS = 3.0
 # while a coherent shift of an older return reveals model tension (a comet's
 # variable activity), not a wrong revolution count.  It is reported as such.
 LINKAGE_TENSION_NORMALIZED_RMS = 6.0
+# Optional relaxed gate (``accept_model_tension``): a return whose best joint
+# correction keeps every linked return within the tension limit is joined if
+# its own normalized RMS stays below this value.  Meant for historical visual
+# or photographic astrometry and comets whose activity a constant force law
+# does not describe; such returns are always reported as model tension.
+LINKAGE_RELAXED_NORMALIZED_RMS = 15.0
 # A predicted miss (median normalized radial residual) below this value is
 # first corrected directly (a neighbouring apparition of an active comet can
 # easily miss by tens of sigma); the line of variations is searched otherwise
@@ -339,13 +346,20 @@ class _Linker:
     def __init__(
         self, observations, groups, initial, constraints, nongravitational,
         fit_once: FitOnce, evaluate: Evaluate, report_progress: ProgressReporter,
-        cancel_callback,
+        cancel_callback, historical_nongravitational: bool = False,
+        accept_model_tension: bool = False,
     ) -> None:
         self.observations = observations
         self.groups = groups
         self.initial = initial
         self.constraints = constraints
         self.requested = dict(nongravitational or {})
+        self.accept_model_tension = bool(accept_model_tension)
+        # Returns joined through the relaxed gate (reported as model tension).
+        self.tension: set[int] = set()
+        self.split_jd: float | None = None
+        if historical_nongravitational:
+            self._request_historical_force()
         self.free_names = tuple(name for name in NONGRAVITATIONAL_NAMES if name in self.requested)
         # While branches are searched the requested seeds act as a fixed force
         # law (zero A means gravity only).  A zero seed of a parameter that the
@@ -365,6 +379,51 @@ class _Linker:
         # Whether any return was joined from a line-of-variations seed (for
         # the provenance note).
         self.used_line_of_variations = False
+
+    def _request_historical_force(self) -> None:
+        """Mirror requested A1–A3 as A1H–A3H valid before the longest gap.
+
+        The switch (TDB JD) is the middle of the longest gap between observed
+        returns: a lost comet (205P: 1896 → 2008) is far from the Sun there,
+        where the water-ice law is negligible, so the force law changes
+        without a noticeable jump.  The historical side starts with the
+        modern values (``current_force``) and is released only once one of
+        its returns takes part in a correction.
+        """
+        modern = [name for name in HISTORICAL_NONGRAVITATIONAL if name in self.requested]
+        if not modern or len(self.groups) < 2:
+            return
+        spans = sorted((self._start(index), self._end(index)) for index in range(len(self.groups)))
+        gaps = [
+            (later[0] - earlier[1], 0.5 * (earlier[1] + later[0]))
+            for earlier, later in zip(spans, spans[1:])
+        ]
+        if not gaps:
+            return
+        _gap, self.split_jd = max(gaps)
+        for name in modern:
+            self.requested[HISTORICAL_NONGRAVITATIONAL[name]] = float(self.requested[name])
+        self.requested[NONGRAVITATIONAL_SPLIT_KEY] = float(self.split_jd)
+
+    def historical(self, index: int) -> bool:
+        """Whether a return lies before the force-law switch."""
+        return self.split_jd is not None and self._end(index) < self.split_jd
+
+    def free_for(self, indices: list[int], names: tuple[str, ...]) -> tuple[str, ...]:
+        """``names`` without historical coefficients that ``indices`` cannot constrain."""
+        historical_names = set(HISTORICAL_NONGRAVITATIONAL.values())
+        if any(self.historical(index) for index in indices):
+            return names
+        return tuple(name for name in names if name not in historical_names)
+
+    def historical_free(self, indices: list[int]) -> tuple[str, ...]:
+        """A1H/A2H to release when a historical return takes part in a stage."""
+        if not any(self.historical(index) for index in indices):
+            return ()
+        return tuple(
+            HISTORICAL_NONGRAVITATIONAL[name] for name in ("A1", "A2")
+            if HISTORICAL_NONGRAVITATIONAL[name] in self.free_names
+        )
 
     # -- helpers ----------------------------------------------------------
     def clear_residuals(self) -> None:
@@ -469,12 +528,20 @@ class _Linker:
                 rejected += 1
             scored = [item for item in scored if not item[1].excluded_from_fit]
             enabled = [item for item in enabled if not item.excluded_from_fit]
-            total = len(enabled) + len(self.rejections.get(index, []))
+            # A secondary track is another object, not blunders of this one:
+            # it neither counts as the object's astrometry nor uses up the
+            # bounded rejection budget (205P in 2021: ten ZTF rows of a second
+            # track would otherwise block rejecting a 66″-off night).
+            blunders = [
+                item for item in self.rejections.get(index, [])
+                if not item.raw.get("coherent_secondary_track")
+            ]
+            total = len(enabled) + len(blunders)
             fraction = (
                 MAXIMUM_REJECTED_FRACTION_DENSE if total >= DENSE_APPARITION_ROWS
                 else MAXIMUM_REJECTED_FRACTION_SPARSE
             )
-            allowed = int(np.floor(fraction * total)) - len(self.rejections.get(index, []))
+            allowed = int(np.floor(fraction * total)) - len(blunders)
             allowed = min(allowed, len(enabled) - min(3, len(enabled)))
             for _score, observation in sorted(scored, key=lambda item: -item[0])[:max(0, allowed)]:
                 observation.excluded_from_fit = True
@@ -610,12 +677,16 @@ class _Linker:
 
     def current_force(self, solution: OrbitSolution | None) -> dict[str, float]:
         force = dict(self.fixed_force)
-        if solution is not None:
-            force.update({
-                name: float(value)
-                for name, value in (solution.nongravitational_parameters or {}).items()
-                if name in force or name == "R_EXPONENT"
-            })
+        reached = (solution.nongravitational_parameters or {}) if solution is not None else {}
+        force.update({
+            name: float(value) for name, value in reached.items()
+            if name in force or name in ("R_EXPONENT", NONGRAVITATIONAL_SPLIT_KEY)
+        })
+        # Until a historical return has been fitted, the historical
+        # coefficients continue the modern ones (one force law).
+        for modern, historical in HISTORICAL_NONGRAVITATIONAL.items():
+            if historical in force and historical not in reached and modern in force:
+                force[historical] = force[modern]
         return force
 
     def accepted(self, indices: list[int], new: list[int] | None = None) -> bool:
@@ -624,7 +695,8 @@ class _Linker:
         for index in indices:
             normalized, _physical, count = self.group_quality(index)
             limit = (
-                LINKAGE_ACCEPT_NORMALIZED_RMS if index in fresh
+                LINKAGE_RELAXED_NORMALIZED_RMS if index in self.tension
+                else LINKAGE_ACCEPT_NORMALIZED_RMS if index in fresh
                 else LINKAGE_TENSION_NORMALIZED_RMS
             )
             if count < 1 or normalized > limit:
@@ -677,7 +749,7 @@ class _Linker:
 
     def fit_anchor(self, index: int) -> tuple[OrbitSolution, float, int]:
         trial = self._fit_anchor_gravity(index)
-        free = self.stage_free([index], trial[0])
+        free = self.stage_free([index], trial[0]) + self.historical_free([index])
         if not free:
             return trial
         self.report_progress(
@@ -886,8 +958,9 @@ class _Linker:
     ) -> tuple[OrbitSolution, float, int] | None:
         stage = sorted(linked + batch)
         labels = ", ".join(self.label(index) for index in sorted(batch))
-        attempts = [self.stage_free(stage, current)]
-        requested = tuple(item for item in ("A1", "A2") if item in self.free_names)
+        historical = self.historical_free(stage)
+        attempts = [self.stage_free(stage, current) + historical]
+        requested = tuple(item for item in ("A1", "A2") if item in self.free_names) + historical
         if requested and requested != attempts[0]:
             attempts.append(requested)
         trial = None
@@ -925,6 +998,7 @@ class _Linker:
         except (RuntimeError, ValueError, FloatingPointError, OverflowError) as exc:
             raise LinkageFailed(tr("propagace na návrat selhala: {0}", exc)) from exc
         failures = [tr("přímá předpověď: medián {0:.1f}σ", predicted_miss)]
+        best: tuple[float, OrbitSolution, tuple[str, ...], bool] | None = None
         seeds: list[tuple[str, OrbitSolution, bool]] = []
         if predicted_miss <= DIRECT_CORRECTION_MEDIAN_SIGMA:
             seeds.append((tr("přímá korekce"), current, False))
@@ -948,9 +1022,10 @@ class _Linker:
             # A stage spanning a full revolution determines the requested
             # A1/A2 itself; otherwise the force law stays fixed first and
             # A1/A2 are released only if the fixed law cannot join the return.
-            stage_free = self.stage_free(stage, seed)
+            historical = self.historical_free(stage)
+            stage_free = self.stage_free(stage, seed) + historical
             attempts = [stage_free]
-            requested = tuple(item for item in ("A1", "A2") if item in self.free_names)
+            requested = tuple(item for item in ("A1", "A2") if item in self.free_names) + historical
             if requested and requested != stage_free:
                 attempts.append(requested)
             trial = None
@@ -974,8 +1049,55 @@ class _Linker:
                     self.used_line_of_variations |= from_line_of_variations
                     return trial
                 failures.append(f"{label_free}: {self.quality_text(stage)}")
+                own = self.group_quality(index)[0]
+                if self.accept_model_tension and self._within_relaxed_gate(stage, index) and (
+                    best is None or own < best[0]
+                ):
+                    best = (own, seed, free, from_line_of_variations)
             self.rollback(checkpoint)
+        if best is not None:
+            relaxed = self._link_with_tension(stage, index, best)
+            if relaxed is not None:
+                return relaxed
+            failures.append(tr("ani s napětím modelu: {0}", self.quality_text(stage)))
         raise LinkageFailed("; ".join(failures[-4:]))
+
+    def _within_relaxed_gate(self, stage: list[int], index: int) -> bool:
+        """New return ≤ relaxed limit, every other one within the tension limit."""
+        for item in stage:
+            normalized, _physical, count = self.group_quality(item)
+            limit = (
+                LINKAGE_RELAXED_NORMALIZED_RMS if item == index or item in self.tension
+                else LINKAGE_TENSION_NORMALIZED_RMS
+            )
+            if count < 1 or normalized > limit:
+                return False
+        return True
+
+    def _link_with_tension(
+        self, stage: list[int], index: int,
+        best: tuple[float, OrbitSolution, tuple[str, ...], bool],
+    ) -> tuple[OrbitSolution, float, int] | None:
+        """Repeat the best failed correction and join it through the relaxed gate."""
+        _own, seed, free, from_line_of_variations = best
+        self.report_progress(tr(
+            "Návrat {0}: připojuji s napětím modelu (do {1:g}σ)…",
+            self.label(index), LINKAGE_RELAXED_NORMALIZED_RMS,
+        ))
+        checkpoint = self.checkpoint()
+        try:
+            trial = self.corrected(stage, seed, free=free)
+        except OrbitFitCancelled:
+            raise
+        except (OrbitFitError, ValueError, RuntimeError, FloatingPointError):
+            self.rollback(checkpoint)
+            return None
+        if not self._within_relaxed_gate(stage, index):
+            self.rollback(checkpoint)
+            return None
+        self.tension.add(index)
+        self.used_line_of_variations |= from_line_of_variations
+        return trial
 
     def final_fit(self, linked: list[int], seed: OrbitSolution) -> tuple[OrbitSolution, float, int]:
         for observation in self.observations:
@@ -1003,7 +1125,8 @@ class _Linker:
         self, linked: list[int], seed: OrbitSolution, rows_per_group: int,
     ) -> tuple[tuple[OrbitSolution, float, int], tuple[str, ...]]:
         """Final correction and the force parameters that were left free."""
-        if not self.free_names:
+        free_names = self.free_for(linked, self.free_names)
+        if not free_names:
             return self.corrected(linked, seed, per_group=rows_per_group, max_nfev=12), ()
         # The linked branch already carries A1/A2 where the stages could
         # determine them; release every requested parameter directly.
@@ -1011,10 +1134,10 @@ class _Linker:
         report = _snapshot(self.observations)
         try:
             released = self.corrected(
-                linked, seed, free=self.free_names, per_group=rows_per_group, max_nfev=16,
+                linked, seed, free=free_names, per_group=rows_per_group, max_nfev=16,
             )
             if self.accepted(linked, new=[]):
-                return released, self.free_names
+                return released, free_names
         except OrbitFitCancelled:
             raise
         except (OrbitFitError, ValueError, RuntimeError, FloatingPointError):
@@ -1109,6 +1232,13 @@ class _Linker:
                     self.label(anchor),
                 )
             )
+        if self.split_jd is not None and not any(self.historical(index) for index in linked):
+            # No historical return was joined: the historical coefficients
+            # were never constrained, so the result keeps one force law.
+            parameters = dict(result[0].nongravitational_parameters or {})
+            for name in (*HISTORICAL_NONGRAVITATIONAL.values(), NONGRAVITATIONAL_SPLIT_KEY):
+                parameters.pop(name, None)
+            result[0].nongravitational_parameters = parameters or None
         # Rows without O-C from the final correction (unlinked apparitions,
         # duplicate reductions, excluded or unsampled rows) are evaluated with
         # the returned orbit; earlier trial values must never remain.
@@ -1128,7 +1258,18 @@ class _Linker:
         ]
         for index in all_indices:
             record = self.records[index]
-            if index in strained:
+            if index in self.tension and index in linked:
+                record["status"] = "linked"
+                record["reason"] = (
+                    tr(
+                        "Připojeno nad běžným limitem (volba napětí modelu, do {0:g}σ): {1}; "
+                        "historická astrometrie nebo konstantní silový model návrat "
+                        "nevystihují přesně.",
+                        LINKAGE_RELAXED_NORMALIZED_RMS,
+                        self.quality_text([index]),
+                    )
+                )
+            elif index in strained:
                 record["status"] = "linked"
                 record["reason"] = (
                     tr(
@@ -1230,6 +1371,7 @@ def link_apparitions(
     nongravitational: dict[str, float] | None,
     fit_once: FitOnce, evaluate: Evaluate,
     report_progress: ProgressReporter, cancel_callback=None,
+    historical_nongravitational: bool = False, accept_model_tension: bool = False,
 ) -> tuple[tuple[OrbitSolution, float, int], list[dict[str, object]], str]:
     """Link several observed apparitions; return (fit result, audit records, note).
 
@@ -1240,5 +1382,7 @@ def link_apparitions(
     linker = _Linker(
         observations, groups, initial, constraints, nongravitational,
         fit_once, evaluate, report_progress, cancel_callback,
+        historical_nongravitational=historical_nongravitational,
+        accept_model_tension=accept_model_tension,
     )
     return linker.run()

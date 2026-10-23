@@ -70,6 +70,21 @@ planetary orbits and their current positions:
   against several star catalogues, e.g. PPM and UCAC-4) are recognised and
   only the one with the best catalogue is fitted; records that the MPC marks
   as superseded (`X`, ADES `deprecated`) are not fitted;
+- split comets: fragment labels from the MPC (column 12 of the 80-column
+  format, e.g. `0205P      b`, or the `-B` suffix of an ADES designation) are
+  recognised; when the astrometry contains several components, the
+  **Comet fragment** selector appears and only the chosen component is fitted;
+  the principal (surviving) component is preselected – the one labelled in
+  the most observed returns, then the most observed one, so for
+  73P/Schwassmann–Wachmann it is C, not the short-lived A; unlabelled
+  measurements – the parent comet before the split, the survivor in later
+  returns that the MPC no longer labels, or reports that did not resolve the
+  fragments – belong to the principal component; rows of the other components stay in the
+  table with O−C but no weight;
+- an unlabelled second track measured by one station on the same exposures
+  (a fragment or another object, e.g. ZTF on 205P in 2021, 65″ from the
+  comet) is recognised even when it has dragged the orbit between the two
+  tracks, and is excluded as a coherent secondary track;
 - times before 1960 are Universal Time UT and are converted to TT with ΔT
   from the reconstruction of the Earth's rotation (Espenak & Meeus), not with
   a fixed 32.184 s offset;
@@ -95,6 +110,15 @@ planetary orbits and their current positions:
   requested parameters in the final joint solution; this way, e.g.,
   206P/Barnard–Boattini (1892 and 2008, 20 revolutions and three approaches to
   Jupiter) is linked even without a catalogue orbit;
+- two linkage options in **Custom settings…**: *separate non-gravitational
+  parameters for historical returns* fits its own A1H/A2H/A3H before the
+  middle of the longest observing gap and A1–A3 after it (a comet whose
+  activity changed while it was lost; 205P: 1896 and 2008–2021); *join a
+  return even above the quality limit* accepts a return up to 15σ as long as
+  the other returns stay within the tension limit – for visual or
+  photographic historical astrometry – and always reports it as model
+  tension; for 205P the two options together link 1896 to 2008–2021
+  (1896 14″/4.7σ with A1H/A2H, 31″/10σ with one force law);
 - integration of arcs longer than two years uses a precise tolerance
   (`rtol = 1e-12`); over centuries and close Jupiter encounters a looser
   tolerance would introduce errors of hundreds of arcseconds;

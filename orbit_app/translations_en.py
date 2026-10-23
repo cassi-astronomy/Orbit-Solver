@@ -1423,4 +1423,42 @@ CATALOG: dict[str, str] = {
         "The body does not exist at this moment: it hit {0} ({1}).\nChoose a time before the impact.",
     "Těleso v tomto okamžiku neexistuje: jeho dráha předtím narazila do planety.\nZvolte dřívější čas.":
         "The body does not exist at this moment: its trajectory hit a planet earlier.\nChoose an earlier time.",
+    "Frag.":
+        "Frag.",
+    "Fragment rozpadlé komety podle MPC (sloupec 12 formátu 80 znaků, resp. přípona -B v ADES). Řádky bez označení patří hlavní složce.":
+        "Fragment of a split comet as labelled by the MPC (column 12 of the 80-column format, or a -B suffix in ADES). Unlabelled rows belong to the principal component.",
+    "Měření jiného fragmentu, než který se právě fituje; dostane O−C, ale nemá váhu.":
+        "Measurement of a fragment other than the one being fitted; it receives O−C but no weight.",
+    "Fragment komety:":
+        "Comet fragment:",
+    "Kometa se rozpadla; fituje se jen vybraná složka. Neoznačená měření (před rozpadem nebo bez rozlišení fragmentů) patří hlavní složce.":
+        "The comet has split; only the selected component is fitted. Unlabelled measurements (before the split or without resolved fragments) belong to the principal component.",
+    "{0} – hlavní složka ({1})":
+        "{0} – principal component ({1})",
+    "Vybrán fragment {0}: {1} měření; ostatní složky nemají ve fitu váhu. Spusťte vlastní fit znovu.":
+        "Fragment {0} selected: {1} measurements; the other components carry no weight in the fit. Run your own fit again.",
+    "fragment {0}":
+        "fragment {0}",
+    "Návrat {0}: připojuji s napětím modelu (do {1:g}σ)…":
+        "Return {0}: joining with model tension (up to {1:g}σ)…",
+    "ani s napětím modelu: {0}":
+        "not even with model tension: {0}",
+    "Připojeno nad běžným limitem (volba napětí modelu, do {0:g}σ): {1}; historická astrometrie nebo konstantní silový model návrat nevystihují přesně.":
+        "Joined above the usual limit (model-tension option, up to {0:g}σ): {1}; the historical astrometry or the constant force law does not describe this return exactly.",
+    "Navazování návratů":
+        "Linking of returns",
+    "Zvlášť negravitační parametry pro historické návraty (A1H, A2H, A3H)":
+        "Separate non-gravitational parameters for historical returns (A1H, A2H, A3H)",
+    "Před nejdelší mezerou v pozorováních platí vlastní sada A1H–A3H, po ní A1–A3. Hodí se pro komety, jejichž aktivita se mezi historickým a moderním návratem změnila (205P: ztracena 1896–2008). Historická sada se fituje až s připojením historického návratu.":
+        "Before the longest gap in the observations a separate set A1H–A3H applies, A1–A3 after it. Useful for comets whose activity changed between a historical and a modern return (205P: lost 1896–2008). The historical set is fitted once a historical return is joined.",
+    "Připojit návrat i nad limitem kvality (napětí modelu, do {0:g}σ)":
+        "Join a return even above the quality limit (model tension, up to {0:g}σ)",
+    "Běžně se návrat připojí, jen když sedí na vlastní astrometrii do 3σ. S touto volbou se přijme i horší shoda, pokud ostatní návraty zůstanou v pořádku – například u vizuální nebo fotografické historické astrometrie. Takový návrat je ve výsledku vždy označen jako napětí modelu.":
+        "Normally a return is joined only if it fits its own astrometry within 3σ. With this option a poorer fit is accepted as long as the other returns stay sound – for example with visual or photographic historical astrometry. Such a return is always marked as model tension in the result.",
+    "historické A1H–A3H":
+        "historical A1H–A3H",
+    "napojení s napětím modelu":
+        "linking with model tension",
+    "Okamžik přepnutí negravitačního modelu není konečný.":
+        "The switch epoch of the non-gravitational model is not finite.",
 }

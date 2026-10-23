@@ -67,6 +67,19 @@ společně s drahami planet a jejich aktuálními polohami:
   katalogům, např. PPM a UCAC-4) se rozpoznají a fituje se jen ta s nejlepším
   katalogem; záznamy, které MPC označuje jako nahrazené (`X`, ADES
   `deprecated`), se nefitují;
+- rozpadlé komety: označení fragmentů z MPC (sloupec 12 formátu 80 znaků,
+  např. `0205P      b`, nebo přípona `-B` v označení ADES) se rozpozná; pokud
+  astrometrie obsahuje více složek, objeví se volba **Fragment komety** a fituje
+  se jen vybraná složka; předvybraná je hlavní (přeživší) složka – ta, která je
+  označena v nejvíce pozorovaných návratech, a při shodě ta nejvíce pozorovaná,
+  takže u 73P/Schwassmann–Wachmann je to C, ne krátce žijící A; neoznačená
+  měření – mateřská kometa před rozpadem, přeživší jádro v pozdějších návratech,
+  které už MPC písmenem neoznačuje, nebo hlášení, která fragmenty nerozlišila –
+  patří hlavní složce; řádky ostatních složek zůstanou v tabulce s O−C, ale bez váhy;
+- neoznačená druhá stopa, kterou jedna stanice změřila na stejných snímcích
+  (fragment nebo jiný objekt, např. ZTF u 205P v roce 2021, 65″ od komety), se
+  rozpozná i tehdy, když dráhu stáhla mezi obě stopy, a vyřadí se jako
+  souvislá vedlejší stopa;
 - časy před rokem 1960 jsou světový čas UT a na TT se převádějí podle ΔT
   z rekonstrukce rotace Země (Espenak & Meeus), ne pevným posunem 32,184 s;
 - navazování vzdálených návratů pro jakékoli těleso (periodické komety,
@@ -90,6 +103,15 @@ společně s drahami planet a jejich aktuálními polohami:
   požadované A1/A2 se fitují, jakmile oblouk pokrývá celý oběh (dvě perihelia),
   ostatní požadované parametry v závěrečném společném řešení; takto se např. 206P/Barnard–Boattini (1892
   a 2008, 20 oběhů a tři přiblížení k Jupiteru) naváže i bez katalogové dráhy;
+- dvě volby navazování ve **Vlastním nastavení…**: *zvlášť negravitační
+  parametry pro historické návraty* fitují vlastní A1H/A2H/A3H před středem
+  nejdelší mezery v pozorováních a A1–A3 po něm (kometa, jejíž aktivita se
+  změnila, zatímco byla ztracená; 205P: 1896 a 2008–2021); *připojit návrat i
+  nad limitem kvality* přijme návrat až do 15σ, pokud ostatní návraty zůstanou
+  v mezích napětí modelu – pro vizuální či fotografickou historickou
+  astrometrii – a vždy ho vykáže jako napětí modelu; u 205P obě volby společně
+  připojí rok 1896 k letům 2008–2021 (1896 14″/4,7σ s A1H/A2H, 31″/10σ
+  s jedním silovým modelem);
 - integrace oblouků delších než dva roky používá přesnou toleranci
   (`rtol = 1e-12`); přes staletí a těsná setkání s Jupiterem by volnější
   tolerance vnesla chybu stovek obloukových vteřin;

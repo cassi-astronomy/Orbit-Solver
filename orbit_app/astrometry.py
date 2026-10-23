@@ -238,6 +238,151 @@ def catalog_rank(observation: Observation) -> int:
     return _ADES_CATALOG_RANK.get(code.upper().replace("-", ""), 0)
 
 
+# --------------------------------------------------------------------------
+# Comet fragments
+# --------------------------------------------------------------------------
+
+# MPC80 columns 6-12 hold a packed provisional designation (``K08R060`` =
+# 2008 R6); a fragment replaces its last character by a lowercase letter
+# (``K08R06b``).  A numbered comet leaves columns 6-11 blank and puts the
+# fragment letter(s) in columns 11-12 (``0205P      b``, ``0073P     bk``).
+_PACKED_COMET_PROVISIONAL = re.compile(r"^[A-L]\d\d[A-Z][0-9A-Za-z]\d[0-9a-z]$")
+# Unpacked designations (ADES permID/provID, user input) carry the fragment as
+# an uppercase suffix: ``205P-B``, ``73P-BK``, ``D/1993 F2-G``, ``2008 R6-C``.
+_UNPACKED_FRAGMENT = re.compile(
+    r"^\s*(?:\d+[PDI]|(?:[ACDPXI]/)?\d{4}\s+[A-Z]{1,2}\d+)-([A-Z]{1,2})\s*$", re.I,
+)
+# ADES rows may carry the original 80-column record.
+_OBS80_KEYS = ("mpc80", "obs80", "obs_80")
+_DESIGNATION_KEYS = ("permid", "provid", "trksub")
+
+
+def mpc80_fragment(line: str) -> str:
+    """Fragment letter(s) of one MPC 80-column record, upper case, or ``""``."""
+    field = (line or "")[5:12].ljust(7)
+    if _PACKED_COMET_PROVISIONAL.match(field):
+        return field[6].upper() if field[6].islower() else ""
+    if not field[:5].strip():
+        letters = field[5:7].strip()
+        if letters.isalpha() and letters.islower():
+            return letters.upper()
+    return ""
+
+
+def designation_fragment(designation: str) -> str:
+    """Fragment suffix of an unpacked designation (``205P-B`` → ``B``)."""
+    match = _UNPACKED_FRAGMENT.match(designation or "")
+    return match.group(1).upper() if match else ""
+
+
+def observation_fragment(observation: Observation) -> str:
+    """Fragment (``A``, ``B``, ``BK``) a measurement refers to; ``""`` if unlabelled.
+
+    Unlabelled rows are the undivided comet (before the split) or a report that
+    did not resolve the components.
+    """
+    raw = {str(key).casefold(): value for key, value in observation.raw.items()}
+    for key in _OBS80_KEYS:
+        line = raw.get(key)
+        if isinstance(line, str) and len(line) >= 12:
+            letters = mpc80_fragment(line)
+            if letters:
+                return letters
+    for value in (observation.designation, *(raw.get(key) for key in _DESIGNATION_KEYS)):
+        if isinstance(value, str):
+            letters = designation_fragment(value)
+            if letters:
+                return letters
+    return ""
+
+
+def fragment_counts(observations: list[Observation]) -> dict[str, int]:
+    """Number of explicitly labelled measurements per fragment, sorted by label."""
+    counts: dict[str, int] = {}
+    for observation in observations:
+        letters = observation_fragment(observation)
+        if letters:
+            counts[letters] = counts.get(letters, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: (len(item[0]), item[0])))
+
+
+# Labels separated by a longer gap belong to different returns (days); the
+# seasonal solar-conjunction gap within one return is shorter.
+FRAGMENT_RETURN_GAP_DAYS = 300.0
+
+
+def fragment_return_counts(observations: list[Observation]) -> dict[str, int]:
+    """Number of observed returns in which each fragment is explicitly labelled."""
+    days: dict[str, list[float]] = {}
+    for observation in observations:
+        letters = observation_fragment(observation)
+        if not letters or not observation.time:
+            continue
+        try:
+            instant = parse_observation_time(observation.time)
+        except ValueError:
+            continue
+        days.setdefault(letters, []).append(seconds_since_j2000(instant) / 86400.0)
+    returns: dict[str, int] = {}
+    for letters, values in days.items():
+        values.sort()
+        returns[letters] = 1 + sum(
+            later - earlier > FRAGMENT_RETURN_GAP_DAYS
+            for earlier, later in zip(values, values[1:])
+        )
+    return returns
+
+
+def primary_fragment(observations: list[Observation]) -> str:
+    """Principal (surviving) component of a split comet.
+
+    The MPC letter does not say which nucleus survives: the brightest one at
+    the split is ``A``, but 73P/Schwassmann–Wachmann lost A within weeks and
+    only C was followed through later returns, after which its astrometry is
+    no longer labelled.  The component labelled in the most observed returns
+    is therefore principal; the number of labelled measurements breaks ties
+    (205P: A, B and C were all seen only in 2008, A is by far the best
+    observed).  Short-lived pieces and stray labels rarely span returns.
+    """
+    counts = fragment_counts(observations)
+    if not counts:
+        return ""
+    returns = fragment_return_counts(observations)
+    # ``counts`` is ordered by label, so complete ties go to the earliest one.
+    return max(counts, key=lambda letters: (returns.get(letters, 1), counts[letters]))
+
+
+def select_fragment(observations: list[Observation], fragment: str | None) -> int:
+    """Restrict fitting to one fragment of a split comet.
+
+    Measurements of the other components get ``raw['inactive_fragment']`` and
+    stop being fit candidates; they still receive O-C against the fitted orbit.
+    Unlabelled rows belong to the principal component (:func:`primary_fragment`):
+    they are the parent nucleus before the split or reports that did not
+    resolve the fragments.  ``fragment`` ``None``/``""`` fits all rows (no
+    selection), as does astrometry without any fragment label.  The user's manual inclusion state is not changed.  Returns
+    the number of rows belonging to the selected component.
+    """
+    wanted = (fragment or "").strip().upper()
+    primary = primary_fragment(observations) if wanted else ""
+    if not primary:
+        # Nothing is labelled: the astrometry does not resolve any fragments.
+        wanted = ""
+    selected = 0
+    for observation in observations:
+        if not wanted:
+            observation.raw.pop("inactive_fragment", None)
+            selected += 1
+            continue
+        letters = observation_fragment(observation) or primary
+        if letters == wanted:
+            observation.raw.pop("inactive_fragment", None)
+            selected += 1
+        else:
+            observation.raw["inactive_fragment"] = True
+    return selected
+
+
 def is_deprecated(observation: Observation) -> bool:
     """MPC flags replaced/deleted records with note 'X'/'x' or ADES ``deprecated``."""
     if str(observation.raw.get("mpc_note2") or "") in ("X", "x"):
@@ -256,6 +401,8 @@ def mark_duplicate_measurements(observations: list[Observation]) -> int:
     flagged ``True`` and receive O-C values but no weight.  Returns the number
     of flagged copies.  The user's manual inclusion state is not changed.
     """
+    # Components of a split comet are measured on the same exposure; they are
+    # different objects, never re-reductions of each other.
     entries: list[tuple[str, float, Observation]] = []
     for observation in observations:
         observation.raw.pop("duplicate_measurement", None)
@@ -266,7 +413,7 @@ def mark_duplicate_measurements(observations: list[Observation]) -> int:
         except ValueError:
             continue
         entries.append((
-            (observation.station or "").strip().upper(),
+            (observation.station or "").strip().upper() + "|" + observation_fragment(observation),
             seconds_since_j2000(instant) / 86400.0,
             observation,
         ))
@@ -301,12 +448,13 @@ def mark_duplicate_measurements(observations: list[Observation]) -> int:
 
 
 def is_fit_candidate(observation: Observation) -> bool:
-    """Valid, enabled, not a duplicate re-reduction and not MPC-deprecated."""
+    """Valid, enabled, of the selected fragment, not a duplicate and not deprecated."""
     return bool(
         not observation.excluded_from_fit
         and observation.ra_deg is not None and observation.dec_deg is not None
         and observation.time
         and not observation.raw.get("duplicate_measurement")
+        and not observation.raw.get("inactive_fragment")
         and not is_deprecated(observation)
     )
 

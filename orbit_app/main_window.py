@@ -66,7 +66,12 @@ from matplotlib.figure import Figure
 from matplotlib.projections import register_projection
 from mpl_toolkits.mplot3d import Axes3D
 
+from .astrometry import (
+    fragment_counts, observation_fragment, primary_fragment, select_fragment,
+)
 from .domain import Observation, OrbitSolution, is_comet_designation
+from .linkage import LINKAGE_RELAXED_NORMALIZED_RMS
+from .orbit_engine import HISTORICAL_NONGRAVITATIONAL, NONGRAVITATIONAL_SPLIT_KEY
 from .comet_dynamics import analyze_original_future_orbit
 from .i18n import SUPPORTED_LANGUAGES, language, save_language, tr
 from . import mpc_cache
@@ -158,6 +163,7 @@ class ObservationModel(QAbstractTableModel):
         ("Dec [° ′ ″]", "dec_deg"),
         (tr("Mag / pásmo"), "magnitude_band"),
         (tr("Stanice"), "station"),
+        (tr("Frag."), "fragment"),
         (tr("Použít"), "excluded_from_fit"),
         ("O−C RA [″]", "residual_ra_arcsec"),
         ("O−C Dec [″]", "residual_dec_arcsec"),
@@ -184,7 +190,26 @@ class ObservationModel(QAbstractTableModel):
             return None
         field = self.columns[index.column()][1]
         observation = self.rows[index.row()]
-        value = None if field == "magnitude_band" else getattr(observation, field)
+        if field == "fragment":
+            value = observation_fragment(observation)
+        else:
+            value = None if field == "magnitude_band" else getattr(observation, field)
+        inactive_fragment = bool(observation.raw.get("inactive_fragment"))
+        if role == Qt.ToolTipRole and field == "fragment":
+            return tr(
+                "Fragment rozpadlé komety podle MPC (sloupec 12 formátu 80 znaků, resp. "
+                "přípona -B v ADES). Řádky bez označení patří hlavní složce.",
+            )
+        if role == Qt.ToolTipRole and field == "excluded_from_fit" and inactive_fragment:
+            return tr(
+                "Měření jiného fragmentu, než který se právě fituje; dostane O−C, ale "
+                "nemá váhu.",
+            )
+        if (
+            role == Qt.ForegroundRole and inactive_fragment
+            and field not in ("residual_ra_arcsec", "residual_dec_arcsec")
+        ):
+            return QColor("#64758c")
         if role == Qt.CheckStateRole and field == "excluded_from_fit":
             return Qt.Unchecked if observation.excluded_from_fit else Qt.Checked
         if role == Qt.ToolTipRole and field == "excluded_from_fit":
@@ -691,6 +716,7 @@ class OrbitFitWorker(QObject):
         truncate_years: float | None = None,
         nongravitational: dict[str, float] | None = None,
         compute_original_future: bool = False,
+        linkage_options: dict[str, bool] | None = None,
     ) -> None:
         super().__init__()
         self.observations = observations
@@ -699,6 +725,7 @@ class OrbitFitWorker(QObject):
         self.truncate_years = truncate_years
         self.nongravitational = nongravitational
         self.compute_original_future = compute_original_future
+        self.linkage_options = dict(linkage_options or {})
         self._cancel_requested = False
 
     def request_cancel(self) -> None:
@@ -723,6 +750,10 @@ class OrbitFitWorker(QObject):
                 self.nongravitational,
                 progress_callback=self.progress.emit,
                 cancel_callback=self.is_cancel_requested,
+                historical_nongravitational=bool(
+                    self.linkage_options.get("historical_nongravitational")
+                ),
+                accept_model_tension=bool(self.linkage_options.get("accept_model_tension")),
             )
             solution = result[0]
             if self.compute_original_future:
@@ -4395,7 +4426,14 @@ class ElementsPanel(QWidget):
                 )
             else:
                 lines.append("Nongravitational parameters (Marsden water-ice model):")
-            for name in ("A1", "A2", "A3", "DT"):
+            split = s.nongravitational_parameters.get(NONGRAVITATIONAL_SPLIT_KEY)
+            if split is not None:
+                switch = datetime_from_jd(float(split))
+                switch_text = f"{switch:%Y-%m-%d}" if switch else f"JD {float(split):.1f}"
+                lines.append(
+                    f"Historical set A1H-A3H applies before {switch_text} (TDB), A1-A3 after it."
+                )
+            for name in ("A1", "A2", "A3", "DT", *HISTORICAL_NONGRAVITATIONAL.values()):
                 if name in s.nongravitational_parameters:
                     value = s.nongravitational_parameters[name]
                     uncertainty = (s.element_uncertainties or {}).get(name)
@@ -4405,7 +4443,7 @@ class ElementsPanel(QWidget):
                     )
                     unit = "days" if name == "DT" else "AU/day^2"
                     value_text = f"{value:+.6f}" if name == "DT" else f"{value:+.6e}"
-                    lines.append(f"{name}   {value_text}{suffix} {unit}")
+                    lines.append(f"{name:<4} {value_text}{suffix} {unit}")
         if s.dynamical_1a:
             dynamics = s.dynamical_1a
             lines.extend(("", tr("Původní a budoucí barycentrická dráha:")))
@@ -4830,9 +4868,11 @@ class OrbitConstraintsDialog(QDialog):
         compute_original_future: bool = False,
         output_epoch: str = "",
         allow_element_constraints: bool = True, parent=None,
+        linkage_options: dict[str, bool] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(tr("Vlastní nastavení fitu"))
+        linkage_options = dict(linkage_options or {})
         self.controls: dict[str, tuple[QCheckBox, QDoubleSpinBox]] = {}
         self.ng_controls: dict[str, tuple[QCheckBox, QDoubleSpinBox]] = {}
         values = {
@@ -4952,10 +4992,51 @@ class OrbitConstraintsDialog(QDialog):
             if not available_dt:
                 dt_enabled.setChecked(False)
 
+        linkage_heading = QLabel(tr("Navazování návratů"))
+        linkage_heading.setStyleSheet("font-weight: 650; margin-top: 10px;")
+        self.historical_force = QCheckBox(
+            tr("Zvlášť negravitační parametry pro historické návraty (A1H, A2H, A3H)")
+        )
+        self.historical_force.setToolTip(
+            tr(
+                "Před nejdelší mezerou v pozorováních platí vlastní sada A1H–A3H, po ní "
+                "A1–A3. Hodí se pro komety, jejichž aktivita se mezi historickým a "
+                "moderním návratem změnila (205P: ztracena 1896–2008). Historická sada "
+                "se fituje až s připojením historického návratu.",
+            )
+        )
+        self.historical_force.setChecked(
+            bool(linkage_options.get("historical_nongravitational"))
+        )
+        self.model_tension = QCheckBox(
+            tr(
+                "Připojit návrat i nad limitem kvality (napětí modelu, do {0:g}σ)",
+                LINKAGE_RELAXED_NORMALIZED_RMS,
+            )
+        )
+        self.model_tension.setToolTip(
+            tr(
+                "Běžně se návrat připojí, jen když sedí na vlastní astrometrii do 3σ. "
+                "S touto volbou se přijme i horší shoda, pokud ostatní návraty zůstanou "
+                "v pořádku – například u vizuální nebo fotografické historické "
+                "astrometrie. Takový návrat je ve výsledku vždy označen jako napětí "
+                "modelu.",
+            )
+        )
+        self.model_tension.setChecked(bool(linkage_options.get("accept_model_tension")))
+
+        def sync_historical() -> None:
+            available = any(control.isChecked() for control in a_checks)
+            self.historical_force.setEnabled(available)
+            if not available:
+                self.historical_force.setChecked(False)
+
         for control in a_checks:
             control.toggled.connect(sync_ng_model)
+            control.toggled.connect(sync_historical)
         self.ng_model.currentIndexChanged.connect(sync_ng_model)
         sync_ng_model()
+        sync_historical()
         nongrav_note = QLabel(
             tr(
                 "A1–A3 lze fitovat bez ohledu na označení tělesa. Pro planetky je obvyklá "
@@ -4968,6 +5049,9 @@ class OrbitConstraintsDialog(QDialog):
         nongrav_note.setWordWrap(True)
         nongrav_note.setObjectName("muted")
         form.addRow(nongrav_note)
+        form.addRow(linkage_heading)
+        form.addRow(self.historical_force)
+        form.addRow(self.model_tension)
         if comet:
             dynamics_heading = QLabel(tr("Dlouhodobá dynamika komety"))
             dynamics_heading.setStyleSheet("font-weight: 650; margin-top: 10px;")
@@ -5076,6 +5160,14 @@ class OrbitConstraintsDialog(QDialog):
 
     def calculate_original_future(self) -> bool:
         return self.is_comet and self.original_future.isChecked()
+
+    def selected_linkage_options(self) -> dict[str, bool]:
+        return {
+            "historical_nongravitational": bool(
+                self.historical_force.isEnabled() and self.historical_force.isChecked()
+            ),
+            "accept_model_tension": self.model_tension.isChecked(),
+        }
 
     def selected_output_epoch(self) -> str:
         return self.output_epoch.text().strip()
@@ -5223,6 +5315,7 @@ class MainWindow(QMainWindow):
         self.current_display_name = ""
         self.current_observations: list[Observation] = []
         self.nongravitational_fit: dict[str, float] = {}
+        self.linkage_options: dict[str, bool] = {}
         self.fit_constraints: dict[str, float] = {}
         self.compute_original_future = False
         self.fit_output_epoch = ""
@@ -5324,6 +5417,19 @@ class MainWindow(QMainWindow):
         self.fit_interval.currentIndexChanged.connect(
             lambda _: self._update_fit_button_label()
         )
+        # Split comets: the components are separate bodies and a joint fit of
+        # their astrometry is meaningless.  Shown only when MPC labels fragments.
+        self.fragment_label = QLabel(tr("Fragment komety:"))
+        self.fragment_selector = QComboBox()
+        self.fragment_selector.setToolTip(
+            tr(
+                "Kometa se rozpadla; fituje se jen vybraná složka. Neoznačená měření "
+                "(před rozpadem nebo bez rozlišení fragmentů) patří hlavní složce.",
+            )
+        )
+        self.fragment_selector.currentIndexChanged.connect(self._fragment_selection_changed)
+        self.fragment_label.setVisible(False)
+        self.fragment_selector.setVisible(False)
         hint = QLabel(
             tr(
                 "MPC dráha je počáteční odhad; vlastní fit používá topocentrické polohy "
@@ -5345,7 +5451,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.constraints_button); layout.addWidget(QLabel(tr(
             "Rozsah astrometrie:",
         )))
-        layout.addWidget(self.fit_interval); layout.addWidget(hint)
+        layout.addWidget(self.fit_interval)
+        layout.addWidget(self.fragment_label); layout.addWidget(self.fragment_selector)
+        layout.addWidget(hint)
         layout.addStretch()
         language_row = QHBoxLayout()
         language_row.addWidget(QLabel("Language / Jazyk:"))
@@ -5519,6 +5627,7 @@ class MainWindow(QMainWindow):
             self.arc_metric.setText("—")
             self.rms_metric.setText("—")
             self.nongravitational_fit = {}
+            self.linkage_options = {}
             self.fit_constraints = {}
             self.compute_original_future = False
             self.fit_output_epoch = ""
@@ -5601,6 +5710,7 @@ class MainWindow(QMainWindow):
         self.load_button.setEnabled(True)
         same_object = designation.strip().casefold() == self.current_designation.strip().casefold()
         self.has_orbit = self.has_orbit and same_object
+        self._configure_fragment_selector(rows)
         self.observation_model.set_rows(rows)
         self.observation_detail.setText(
             tr("Kliknutím na pozorování zobrazíte observatoř a geometrii v okamžiku měření.")
@@ -5967,6 +6077,47 @@ class MainWindow(QMainWindow):
             10000,
         )
 
+    def _configure_fragment_selector(self, rows: list[Observation]) -> None:
+        """Offer the components of a split comet and fit the principal one."""
+        counts = fragment_counts(rows)
+        primary = primary_fragment(rows)
+        unlabelled = sum(1 for row in rows if not observation_fragment(row))
+        self.fragment_selector.blockSignals(True)
+        self.fragment_selector.clear()
+        if len(counts) >= 2:
+            for letters, count in counts.items():
+                if letters == primary:
+                    text = tr("{0} – hlavní složka ({1})", letters, count + unlabelled)
+                else:
+                    text = f"{letters} ({count})"
+                self.fragment_selector.addItem(text, letters)
+            self.fragment_selector.setCurrentIndex(list(counts).index(primary))
+            select_fragment(rows, primary)
+        else:
+            select_fragment(rows, None)
+        self.fragment_selector.blockSignals(False)
+        self.fragment_label.setVisible(len(counts) >= 2)
+        self.fragment_selector.setVisible(len(counts) >= 2)
+
+    def _fragment_selection_changed(self, _index: int) -> None:
+        fragment = self.fragment_selector.currentData()
+        if not fragment or not self.current_observations:
+            return
+        selected = select_fragment(self.current_observations, fragment)
+        for observation in self.current_observations:
+            observation.used_in_fit = None
+        self.observation_model.set_rows(self.current_observations)
+        self._update_fit_button_label()
+        self._refresh_residual_actions()
+        self.statusBar().showMessage(
+            tr(
+                "Vybrán fragment {0}: {1} měření; ostatní složky nemají ve fitu váhu. "
+                "Spusťte vlastní fit znovu.",
+                fragment, selected,
+            ),
+            10000,
+        )
+
     def _update_fit_button_label(self) -> None:
         total = len(self.current_observations)
         selected = fit_selection_count(
@@ -6054,12 +6205,13 @@ class MainWindow(QMainWindow):
         dialog = OrbitConstraintsDialog(
             settings_solution, self.fit_constraints, self.nongravitational_fit,
             self.compute_original_future, self.fit_output_epoch,
-            self.has_orbit, self,
+            self.has_orbit, self, linkage_options=self.linkage_options,
         )
         if dialog.exec() != QDialog.Accepted:
             return
         self.fit_constraints = dialog.selected_constraints()
         self.nongravitational_fit = dialog.selected_nongravitational()
+        self.linkage_options = dialog.selected_linkage_options()
         self.compute_original_future = dialog.calculate_original_future()
         self.fit_output_epoch = dialog.selected_output_epoch()
         if self.fit_output_epoch:
@@ -6078,10 +6230,16 @@ class MainWindow(QMainWindow):
             name for name in ("A1", "A2", "A3", "DT")
             if name in self.nongravitational_fit
         ]
+        linkage = [
+            text for key, text in (
+                ("historical_nongravitational", tr("historické A1H–A3H")),
+                ("accept_model_tension", tr("napojení s napětím modelu")),
+            ) if self.linkage_options.get(key)
+        ]
         count = (
             len(self.fit_constraints) + len(fitted_ng_names)
             + int(self.compute_original_future)
-            + int(bool(self.fit_output_epoch))
+            + int(bool(self.fit_output_epoch)) + len(linkage)
         )
         self.constraints_button.setText(
             tr("Vlastní nastavení… ({0})", count) if count else tr("Vlastní nastavení…")
@@ -6096,7 +6254,7 @@ class MainWindow(QMainWindow):
             dynamics = ["original/future 1/a"] if self.compute_original_future else []
             epoch = ([tr("výstupní epocha {0}", self.fit_output_epoch)]
                      if self.fit_output_epoch else [])
-            summary = ", ".join(fixed + fitted + dynamics + epoch)
+            summary = ", ".join(fixed + fitted + dynamics + epoch + linkage)
             self.statusBar().showMessage(tr("Aktivní vlastní nastavení: {0}", summary), 10000)
         else:
             self.statusBar().showMessage(tr("Všech šest elementů je ve vlastním fitu volných."), 6000)
@@ -6203,6 +6361,7 @@ class MainWindow(QMainWindow):
         self.fit_button.setEnabled(False)
         self.solve.setEnabled(False)
         self.fit_interval.setEnabled(False)
+        self.fragment_selector.setEnabled(False)
         truncate_years = self.fit_interval.currentData()
         interval_label = self.fit_interval.currentText().lower()
         mode = f" — {interval_label}"
@@ -6214,6 +6373,7 @@ class MainWindow(QMainWindow):
         worker = OrbitFitWorker(
             self.current_observations, initial, self.fit_constraints, truncate_years,
             self.nongravitational_fit, self.compute_original_future,
+            self.linkage_options,
         )
         progress_dialog = OrbitFitProgressDialog(self)
         # A queued slot on ``worker`` could not run while its thread is inside
@@ -6297,6 +6457,8 @@ class MainWindow(QMainWindow):
         count_text = apparition_observation_count_text(solution)
         linkage_text = apparition_linkage_summary(solution)
         label_parts = [tr("Vlastní fit")]
+        if self.fragment_selector.isVisible() and self.fragment_selector.currentData():
+            label_parts.append(tr("fragment {0}", self.fragment_selector.currentData()))
         if linkage_text:
             label_parts.append(linkage_text)
         if count_text:
@@ -6373,6 +6535,7 @@ class MainWindow(QMainWindow):
         )
         self.solve.setEnabled(True)
         self.fit_interval.setEnabled(True)
+        self.fragment_selector.setEnabled(True)
 
 
 def run() -> int:

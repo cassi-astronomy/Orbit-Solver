@@ -132,17 +132,43 @@ def delayed_heliocentric_radius(
     return radius
 
 
+# Separate historical force law: before ``SPLIT_JD`` (TDB Julian date) the
+# coefficients A1H/A2H/A3H replace A1/A2/A3.  A comet whose activity changed
+# between a historical and a modern apparition (205P: lost from 1896 to 2008)
+# cannot be described by one constant set; the switch is placed in the long
+# unobserved gap, normally near aphelion where the water-ice law is ~0.
+NONGRAVITATIONAL_SPLIT_KEY = "SPLIT_JD"
+HISTORICAL_NONGRAVITATIONAL = {"A1": "A1H", "A2": "A2H", "A3": "A3H"}
+
+
+def active_nongravitational_coefficients(
+    parameters: dict[str, float] | None, jd: float | None,
+) -> tuple[float, float, float]:
+    """(A1, A2, A3) in AU/day² valid at TDB ``jd`` (historical before the split)."""
+    if not parameters:
+        return 0.0, 0.0, 0.0
+    split = parameters.get(NONGRAVITATIONAL_SPLIT_KEY)
+    names = ("A1", "A2", "A3")
+    if split is not None and jd is not None and float(jd) < float(split):
+        names = tuple(HISTORICAL_NONGRAVITATIONAL[name] for name in names)
+    return tuple(float(parameters.get(name, 0.0)) for name in names)
+
+
 def nongravitational_acceleration(
     position: np.ndarray, velocity: np.ndarray,
     parameters: dict[str, float] | None,
+    jd: float | None = None,
 ) -> np.ndarray:
     """A1/A2/A3 acceleration in RTN using the selected distance law.
 
     The default is the Marsden water-ice law. ``R_EXPONENT`` selects the
     asteroid convention g(r) = r**(-R_EXPONENT); exponent 2 is the usual
     simple model for radiation pressure (A1) or Yarkovsky drift (A2).
+    ``jd`` (TDB) selects the historical coefficients A1H–A3H before
+    ``SPLIT_JD`` when the parameters define one.
     """
-    if not parameters or not any(float(parameters.get(name, 0.0)) for name in ("A1", "A2", "A3")):
+    a1, a2, a3 = active_nongravitational_coefficients(parameters, jd)
+    if not (a1 or a2 or a3):
         return np.zeros(3, dtype=float)
     position = np.asarray(position, dtype=float)
     velocity = np.asarray(velocity, dtype=float)
@@ -154,11 +180,7 @@ def nongravitational_acceleration(
         return np.zeros(3, dtype=float)
     normal = normal_vector / normal_norm
     transverse = _cross(normal, radial)
-    direction = (
-        float(parameters.get("A1", 0.0)) * radial +
-        float(parameters.get("A2", 0.0)) * transverse +
-        float(parameters.get("A3", 0.0)) * normal
-    )
+    direction = a1 * radial + a2 * transverse + a3 * normal
     if "R_EXPONENT" in parameters:
         exponent = float(parameters["R_EXPONENT"])
         if not np.isfinite(exponent) or exponent <= 0.0:
@@ -291,7 +313,7 @@ class NBodyIntegrator:
         self._check_collisions = self.detect_collisions and bool(np.any(self._radius2 > 0.0))
         self._has_nongravitational = any(
             float(self.nongravitational_parameters.get(name, 0.0))
-            for name in ("A1", "A2", "A3")
+            for name in ("A1", "A2", "A3", *HISTORICAL_NONGRAVITATIONAL.values())
         )
         # Force-law constants resolved once; the integrator evaluates the law
         # millions of times per fit (same formulas as
@@ -299,6 +321,14 @@ class NBodyIntegrator:
         parameters = self.nongravitational_parameters
         self._ng_coefficients = tuple(
             float(parameters.get(name, 0.0)) for name in ("A1", "A2", "A3")
+        )
+        split = parameters.get(NONGRAVITATIONAL_SPLIT_KEY)
+        self._ng_split = float(split) if split is not None else None
+        if self._ng_split is not None and not np.isfinite(self._ng_split):
+            raise FloatingPointError(tr("Okamžik přepnutí negravitačního modelu není konečný."))
+        self._ng_historical = tuple(
+            float(parameters.get(HISTORICAL_NONGRAVITATIONAL[name], 0.0))
+            for name in ("A1", "A2", "A3")
         )
         self._ng_exponent = (
             float(parameters["R_EXPONENT"]) if "R_EXPONENT" in parameters else None
@@ -388,7 +418,7 @@ class NBodyIntegrator:
             )
         if velocity is not None and self._has_nongravitational:
             acceleration = acceleration + self._nongravitational_acceleration(
-                position, velocity,
+                position, velocity, jd,
             )
         return acceleration
 
@@ -403,8 +433,11 @@ class NBodyIntegrator:
         scaled = max(activity_radius, 1e-12) / 2.808
         return 0.111262 * scaled ** -2.15 * (1.0 + scaled ** 5.093) ** -4.6142
 
+    def _historical(self, jd: float | None) -> bool:
+        return self._ng_split is not None and jd is not None and jd < self._ng_split
+
     def _nongravitational_acceleration(
-        self, position: np.ndarray, velocity: np.ndarray,
+        self, position: np.ndarray, velocity: np.ndarray, jd: float | None = None,
     ) -> np.ndarray:
         """A1/A2/A3 in RTN; identical to nongravitational_acceleration()."""
         radius = math.sqrt(float(position @ position))
@@ -415,7 +448,9 @@ class NBodyIntegrator:
             return np.zeros(3, dtype=float)
         normal = normal_vector / normal_norm
         transverse = _cross(normal, radial)
-        a1, a2, a3 = self._ng_coefficients
+        a1, a2, a3 = self._ng_historical if self._historical(jd) else self._ng_coefficients
+        if not (a1 or a2 or a3):
+            return np.zeros(3, dtype=float)
         direction = a1 * radial + a2 * transverse + a3 * normal
         return self._activity_law(position, velocity, radius) * direction
 
@@ -467,11 +502,18 @@ class NBodyIntegrator:
         normal = normal / normal_norm
         transverse = _cross(normal, radial)
         law = self._activity_law(position, velocity, radius)
-        directions = {"A1": radial, "A2": transverse, "A3": normal}
+        modern = {"A1": radial, "A2": transverse, "A3": normal}
+        historical = {
+            HISTORICAL_NONGRAVITATIONAL[name]: vector for name, vector in modern.items()
+        }
+        # Only the coefficient set acting at ``jd`` has a derivative there.
+        active, inactive = (historical, modern) if self._historical(jd) else (modern, historical)
         for column, (name, scale) in enumerate(zip(parameter_names, parameter_scales)):
-            if name in directions:
+            if name in active:
                 # d(a)/d(A_k) = g(r) * unit vector, exactly.
-                parameter_jacobian[:, column] = law * directions[name] * float(scale)
+                parameter_jacobian[:, column] = law * active[name] * float(scale)
+                continue
+            if name in inactive:
                 continue
             physical_value = float(parameters.get(name, 0.0))
             physical_step = max(.01, abs(physical_value) * 1e-5)
@@ -480,8 +522,8 @@ class NBodyIntegrator:
             plus_parameters[name] = physical_value + physical_step
             minus_parameters[name] = physical_value - physical_step
             parameter_jacobian[:, column] = (
-                nongravitational_acceleration(position, velocity, plus_parameters)
-                - nongravitational_acceleration(position, velocity, minus_parameters)
+                nongravitational_acceleration(position, velocity, plus_parameters, jd)
+                - nongravitational_acceleration(position, velocity, minus_parameters, jd)
             ) / (2.0 * physical_step) * float(scale)
         return position_jacobian, velocity_jacobian, parameter_jacobian
 
