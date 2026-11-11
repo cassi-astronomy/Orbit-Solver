@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
-from .domain import Observation, OrbitSolution
+from .domain import Observation, OrbitSolution, is_comet_designation
 from .i18n import tr
 from .orbit_engine import MU_SUN
 
@@ -37,6 +37,67 @@ LINKAGE_STATUS_LABELS = {
     "integrated_only": tr("jen integrovaná předpověď"),
 }
 
+LUNAR_SIDEREAL_PERIOD_DAYS = 27.321661
+
+
+def format_diameter(diameter_km: float) -> str:
+    """Diameter with a unit suited to its size (m below 1 km, km above)."""
+    value = float(diameter_km)
+    if not np.isfinite(value) or value <= 0.0:
+        return "—"
+    if value < 0.001:
+        return f"{value * 1e5:.0f} cm"
+    if value < 1.0:
+        metres = value * 1000.0
+        return f"{metres:.0f} m" if metres >= 10.0 else f"{metres:.1f} m"
+    return f"{value:.0f} km" if value >= 100.0 else f"{value:.1f} km"
+
+
+def asteroid_size_lines(solution: OrbitSolution) -> list[str]:
+    """Report lines with the diameter range implied by H for an asteroid.
+
+    Empty for comets (H/M of an active comet measures the coma, not the
+    nucleus) and while H is only a placeholder.
+    """
+    from .photometry import (
+        ASTEROID_ALBEDO_EXTREME, ASTEROID_ALBEDO_TYPICAL,
+        diameter_from_absolute_magnitude_km,
+    )
+
+    if (
+        not solution.absolute_magnitude_known
+        or not np.isfinite(float(solution.absolute_magnitude))
+        or is_comet_designation(solution.designation)
+        or is_comet_designation(solution.display_name or "")
+    ):
+        return []
+    h = float(solution.absolute_magnitude)
+
+    def size_range(albedos: tuple[float, float]) -> str:
+        bright, dark = albedos
+        return (
+            f"{format_diameter(diameter_from_absolute_magnitude_km(h, bright))} – "
+            f"{format_diameter(diameter_from_absolute_magnitude_km(h, dark))}"
+        )
+
+    typical_bright, typical_dark = ASTEROID_ALBEDO_TYPICAL
+    extreme_bright, extreme_dark = ASTEROID_ALBEDO_EXTREME
+    return [
+        tr("Odhad průměru z H (albedo není známo):"),
+        tr(
+            "  obvyklý rozsah  {0}  (světlé těleso typu S p_V = {1:.2f} až tmavé typu C p_V = {2:.2f})",
+            size_range(ASTEROID_ALBEDO_TYPICAL), typical_bright, typical_dark,
+        ),
+        tr(
+            "  krajní meze     {0}  (p_V = {1:.2f} až {2:.2f})",
+            size_range(ASTEROID_ALBEDO_EXTREME), extreme_bright, extreme_dark,
+        ),
+        tr(
+            "  D = 1329 km / √p_V · 10^(−H/5); nejistota H ±0,3 mag sama mění průměr "
+            "asi o ±15 %.",
+        ),
+    ]
+
 
 def sky_track_sample_count(horizon_days: int) -> int:
     """Keep short tracks smooth without making multi-year views enormous."""
@@ -47,7 +108,13 @@ def equatorial_ra_ticks(
     center_ra_deg: float, field_deg: float,
 ) -> tuple[np.ndarray, tuple[str, ...]]:
     """Return sky-anchored RA ticks for a target-centred rectangular map."""
-    if field_deg <= 15.0:
+    if field_deg <= 0.5:
+        step_hours = 10.0 / 3600.0
+    elif field_deg <= 2.0:
+        step_hours = 1.0 / 60.0
+    elif field_deg <= 6.0:
+        step_hours = 5.0 / 60.0
+    elif field_deg <= 15.0:
         step_hours = 0.25
     elif field_deg <= 30.0:
         step_hours = 0.5
@@ -66,11 +133,15 @@ def equatorial_ra_ticks(
     positions = absolute - center_ra_deg
     labels: list[str] = []
     for degrees in absolute:
-        total_minutes = int(round((degrees % 360.0) * 4.0)) % (24 * 60)
-        hours, minutes = divmod(total_minutes, 60)
-        labels.append(
-            f"{hours:02d}h" if minutes == 0 else f"{hours:02d}h{minutes:02d}"
-        )
+        total_seconds = int(round((degrees % 360.0) * 240.0)) % (24 * 3600)
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if seconds:
+            labels.append(f"{hours:02d}h{minutes:02d}m{seconds:02d}s")
+        else:
+            labels.append(
+                f"{hours:02d}h" if minutes == 0 else f"{hours:02d}h{minutes:02d}"
+            )
     return positions, tuple(labels)
 
 
@@ -149,6 +220,92 @@ def project_ecliptic_camera(
         (flat @ up).reshape(original_shape),
         (flat @ camera).reshape(original_shape),
     )
+
+
+def projected_ecliptic_curtain_quads(
+    orbit_xyz_au: np.ndarray, azimuth_deg: float, elevation_deg: float,
+) -> np.ndarray:
+    """Project an orbit-to-ecliptic curtain as adjacent screen-space quads.
+
+    ``orbit_xyz_au`` is a sampled heliocentric J2000-ecliptic path in AU.  The
+    returned array has shape ``(N - 1, 4, 2)``.  Local quadrilaterals avoid the
+    false closing chords produced when a concave projected curtain is filled as
+    one polygon.
+    """
+    orbit = np.asarray(orbit_xyz_au, dtype=float)
+    if orbit.ndim != 2 or orbit.shape[1] != 3:
+        raise ValueError("orbit_xyz_au must have shape (N, 3)")
+    if len(orbit) < 2:
+        return np.empty((0, 4, 2), dtype=float)
+    base = orbit.copy()
+    base[:, 2] = 0.0
+    orbit_x, orbit_y, _ = project_ecliptic_camera(
+        orbit, azimuth_deg, elevation_deg,
+    )
+    base_x, base_y, _ = project_ecliptic_camera(
+        base, azimuth_deg, elevation_deg,
+    )
+    return np.stack((
+        np.column_stack((orbit_x[:-1], orbit_y[:-1])),
+        np.column_stack((orbit_x[1:], orbit_y[1:])),
+        np.column_stack((base_x[1:], base_y[1:])),
+        np.column_stack((base_x[:-1], base_y[:-1])),
+    ), axis=1)
+
+
+def lunar_orbit_path_epochs(current_jd: float) -> tuple[int, np.ndarray]:
+    """Return a day-keyed, current-epoch lunar path in dynamical JD.
+
+    The path is centred on the UTC-like integer JD bucket instead of starting
+    at the first frame ever drawn.  Consequently an animated Moon always lies
+    on the same ephemeris curve while the cache remains reusable for one day.
+    """
+    cache_day = int(np.floor(float(current_jd)))
+    half_period = LUNAR_SIDEREAL_PERIOD_DAYS / 2.0
+    centre = cache_day + .5
+    return cache_day, np.linspace(
+        centre - half_period, centre + half_period, 481,
+    )
+
+
+def trajectory_display_indices(
+    trajectory_epochs: np.ndarray,
+    capture_ranges: tuple[tuple[float, float], ...] = (),
+    maximum_points: int = 6000,
+) -> np.ndarray:
+    """Thin a long trajectory while retaining dense planet-capture arcs."""
+    epochs = np.asarray(trajectory_epochs, dtype=float)
+    if epochs.ndim != 1:
+        raise ValueError("trajectory_epochs must be one-dimensional")
+    if len(epochs) <= maximum_points:
+        return np.arange(len(epochs), dtype=int)
+    if maximum_points < 2:
+        raise ValueError("maximum_points must be at least two")
+
+    capture_mask = np.zeros(len(epochs), dtype=bool)
+    for start, end in capture_ranges:
+        lower, upper = sorted((float(start), float(end)))
+        capture_mask |= (epochs >= lower) & (epochs <= upper)
+    capture_indices = np.flatnonzero(capture_mask)
+
+    # Reserve enough context to show the heliocentric branches that lead into
+    # and out of a capture.  If the captured intervals alone are enormous,
+    # keep a dense representative subset rather than exhausting the plot.
+    capture_budget = min(len(capture_indices), max(2, maximum_points * 3 // 4))
+    if len(capture_indices) > capture_budget:
+        capture_indices = capture_indices[
+            np.linspace(0, len(capture_indices) - 1, capture_budget, dtype=int)
+        ]
+    background_budget = maximum_points - len(capture_indices)
+    background = np.linspace(
+        0, len(epochs) - 1, max(2, background_budget), dtype=int,
+    )
+    selected = np.unique(np.concatenate((background, capture_indices)))
+    if len(selected) > maximum_points:
+        selected = selected[
+            np.linspace(0, len(selected) - 1, maximum_points, dtype=int)
+        ]
+    return selected
 
 
 def solar_orbit_clip_radius(

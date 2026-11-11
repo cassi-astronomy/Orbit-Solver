@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable
@@ -9,8 +10,11 @@ from scipy.optimize import least_squares
 
 from .astrometry import (
     is_deprecated, is_fit_candidate, mark_duplicate_measurements, normal_place_observations,
-    observation_sigma_arcsec, observation_sigmas, parse_observation_time, seconds_since_j2000,
+    scale_historical_sigmas,
+    observation_sigma_arcsec, observation_sigmas, observation_whiteners, observing_night_key,
+    parse_observation_time, seconds_since_j2000,
 )
+from .astrometric_debias import catalogue_debias_arcsec, debias_available
 from .domain import Observation, OrbitSolution, is_comet_designation
 from .i18n import tr
 from .mpc_orbit import cartesian_to_elements
@@ -19,7 +23,7 @@ from .observatories import (
     station_offsets_gcrs,
 )
 from .orbit_engine import (
-    DEFAULT_PERTURBERS, LONG_ARC_DAYS, MU_SUN, STANDARD_TOLERANCES, NBodyIntegrator,
+    ALL_HISTORICAL_NAMES, DEFAULT_PERTURBERS, LONG_ARC_DAYS, MU_SUN, STANDARD_TOLERANCES, NBodyIntegrator,
     StateVector,
     tolerances_for_span,
 )
@@ -32,14 +36,13 @@ __all__ = [
 ]
 
 C_AU_PER_DAY = 173.1446326846693
-# A1H–A3H are the historical coefficients that replace A1–A3 before SPLIT_JD
-# (orbit_engine.HISTORICAL_NONGRAVITATIONAL); SPLIT_JD itself is fixed metadata.
-NONGRAVITATIONAL_NAMES = ("A1", "A2", "A3", "DT", "A1H", "A2H", "A3H")
-# Optimizer units: A1–A3 (and A1H–A3H) are fitted in units of 1e-8 AU/day²,
-# DT in days.
-_NONGRAV_SCALE = {
-    "A1": 1e-8, "A2": 1e-8, "A3": 1e-8, "DT": 1.0, "A1H": 1e-8, "A2H": 1e-8, "A3H": 1e-8,
-}
+# A1H–A3H (and A1H2–A3H3 for earlier force periods) replace A1–A3 before
+# SPLIT_JD (SPLIT_JD2, …; orbit_engine.historical_period_names); the switch
+# epochs themselves are fixed metadata.
+NONGRAVITATIONAL_NAMES = ("A1", "A2", "A3", "DT", *ALL_HISTORICAL_NAMES)
+# Optimizer units: A1–A3 and the historical sets are fitted in units of
+# 1e-8 AU/day², DT in days.
+_NONGRAV_SCALE = {name: (1.0 if name == "DT" else 1e-8) for name in NONGRAVITATIONAL_NAMES}
 _PLANET_NAMES = (
     "mercury", "venus", "earth", "moon", "mars",
     "jupiter", "saturn", "uranus", "neptune", "pluto",
@@ -48,6 +51,7 @@ _PLANET_NAMES = (
 # Backwards-compatible private names used across the application and tests.
 _observation_sigma_arcsec = observation_sigma_arcsec
 _observation_sigmas = observation_sigmas
+_observation_whiteners = observation_whiteners
 _normal_place_observations = normal_place_observations
 
 
@@ -99,9 +103,41 @@ def _calibrate_fitted_photometry(
             geometry["delta"], geometry["r"],
             solution.photometric_exponent, phase,
         )
+        solution.absolute_magnitude_known = True
     except (ValueError, FloatingPointError, RuntimeError):
         # Photometry must never invalidate an otherwise sound astrometric fit.
         return
+
+
+def _debiased_coordinates(
+    rows: list[tuple[Observation, datetime, float, float]],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Astrometry after optional catalogue zonal/proper-motion correction."""
+    right_ascension: list[float] = []
+    declination: list[float] = []
+    available = debias_available()
+    for observation, instant, ra_deg, dec_deg in rows:
+        observation.raw.pop("catalogue_debias_arcsec", None)
+        correction_ra = correction_dec = 0.0
+        if available:
+            start = datetime(instant.year, 1, 1, tzinfo=instant.tzinfo)
+            end = datetime(instant.year + 1, 1, 1, tzinfo=instant.tzinfo)
+            year = instant.year + (instant - start) / (end - start)
+            correction_ra, correction_dec = catalogue_debias_arcsec(
+                observation, ra_deg, dec_deg, float(year),
+            )
+        cosine = float(np.cos(np.radians(dec_deg)))
+        corrected_ra = ra_deg
+        if abs(cosine) > 1e-8:
+            corrected_ra -= correction_ra / (3600.0 * cosine)
+        corrected_dec = dec_deg - correction_dec / 3600.0
+        if correction_ra or correction_dec:
+            observation.raw["catalogue_debias_arcsec"] = (
+                float(correction_ra), float(correction_dec),
+            )
+        right_ascension.append(corrected_ra)
+        declination.append(corrected_dec)
+    return np.asarray(right_ascension, dtype=float), np.asarray(declination, dtype=float)
 
 
 
@@ -125,14 +161,25 @@ def _dynamics_engine(
     start = float(min(start_jd, end_jd)) - 2.0
     end = float(max(start_jd, end_jd)) + 2.0
     span = end - start
-    ephemeris = (
-        _InterpolatedPlanetEphemeris(PLANETS, start, end)
-        if span <= LONG_ARC_DAYS else
-        SplinePlanetEphemeris(PLANETS, _PLANET_NAMES, start, end)
-    )
+    perturbers = DEFAULT_PERTURBERS
+    from .asteroid_perturbers import ASTEROID_NAMES, optional_asteroid_ephemeris
+    asteroid_source = optional_asteroid_ephemeris()
+    if asteroid_source is not None:
+        ephemeris = SplinePlanetEphemeris(
+            asteroid_source, _PLANET_NAMES + ASTEROID_NAMES, start, end,
+            step_days=0.125 if span <= LONG_ARC_DAYS else 1.0,
+        )
+        perturbers += asteroid_source.perturbers
+    else:
+        ephemeris = (
+            _InterpolatedPlanetEphemeris(PLANETS, start, end)
+            if span <= LONG_ARC_DAYS else
+            SplinePlanetEphemeris(PLANETS, _PLANET_NAMES, start, end)
+        )
     rtol, atol = tolerances_for_span(span)
     return NBodyIntegrator(
-        ephemeris, relative_tolerance=rtol, absolute_tolerance=atol,
+        ephemeris, perturbers=perturbers,
+        relative_tolerance=rtol, absolute_tolerance=atol,
         nongravitational_parameters=nongravitational_parameters,
     )
 
@@ -251,8 +298,13 @@ def _formal_element_uncertainties(
     state_vector: np.ndarray, elements: tuple[float, float, float, float, float, float],
     astrometric_jacobian: np.ndarray, astrometric_residual: np.ndarray,
     free_parameter_count: int, nongrav_names: tuple[str, ...] = (),
+    covariance_out: list | None = None,
 ) -> tuple[dict[str, float] | None, np.ndarray | None]:
-    """Linearised 1-sigma uncertainties; robust-fit covariance is approximate."""
+    """Linearised 1-sigma uncertainties; robust-fit covariance is approximate.
+
+    ``covariance_out`` (a list) receives the full parameter covariance in
+    physical units (state, then A1-A3 in AU/day² and DT in days).
+    """
     try:
         degrees_of_freedom = max(1, astrometric_residual.size - free_parameter_count)
         variance = float(np.dot(astrometric_residual, astrometric_residual) / degrees_of_freedom)
@@ -290,6 +342,12 @@ def _formal_element_uncertainties(
             inverse_column_scale @ normalized_covariance @ inverse_column_scale
         ) * variance
         state_covariance = parameter_covariance[:6, :6]
+        if covariance_out is not None and nongrav_names:
+            # A parameters are scaled by 1e-8 inside the optimiser; DT is days.
+            scales = np.array(
+                [1.0] * 6 + [1.0 if name == "DT" else 1e-8 for name in nongrav_names],
+            )
+            covariance_out.append(parameter_covariance * np.outer(scales, scales))
         element_jacobian = np.empty((6, 6), dtype=float)
         angular_indices = (2, 3, 4, 5)
         for column in range(6):
@@ -925,7 +983,9 @@ def initial_orbit_from_observations(
             semi_major_axis_au=elements[0], eccentricity=elements[1],
             inclination_deg=elements[2], node_deg=elements[3],
             arg_peri_deg=elements[4], mean_anomaly_deg=elements[5],
+            # Median apparent magnitude: a display placeholder, not yet H.
             absolute_magnitude=float(np.median(magnitudes)) if magnitudes else 18.0,
+            absolute_magnitude_known=False,
             photometric_exponent=4.0 if cometary else 2.0,
             phase_correction=not cometary,
             provisional=True,
@@ -1028,9 +1088,20 @@ def _fit_orbit_once(
         usable = [usable[index] for index in indices]
     epochs = dynamical_jd([item[1] for item in usable])
     observer_offsets = _observation_offsets_gcrs(usable)
-    observed_ra = np.array([item[2] for item in usable])
-    observed_dec = np.array([item[3] for item in usable])
-    astrometric_sigmas = _observation_sigmas(usable, account_for_batch_correlation=True)
+    observed_ra, observed_dec = _debiased_coordinates(usable)
+    astrometric_whiteners = _observation_whiteners(
+        usable, account_for_batch_correlation=True,
+    )
+
+    def whiten_astrometry(values: np.ndarray) -> np.ndarray:
+        blocks = np.asarray(values, dtype=float).reshape(-1, 2)
+        return np.einsum("nij,nj->ni", astrometric_whiteners, blocks).ravel()
+
+    def whiten_jacobian(values: np.ndarray) -> np.ndarray:
+        blocks = np.asarray(values, dtype=float).reshape(len(usable), 2, -1)
+        return np.einsum("nij,njk->nik", astrometric_whiteners, blocks).reshape(
+            len(usable) * 2, -1,
+        )
     nongrav_names = tuple(
         name for name in NONGRAVITATIONAL_NAMES if name in (nongravitational or {})
     )
@@ -1149,7 +1220,7 @@ def _fit_orbit_once(
     def residuals_with_engine(vector: np.ndarray, engine: NBodyIntegrator) -> np.ndarray:
         check_cancelled()
         try:
-            astrometry = astrometric_residuals(vector, engine) / astrometric_sigmas
+            astrometry = whiten_astrometry(astrometric_residuals(vector, engine))
         except (RuntimeError, ValueError, FloatingPointError, OverflowError):
             # Numerical least-squares deliberately probes both sides of every
             # parameter. With free A1/A2/A3/DT one such trial can imply a
@@ -1195,8 +1266,8 @@ def _fit_orbit_once(
             jacobian[:, column] = (
                 projected(propagated + displacement) - projected(propagated - displacement)
             ) / (2.0 * step)
-        residual_values = astrometry / astrometric_sigmas
-        jacobian_values = jacobian / astrometric_sigmas[:, None]
+        residual_values = whiten_astrometry(astrometry)
+        jacobian_values = whiten_jacobian(jacobian)
         if constraints:
             penalties = constraint_values(vector)
             penalty_jacobian = np.zeros((len(penalties), vector.size), dtype=float)
@@ -1294,9 +1365,8 @@ def _fit_orbit_once(
             )
         ) from exc
     rms = float(np.sqrt(np.mean(np.square(final_astrometric_residual))))
-    normalized_rms = float(np.sqrt(np.mean(np.square(
-        final_astrometric_residual / astrometric_sigmas
-    ))))
+    final_normalized_residual = whiten_astrometry(final_astrometric_residual)
+    normalized_rms = float(np.sqrt(np.mean(np.square(final_normalized_residual))))
     if not screening and normalized_rms > 100.0 and rms > 3600.0:
         raise OrbitFitError(
             tr(
@@ -1306,6 +1376,7 @@ def _fit_orbit_once(
                 normalized_rms,
             )
         )
+    full_covariance: list = []
     if screening:
         uncertainties, state_covariance = None, None
     else:
@@ -1315,15 +1386,17 @@ def _fit_orbit_once(
             final_jacobian = np.asarray(result.jac, dtype=float)
         uncertainties, state_covariance = _formal_element_uncertainties(
             result_vector, elements, final_jacobian[:final_astrometric_residual.size, :],
-            final_astrometric_residual / astrometric_sigmas,
+            final_normalized_residual,
             max(1, 6 + len(nongrav_names) - len(constraints or {})), nongrav_names,
+            covariance_out=full_covariance,
         )
     solution = OrbitSolution(
         designation=initial.designation,
         epoch_jd=reference_epoch,
         semi_major_axis_au=elements[0], eccentricity=elements[1], inclination_deg=elements[2],
         node_deg=elements[3], arg_peri_deg=elements[4], mean_anomaly_deg=elements[5],
-        absolute_magnitude=initial.absolute_magnitude, slope_g=initial.slope_g,
+        absolute_magnitude=initial.absolute_magnitude,
+        absolute_magnitude_known=initial.absolute_magnitude_known, slope_g=initial.slope_g,
         photometric_exponent=initial.photometric_exponent,
         phase_correction=initial.phase_correction,
         provisional=True,
@@ -1332,6 +1405,14 @@ def _fit_orbit_once(
         state_covariance=(
             tuple(tuple(float(value) for value in row) for row in state_covariance)
             if state_covariance is not None else None
+        ),
+        parameter_covariance=(
+            tuple(tuple(float(value) for value in row) for row in full_covariance[0])
+            if full_covariance and state_covariance is not None else None
+        ),
+        parameter_names=(
+            ("x", "y", "z", "vx", "vy", "vz", *nongrav_names)
+            if full_covariance and state_covariance is not None else None
         ),
         element_uncertainties=uncertainties,
         fit_observation_count=len(usable),
@@ -1348,8 +1429,7 @@ def _fit_orbit_once(
     report_rows = list(reportable)
     report_epochs = dynamical_jd([item[1] for item in report_rows])
     report_offsets = _observation_offsets_gcrs(report_rows)
-    report_ra = np.array([item[2] for item in report_rows])
-    report_dec = np.array([item[3] for item in report_rows])
+    report_ra, report_dec = _debiased_coordinates(report_rows)
     report_state = StateVector(reference_epoch, result_vector[:3], result_vector[3:6])
     report_engine = engine_for(result_vector, full_engine)
     check_cancelled()
@@ -1603,6 +1683,81 @@ def _coherent_secondary_track_candidates(
     return list({id(item): item for item in selected}.values())
 
 
+MISLINKED_TRACKLET_MINIMUM_ROWS = 3
+MISLINKED_TRACKLET_MINIMUM_OFFSET_ARCSEC = 4.0
+MISLINKED_TRACKLET_MINIMUM_NORMALIZED_OFFSET = 6.0
+MAXIMUM_MISLINKED_TRACKLET_FRACTION = 0.15
+
+
+def _tracklet_group_key(observation: Observation) -> tuple[str, str] | None:
+    if not observation.station or not observation.time:
+        return None
+    lowered = {str(key).casefold(): value for key, value in observation.raw.items()}
+    explicit = str(lowered.get("trksub") or lowered.get("trkmpc") or "").strip()
+    try:
+        instant = parse_observation_time(observation.time)
+    except ValueError:
+        return None
+    if explicit:
+        return (observation.station.strip().upper(), f"tracklet:{explicit}")
+    station, night = observing_night_key(observation, instant)
+    return station, f"night:{night}"
+
+
+def _mislinked_tracklet_candidates(observations: list[Observation]) -> list[Observation]:
+    """Return entire internally coherent tracklets rejected by the other data.
+
+    A whole tracklet is removed only while a sizeable independent reference
+    set already fits, and only when the tracklet's O-C vectors form a compact
+    cluster far from that reference.  This prevents a weak preliminary orbit
+    from discarding an otherwise valid observing night merely because the
+    orbit itself is displaced.
+    """
+    groups: dict[tuple[str, str], list[Observation]] = {}
+    weighted: list[Observation] = []
+    for observation in observations:
+        if (
+            not _is_weighted(observation)
+            or observation.residual_ra_arcsec is None
+            or observation.residual_dec_arcsec is None
+        ):
+            continue
+        weighted.append(observation)
+        key = _tracklet_group_key(observation)
+        if key is not None:
+            groups.setdefault(key, []).append(observation)
+    selected: list[Observation] = []
+    for group in groups.values():
+        if len(group) < MISLINKED_TRACKLET_MINIMUM_ROWS:
+            continue
+        member_ids = {id(item) for item in group}
+        reference = [item for item in weighted if id(item) not in member_ids]
+        if len(reference) < 6:
+            continue
+        reference_normalized = np.asarray([
+            _normalized_observation_residual(item) for item in reference
+        ])
+        if float(np.median(reference_normalized)) > 3.0:
+            continue
+        vectors = np.asarray([
+            (float(item.residual_ra_arcsec), float(item.residual_dec_arcsec))
+            for item in group
+        ])
+        centre = np.median(vectors, axis=0)
+        offset = float(np.linalg.norm(centre))
+        normalized_offset = float(np.median([
+            _normalized_observation_residual(item) for item in group
+        ]))
+        scatter = float(np.median(np.linalg.norm(vectors - centre, axis=1)))
+        if (
+            offset >= MISLINKED_TRACKLET_MINIMUM_OFFSET_ARCSEC
+            and normalized_offset >= MISLINKED_TRACKLET_MINIMUM_NORMALIZED_OFFSET
+            and scatter <= max(1.5, 0.2 * offset)
+        ):
+            selected.extend(group)
+    return list({id(item): item for item in selected}.values())
+
+
 def _is_weighted(observation: Observation) -> bool:
     """Enabled row that carries weight (not a duplicate, deprecated or other fragment)."""
     return bool(
@@ -1807,12 +1962,10 @@ def _evaluate_solution_observations(
         ) from exc
     offsets = _observation_offsets_gcrs(parsed)
     computed_ra, computed_dec = _equatorial_direction(emitted, epochs, offsets, earth)
-    observed_ra = np.asarray([item[2] for item in parsed])
-    observed_dec = np.asarray([item[3] for item in parsed])
+    observed_ra, observed_dec = _debiased_coordinates(parsed)
     residual_ra = (observed_ra - computed_ra + 180.0) % 360.0 - 180.0
     residual_ra *= np.cos(np.radians(observed_dec)) * 3600.0
     residual_dec = (observed_dec - computed_dec) * 3600.0
-    normalized: list[float] = []
     physical: list[float] = []
     for item, delta_ra, delta_dec in zip(parsed, residual_ra, residual_dec):
         observation = item[0]
@@ -1821,11 +1974,16 @@ def _evaluate_solution_observations(
         observation.used_in_fit = False
         if not is_fit_candidate(observation):
             continue
-        sigma_ra, sigma_dec = _observation_sigma_arcsec(observation)
         physical.extend((float(delta_ra), float(delta_dec)))
-        normalized.extend((float(delta_ra) / sigma_ra, float(delta_dec) / sigma_dec))
     if not physical:
         return float("nan"), float("nan"), 0
+    candidates = [item for item in parsed if is_fit_candidate(item[0])]
+    candidate_residuals = np.asarray([
+        (float(item[0].residual_ra_arcsec), float(item[0].residual_dec_arcsec))
+        for item in candidates
+    ])
+    whiteners = _observation_whiteners(candidates, account_for_batch_correlation=True)
+    normalized = np.einsum("nij,nj->ni", whiteners, candidate_residuals).ravel()
     return (
         float(np.sqrt(np.mean(np.square(physical)))),
         float(np.sqrt(np.mean(np.square(normalized)))),
@@ -1999,6 +2157,215 @@ def _prefer_parabolic_short_arc(
     return candidate
 
 
+TEMPORARY_CAPTURE_INITIAL_WINDOW_DAYS = 3.0
+TEMPORARY_CAPTURE_MAXIMUM_DISTANCE_AU = 0.02
+TEMPORARY_CAPTURE_RADIATION_PRESSURE_A1 = (0.0, 1e-9, 2e-9, 3e-9, 5e-9)
+
+
+def _earth_relative_energy(solution: OrbitSolution) -> tuple[float, float]:
+    """Return geocentric distance (AU) and two-body energy (AU²/day²)."""
+    if solution.position_au is None or solution.velocity_au_per_day is None:
+        return float("inf"), float("inf")
+    step_days = 0.01
+    earth = earth_heliocentric_ecliptic(np.array([
+        solution.epoch_jd - step_days, solution.epoch_jd, solution.epoch_jd + step_days,
+    ]))
+    relative_position = np.asarray(solution.position_au, dtype=float) - earth[1]
+    earth_velocity = (earth[2] - earth[0]) / (2.0 * step_days)
+    relative_velocity = np.asarray(solution.velocity_au_per_day, dtype=float) - earth_velocity
+    distance = float(np.linalg.norm(relative_position))
+    earth_mu = next(body.mu_au3_day2 for body in _EARTH_MOON_PERTURBERS if body.name == "earth")
+    energy = float(relative_velocity @ relative_velocity / 2.0 - earth_mu / distance)
+    return distance, energy
+
+
+def _temporarily_captured_initial_seed(
+    active_rows: list[tuple[Observation, datetime, float, float]],
+) -> tuple[OrbitSolution, datetime] | None:
+    """Find an early compact window whose angles imply an Earth-bound state.
+
+    A temporary satellite can complete several planetocentric revolutions in
+    one ordinary ``apparition``.  Its initial phase therefore has to be fixed
+    locally before observations months later can participate in a correction.
+    """
+    if len(active_rows) < 6:
+        return None
+    for first in range(len(active_rows)):
+        start = active_rows[first][1]
+        stop = start + timedelta(days=TEMPORARY_CAPTURE_INITIAL_WINDOW_DAYS)
+        window = [
+            item[0] for item in active_rows[first:]
+            if item[1] <= stop
+        ]
+        if len(window) < 6:
+            continue
+        window_times = [
+            item[1] for item in active_rows[first:first + len(window)]
+        ]
+        if (window_times[-1] - window_times[0]).total_seconds() < 0.2 * 86400.0:
+            continue
+        try:
+            seed = initial_orbit_from_observations(window)
+        except (OrbitFitError, ValueError, RuntimeError, FloatingPointError):
+            continue
+        distance, energy = _earth_relative_energy(seed)
+        if distance <= TEMPORARY_CAPTURE_MAXIMUM_DISTANCE_AU and energy < 0.0:
+            return seed, start
+        # The first solvable dense track is an ordinary heliocentric object;
+        # do not search later windows until one happens to mimic a satellite.
+        return None
+    return None
+
+
+def _should_check_temporary_capture(
+    active_rows: list[tuple[Observation, datetime, float, float]],
+    initial: OrbitSolution | None,
+) -> bool:
+    """Whether a supplied catalogue/UI state may describe an Earth capture."""
+    if initial is None:
+        return True
+    from .mpc import unpack_mpc80_designation
+
+    def readable(observation: Observation) -> str:
+        # MPC80 rows carry the packed form (0205PI96R020) while a catalogue
+        # orbit carries the unpacked one (205P); compare like with like.
+        packed = str(observation.raw.get("mpc80") or "")[:12]
+        return unpack_mpc80_designation(packed, include_fragment=False) or observation.designation
+
+    observed_designation = next(
+        (readable(item[0]) for item in active_rows if item[0].designation), "",
+    ).strip().casefold()
+    initial_designation = (initial.designation or "").strip().casefold()
+    if observed_designation and initial_designation and observed_designation != initial_designation:
+        # A pasted MPC block can replace the table while the search field and
+        # currently displayed orbit still belong to the previous object.
+        return True
+    try:
+        distance, _energy = _earth_relative_energy(initial)
+    except (ValueError, RuntimeError, FloatingPointError):
+        return True
+    # A catalogue osculating state inside a few Hill radii deserves the local
+    # bound-branch check even when its current two-body energy is marginal.
+    return distance <= 0.03
+
+
+def _fit_temporarily_captured_arc(
+    active_rows: list[tuple[Observation, datetime, float, float]],
+    seed: OrbitSolution, start: datetime,
+    fit_once, report_progress,
+) -> tuple[tuple[OrbitSolution, float, int], dict[str, float]]:
+    """Fit an Earth-bound arc by extending its time span in phase-safe steps."""
+    end = active_rows[-1][1]
+    total_days = max(TEMPORARY_CAPTURE_INITIAL_WINDOW_DAYS, (
+        end - start
+    ).total_seconds() / 86400.0)
+
+    def rows_through(days: float) -> list[Observation]:
+        stop = start + timedelta(days=float(days))
+        return [item[0] for item in active_rows if start <= item[1] <= stop]
+
+    result: tuple[OrbitSolution, float, int] | None = None
+    current = seed
+    completed_days = 0.0
+    for days in (3.0, 7.0, 14.0, 30.0):
+        target = min(days, total_days)
+        if target <= completed_days or len(rows_through(target)) < 6:
+            continue
+        report_progress(tr("Postupně rozšiřuji geocentrický pozorovací oblouk…"), 20)
+        result = fit_once(
+            rows_through(target), current, maximum_observations=120,
+            max_nfev=60, robust_loss=True, screening=True,
+        )
+        current = result[0]
+        completed_days = target
+        if target >= total_days:
+            return result, {}
+
+    # Direct radiation pressure is unusually important for hollow rocket
+    # stages.  Screen a few physically plausible A1/r² levels while the phase
+    # is still constrained to about one geocentric revolution, then keep the
+    # selected force fixed during the longer phase-unwrapping stages.
+    screen_days = min(60.0, total_days)
+    candidates: list[tuple[float, tuple[OrbitSolution, float, int], dict[str, float]]] = []
+    for a1 in TEMPORARY_CAPTURE_RADIATION_PRESSURE_A1:
+        model = {"A1": float(a1), "R_EXPONENT": 2.0}
+        try:
+            report_progress(tr("Prověřuji tlak slunečního záření geocentrické dráhy…"))
+            trial = fit_once(
+                rows_through(screen_days), current,
+                fixed_nongravitational=model, maximum_observations=120,
+                max_nfev=60, robust_loss=True, screening=True,
+            )
+        except (OrbitFitError, ValueError, RuntimeError, FloatingPointError):
+            continue
+        candidates.append((trial[1], trial, model))
+    if not candidates:
+        raise OrbitFitError(tr(
+            "Postupná korekce dočasně zachycené geocentrické dráhy selhala.",
+        ))
+    _, result, selected_model = min(candidates, key=lambda item: item[0])
+    current = result[0]
+    completed_days = screen_days
+
+    target = completed_days
+    while target < total_days:
+        target = min(total_days, target + 30.0)
+        rows = rows_through(target)
+        if len(rows) < 6:
+            continue
+        report_progress(tr("Postupně rozšiřuji geocentrický pozorovací oblouk…"))
+        result = fit_once(
+            rows, current, fixed_nongravitational=selected_model,
+            maximum_observations=120, max_nfev=60,
+            robust_loss=True, screening=True,
+        )
+        current = result[0]
+
+    # Include any sparse rows preceding the first dense track (J002E3 has two
+    # such pre-discovery positions) only after the continuous phase is fixed.
+    all_rows = [item[0] for item in active_rows]
+    if any(item[1] < start for item in active_rows):
+        report_progress(tr("Připojuji řídká měření před hlavním geocentrickým obloukem…"))
+        result = fit_once(
+            all_rows, current, fixed_nongravitational=selected_model,
+            maximum_observations=120, max_nfev=60,
+            robust_loss=True, screening=True,
+        )
+    return result, selected_model
+
+
+# Arcs longer than this (years) need JPL DE440: the analytic planetary model
+# is adequate within one apparition, but over decades its Jupiter positions
+# shift a comet that passes the planet closely by many arcseconds (206P,
+# 1892-2008: 8″ with DE440, 14 000″ with the analytic model).
+DE440_REQUIRED_ARC_YEARS = 10.0
+
+
+def long_arc_ephemeris_warning(observations: list[Observation]) -> str:
+    """Warning text when a multi-decade arc is fitted without JPL DE440 ('' if fine)."""
+    if PLANETS.jpl is not None:
+        return ""
+    times = []
+    for observation in observations:
+        if not is_fit_candidate(observation):
+            continue
+        try:
+            times.append(parse_observation_time(observation.time))
+        except (TypeError, ValueError):
+            continue
+    if len(times) < 2:
+        return ""
+    years = (max(times) - min(times)).total_seconds() / (365.25 * 86400.0)
+    if years <= DE440_REQUIRED_ARC_YEARS:
+        return ""
+    return tr(
+        "POZOR: oblouk {0:.0f} let se počítá bez JPL DE440, jen s přibližným "
+        "analytickým modelem planet. Po těsných průletech kolem Jupiteru může být "
+        "napojení vzdálených návratů zcela chybné; stáhněte DE440 a výpočet zopakujte.",
+        years,
+    )
+
+
 def fit_orbit(
     observations: list[Observation], initial: OrbitSolution | None,
     constraints: dict[str, float] | None = None,
@@ -2008,6 +2375,8 @@ def fit_orbit(
     cancel_callback: CancelCallback | None = None,
     historical_nongravitational: bool = False,
     accept_model_tension: bool = False,
+    historical_split_jd: float | list[float] | tuple[float, ...] | None = None,
+    historical_sigma: tuple[float, float] | None = None,
 ) -> tuple[OrbitSolution, float, int]:
     """Fit an orbit to astrometry.
 
@@ -2024,12 +2393,22 @@ def fit_orbit(
     may carry fixed force-law metadata such as ``R_EXPONENT``.
 
     Linkage options (several apparitions only): ``historical_nongravitational``
-    fits separate A1H/A2H/A3H before the longest observing gap;
+    fits separate A1H/A2H/A3H before the longest observing gap, or before
+    ``historical_split_jd`` (TDB) when that lies in a gap between returns;
+    several switch epochs give several force periods (A1H–A3H, A1H2–A3H2, …
+    from the most recent switch backwards, at most
+    ``orbit_engine.MAX_FORCE_PERIODS``);
     ``accept_model_tension`` joins a return up to
     ``linkage.LINKAGE_RELAXED_NORMALIZED_RMS`` and reports it as tension.
+
+    ``historical_sigma`` = (decimal year, factor) multiplies the uncertainty of
+    every measurement older than that year (systematic errors of historical
+    astrometry, :func:`astrometry.scale_historical_sigmas`).
     """
     progress_step = 0
     progress_total = 0
+    automatic_fixed_nongravitational: dict[str, float] | None = None
+    automatic_nongravitational_note = ""
 
     def check_cancelled() -> None:
         if cancel_callback is not None and cancel_callback():
@@ -2048,6 +2427,10 @@ def fit_orbit(
 
     def fit_once(*args, **kwargs):
         kwargs.setdefault("cancel_callback", cancel_callback)
+        if automatic_fixed_nongravitational:
+            kwargs.setdefault(
+                "fixed_nongravitational", automatic_fixed_nongravitational,
+            )
         return _fit_orbit_once(*args, **kwargs)
 
     report_progress(tr("Připravuji astrometrii a počáteční dráhu…"))
@@ -2059,6 +2442,9 @@ def fit_orbit(
         observation.residual_ra_arcsec = None
         observation.residual_dec_arcsec = None
     duplicate_count = mark_duplicate_measurements(observations)
+    scaled_count = scale_historical_sigmas(
+        observations, *(historical_sigma if historical_sigma else (None, None)),
+    )
     active_rows: list[tuple[Observation, datetime, float, float]] = []
     for observation in observations:
         if not is_fit_candidate(observation):
@@ -2080,6 +2466,14 @@ def fit_orbit(
     short_arc = len(active_times) >= 2 and arc_days <= 30.0
     long_arc = arc_days > LONG_ARC_DAYS
     active_count = len(active_times)
+    temporary_capture_seed = (
+        _temporarily_captured_initial_seed(active_rows)
+        if (
+            not constraints and arc_days > 30.0
+            and _should_check_temporary_capture(active_rows, initial)
+        )
+        else None
+    )
     # Range is intrinsically weakly constrained on a discovery arc, and an
     # existing preliminary/MPC seed may itself sit in the wrong basin.  Use
     # several range branches whenever a six-parameter solution is possible.
@@ -2099,7 +2493,17 @@ def fit_orbit(
     apparition_linkage: list[dict[str, object]] = []
     linkage_note = ""
 
-    if multibranch:
+    if temporary_capture_seed is not None:
+        result, automatic_fixed_nongravitational = _fit_temporarily_captured_arc(
+            active_rows, temporary_capture_seed[0], temporary_capture_seed[1],
+            fit_once, report_progress,
+        )
+        report_progress(tr("Zpřesňuji řešení na všech měřeních…"))
+        result = fit_once(
+            observations, result[0], constraints, truncate_years,
+            maximum_observations=None, max_nfev=36, robust_loss=True,
+        )
+    elif multibranch:
         result = _fit_short_arc_branches(
             observations, initial, constraints, truncate_years, nongravitational,
             fit_once, report_progress,
@@ -2114,6 +2518,7 @@ def fit_orbit(
             report_progress=report_progress, cancel_callback=cancel_callback,
             historical_nongravitational=historical_nongravitational,
             accept_model_tension=accept_model_tension,
+            historical_split_jd=historical_split_jd,
         )
     else:
         report_progress(tr("Provádím diferenciální korekci dráhy…"), 3)
@@ -2132,7 +2537,7 @@ def fit_orbit(
                 maximum_observations=None, max_nfev=12 if long_arc else 36,
                 robust_loss=True,
             )
-    if not constraints and not nongravitational:
+    if not constraints and not nongravitational and not automatic_fixed_nongravitational:
         result = _prefer_parabolic_short_arc(
             observations, result, truncate_years, cancel_callback,
         )
@@ -2140,12 +2545,46 @@ def fit_orbit(
     # Remove at most one pass so a weak preliminary orbit cannot cascade into
     # wholesale data rejection.  Linked apparitions handle rejection per stage.
     if not constraints and not long_arc and not apparition_linkage:
+        rejection_nongravitational = (
+            None if automatic_fixed_nongravitational else nongravitational
+        )
         result = _reject_isolated_blunders(
-            observations, result, constraints, truncate_years, nongravitational,
+            observations, result, constraints, truncate_years, rejection_nongravitational,
             short_arc, fit_once, report_progress,
+        )
+        if automatic_fixed_nongravitational:
+            # The ordinary rejection pass is intentionally capped at 120
+            # rows.  A captured satellite is sensitive to the complete phase
+            # distribution, so polish the surviving rows once more with the
+            # selected J2+SRP force model before reporting uncertainties.
+            report_progress(tr("Zpřesňuji geocentrické řešení po kontrole odlehlých měření…"))
+            result = fit_once(
+                observations, result[0], constraints, truncate_years,
+                maximum_observations=None, max_nfev=24, robust_loss=True,
+            )
+    if (
+        not constraints and not nongravitational and not automatic_fixed_nongravitational
+        and not historical_nongravitational and active_count >= 12 and not short_arc
+    ):
+        result, automatic_nongravitational_note = _select_automatic_nongravitational_model(
+            observations, result, arc_days, truncate_years, fit_once, report_progress,
         )
     report_progress(tr("Dokončuji O−C, nejistoty a fotometrii…"))
     notes = [result[0].fit_model_note or "", linkage_note]
+    if automatic_fixed_nongravitational:
+        notes.append(tr(
+            "Dočasně zachycená geocentrická dráha byla určena postupným rozšířením "
+            "oblouku; model zahrnuje zemské J2 a automaticky zvolený tlak záření "
+            "A1={0:.3g} AU/den².",
+            automatic_fixed_nongravitational.get("A1", 0.0),
+        ))
+        if nongravitational:
+            notes.append(tr(
+                "Ručně zvolené A1/A2/A3 bylo při počátečním rozmotání geocentrických "
+                "oběhů nahrazeno automaticky prověřeným tlakem záření.",
+            ))
+    if automatic_nongravitational_note:
+        notes.append(automatic_nongravitational_note)
     if duplicate_count:
         notes.append(
             tr(
@@ -2154,6 +2593,30 @@ def fit_orbit(
                 duplicate_count,
             )
         )
+    if scaled_count:
+        notes.append(tr(
+            "Nejistota {0} měření pořízených před rokem {1:g} byla zvětšena {2:g}× "
+            "(soustavné chyby historické astrometrie).",
+            scaled_count, float(historical_sigma[0]), float(historical_sigma[1]),
+        ))
+    debiased_count = sum(
+        "catalogue_debias_arcsec" in observation.raw for observation in observations
+    )
+    if debiased_count:
+        notes.append(tr(
+            "U {0} měření byla odečtena zonální a vlastní-pohybová oprava hvězdného "
+            "katalogu podle mapy Eggl et al. (2020).",
+            debiased_count,
+        ))
+    from .asteroid_perturbers import massive_asteroids_active
+    if massive_asteroids_active():
+        notes.append(tr(
+            "Silový model zahrnul 16 hmotných planetek s polohami a hmotnostmi "
+            "z JPL SB441 prostřednictvím volitelného ASSIST.",
+        ))
+    warning = long_arc_ephemeris_warning(observations)
+    if warning:
+        notes.append(warning)
     result[0].fit_model_note = " ".join(item for item in notes if item) or None
     _calibrate_fitted_photometry(observations, result[0])
     if apparition_linkage:
@@ -2175,6 +2638,127 @@ def _fitted_nongravitational(
         if name in values
     })
     return values
+
+
+AUTOMATIC_NONGRAVITATIONAL_DELTA_BIC = 10.0
+AUTOMATIC_NONGRAVITATIONAL_MINIMUM_SNR = 3.0
+
+
+def _automatic_nongravitational_candidates(
+    solution: OrbitSolution, arc_days: float,
+) -> list[dict[str, float]]:
+    """Conservative force models worth testing for this object and arc."""
+    if is_comet_designation(solution.designation):
+        if arc_days < 60.0:
+            return []
+        candidates = [{"A1": 0.0}]
+        if arc_days >= 180.0:
+            candidates.append({"A1": 0.0, "A2": 0.0})
+        return candidates
+    # A transverse r^-2 acceleration is the standard asteroidal Yarkovsky
+    # model.  Below two years it is too correlated with the six-state orbit to
+    # be selected automatically, even if a formal optimizer can fit it.
+    if arc_days >= LONG_ARC_DAYS:
+        return [{"A2": 0.0, "R_EXPONENT": 2.0}]
+    return []
+
+
+def _nongravitational_significance(
+    solution: OrbitSolution, names: tuple[str, ...],
+) -> tuple[float, ...] | None:
+    if not solution.parameter_names or solution.parameter_covariance is None:
+        return None
+    covariance = np.asarray(solution.parameter_covariance, dtype=float)
+    values = solution.nongravitational_parameters or {}
+    significance: list[float] = []
+    for name in names:
+        try:
+            index = solution.parameter_names.index(name)
+            variance = float(covariance[index, index])
+            value = float(values[name])
+        except (ValueError, KeyError, IndexError, TypeError):
+            return None
+        if not np.isfinite(variance) or variance <= 0.0 or not np.isfinite(value):
+            return None
+        significance.append(abs(value) / np.sqrt(variance))
+    return tuple(significance)
+
+
+def _select_automatic_nongravitational_model(
+    observations: list[Observation],
+    gravity_result: tuple[OrbitSolution, float, int],
+    arc_days: float,
+    truncate_years: float | None,
+    fit_once,
+    report_progress,
+) -> tuple[tuple[OrbitSolution, float, int], str]:
+    """Accept nongravitation only with strong BIC and covariance evidence."""
+    models = _automatic_nongravitational_candidates(gravity_result[0], arc_days)
+    comparison_result = gravity_result
+    if models:
+        try:
+            comparison_result = fit_once(
+                copy.deepcopy(observations), gravity_result[0], None, truncate_years, None,
+                maximum_observations=None, max_nfev=18, robust_loss=False,
+            )
+        except (OrbitFitError, ValueError, RuntimeError, FloatingPointError):
+            return gravity_result, ""
+    baseline_rms = comparison_result[0].fit_normalized_rms
+    baseline_count = comparison_result[0].fit_observation_count or comparison_result[2]
+    if not models or baseline_rms is None or baseline_count < 12:
+        return gravity_result, ""
+    measurements = 2 * int(baseline_count)
+    baseline_chi2 = float(baseline_rms) ** 2 * measurements
+    best: tuple[float, dict[str, float], tuple[OrbitSolution, float, int], tuple[float, ...]] | None = None
+    for model in models:
+        free_names = tuple(name for name in ("A1", "A2", "A3", "DT") if name in model)
+        try:
+            report_progress(tr("Prověřuji, zda astrometrie vyžaduje negravitační síly…"))
+            trial_observations = copy.deepcopy(observations)
+            trial = fit_once(
+                trial_observations, comparison_result[0], None, truncate_years, model,
+                maximum_observations=None, max_nfev=28, robust_loss=False,
+            )
+        except (OrbitFitError, ValueError, RuntimeError, FloatingPointError):
+            continue
+        trial_rms = trial[0].fit_normalized_rms
+        trial_count = trial[0].fit_observation_count or trial[2]
+        significance = _nongravitational_significance(trial[0], free_names)
+        if trial_rms is None or trial_count != baseline_count or significance is None:
+            continue
+        trial_chi2 = float(trial_rms) ** 2 * measurements
+        delta_bic = baseline_chi2 - trial_chi2 - len(free_names) * np.log(measurements)
+        force_values = trial[0].nongravitational_parameters or {}
+        plausible = all(abs(float(force_values.get(name, 0.0))) <= 5e-7 for name in free_names)
+        if (
+            delta_bic >= AUTOMATIC_NONGRAVITATIONAL_DELTA_BIC
+            and min(significance) >= AUTOMATIC_NONGRAVITATIONAL_MINIMUM_SNR
+            and plausible
+            and (best is None or delta_bic > best[0])
+        ):
+            best = (float(delta_bic), model, trial, significance)
+    if best is None:
+        return gravity_result, ""
+    delta_bic, model, trial, significance = best
+    report_progress(tr("Přepočítávám dráhu s potvrzeným negravitačním modelem…"))
+    accepted = fit_once(
+        observations, trial[0], None, truncate_years,
+        _fitted_nongravitational(model, trial[0]),
+        maximum_observations=None, max_nfev=18, robust_loss=False,
+    )
+    fitted = accepted[0].nongravitational_parameters or {}
+    summary = ", ".join(
+        tr("{0}={1:.3g} AU/den² ({2:.1f}σ)", name, float(fitted.get(name, 0.0)), snr)
+        for name, snr in zip(
+            (name for name in ("A1", "A2", "A3", "DT") if name in model), significance,
+        )
+    )
+    return accepted, tr(
+        "Astrometrie statisticky potvrdila automatický negravitační model: {0}; "
+        "zlepšení ΔBIC={1:.1f}. Model bez negravitačních sil zůstal výchozí, dokud "
+        "nebyla splněna hranice 3σ a ΔBIC>10.",
+        summary, delta_bic,
+    )
 
 
 def _snapshot_report(observations: list[Observation]) -> list[tuple]:
@@ -2245,33 +2829,44 @@ def _fit_short_arc_branches(
 MAXIMUM_DOUBLE_TRACK_FRACTION = 0.25
 
 
+# Double-track separation is repeated after each refit: the first fit can be
+# dragged towards a second track weighted more heavily than the object
+# (205P in 2021, ADES: ZTF's secondary track 0.3″, the comet 1.0″), so a
+# second night only stands out once the first one is removed.
+DOUBLE_TRACK_PASSES = 3
+
+
 def _reject_simultaneous_double_tracks(
     observations, result, constraints, truncate_years, nongravitational,
     short_arc, fit_once, report_progress,
 ) -> tuple[OrbitSolution, float, int]:
-    """Separate an unlabelled second track before rejecting isolated blunders."""
-    secondary = _simultaneous_double_track_candidates(observations)
-    weighted = sum(_is_weighted(item) for item in observations)
-    if (
-        not secondary
-        or len(secondary) > MAXIMUM_DOUBLE_TRACK_FRACTION * weighted
-        or weighted - len(secondary) < 6
-    ):
-        return result
-    for observation in secondary:
-        observation.excluded_from_fit = True
-        observation.raw["automatic_exclusion"] = True
-        observation.raw["coherent_secondary_track"] = True
-        observation.raw["automatic_exclusion_reason"] = tr(
-            "Souvislá vedlejší astrometrická stopa; možný fragment nebo sekundární jádro.",
+    """Separate unlabelled second tracks before rejecting isolated blunders."""
+    total_weighted = sum(_is_weighted(item) for item in observations)
+    separated = 0
+    for _pass in range(DOUBLE_TRACK_PASSES):
+        secondary = _simultaneous_double_track_candidates(observations)
+        if (
+            not secondary
+            or separated + len(secondary) > MAXIMUM_DOUBLE_TRACK_FRACTION * total_weighted
+            or total_weighted - separated - len(secondary) < 6
+        ):
+            break
+        for observation in secondary:
+            observation.excluded_from_fit = True
+            observation.raw["automatic_exclusion"] = True
+            observation.raw["coherent_secondary_track"] = True
+            observation.raw["automatic_exclusion_reason"] = tr(
+                "Souvislá vedlejší astrometrická stopa; možný fragment nebo sekundární jádro.",
+            )
+        separated += len(secondary)
+        report_progress(tr("Přepočítávám dráhu po vyřazení odlehlých měření…"))
+        result = fit_once(
+            observations, result[0], constraints, truncate_years,
+            _fitted_nongravitational(nongravitational, result[0]),
+            maximum_observations=None if nongravitational or short_arc else 120,
+            max_nfev=12,
         )
-    report_progress(tr("Přepočítávám dráhu po vyřazení odlehlých měření…"))
-    return fit_once(
-        observations, result[0], constraints, truncate_years,
-        _fitted_nongravitational(nongravitational, result[0]),
-        maximum_observations=None if nongravitational or short_arc else 120,
-        max_nfev=12,
-    )
+    return result
 
 
 def _reject_isolated_blunders(
@@ -2282,6 +2877,28 @@ def _reject_isolated_blunders(
         observations, result, constraints, truncate_years, nongravitational,
         short_arc, fit_once, report_progress,
     )
+    tracklets = _mislinked_tracklet_candidates(observations)
+    active_before_tracklets = sum(_is_weighted(item) for item in observations)
+    if (
+        tracklets
+        and len(tracklets) <= MAXIMUM_MISLINKED_TRACKLET_FRACTION * active_before_tracklets
+        and active_before_tracklets - len(tracklets) >= 6
+    ):
+        for observation in tracklets:
+            observation.excluded_from_fit = True
+            observation.raw["automatic_exclusion"] = True
+            observation.raw["mislinked_tracklet"] = True
+            observation.raw["automatic_exclusion_reason"] = tr(
+                "Celý vnitřně souvislý tracklet je neslučitelný s ostatní astrometrií; "
+                "byl vyřazen jako pravděpodobné chybné přiřazení.",
+            )
+        report_progress(tr("Přepočítávám dráhu po vyřazení chybně přiřazeného trackletu…"))
+        result = fit_once(
+            observations, result[0], constraints, truncate_years,
+            _fitted_nongravitational(nongravitational, result[0]),
+            maximum_observations=None if nongravitational or short_arc else 120,
+            max_nfev=12,
+        )
     candidates = [
         item for item in observations
         if _is_weighted(item) and _is_automatic_rejection_candidate(item, result[1])
@@ -2315,6 +2932,64 @@ def _reject_isolated_blunders(
         maximum_observations=None if nongravitational or short_arc else 120,
         max_nfev=12,
     )
+    result = _reclassify_secondary_tracks(
+        observations, result, constraints, truncate_years, nongravitational,
+        short_arc, fit_once, report_progress,
+    )
     if not nongravitational and not constraints:
         result = _prefer_parabolic_short_arc(observations, result, truncate_years)
     return result
+
+
+def _reclassify_secondary_tracks(
+    observations, result, constraints, truncate_years, nongravitational,
+    short_arc, fit_once, report_progress,
+) -> tuple[OrbitSolution, float, int]:
+    """Look for second tracks again once isolated blunders are gone.
+
+    Rows of a heavily weighted second track can drag the orbit until the
+    blunder pass has removed some of them; only then the whole night stands
+    out as a track.  Its rows (including the ones just rejected as isolated)
+    are relabelled as a secondary track and the orbit is refitted when a row
+    that still carried weight was among them.
+    """
+    isolated = [
+        item for item in observations
+        if item.excluded_from_fit and item.raw.get("automatic_exclusion")
+        and not item.raw.get("coherent_secondary_track")
+    ]
+    isolated_ids = {id(item) for item in isolated}
+    for observation in isolated:
+        observation.excluded_from_fit = False
+    found = {id(item) for item in _simultaneous_double_track_candidates(observations)}
+    # The same budget as the first pass: a "track" larger than a quarter of
+    # the astrometry is the object itself, not a fragment.
+    already = sum(bool(item.raw.get("coherent_secondary_track")) for item in observations)
+    weighted = sum(_is_weighted(item) for item in observations)
+    if (
+        already + len(found) > MAXIMUM_DOUBLE_TRACK_FRACTION * (weighted + already)
+        or weighted - len(found) < 6
+    ):
+        found = set()
+    weighted_found = False
+    for observation in observations:
+        if id(observation) in found:
+            weighted_found |= id(observation) not in isolated_ids
+            observation.excluded_from_fit = True
+            observation.raw["automatic_exclusion"] = True
+            observation.raw["coherent_secondary_track"] = True
+            observation.raw["automatic_exclusion_reason"] = tr(
+                "Souvislá vedlejší astrometrická stopa; možný fragment nebo sekundární jádro.",
+            )
+    for observation in isolated:
+        if id(observation) not in found:
+            observation.excluded_from_fit = True
+    if not weighted_found:
+        return result
+    report_progress(tr("Přepočítávám dráhu po vyřazení odlehlých měření…"))
+    return fit_once(
+        observations, result[0], constraints, truncate_years,
+        _fitted_nongravitational(nongravitational, result[0]),
+        maximum_observations=None if nongravitational or short_arc else 120,
+        max_nfev=12,
+    )

@@ -39,6 +39,79 @@ def _sexagesimal(field: str, signed: bool) -> tuple[float, float]:
     return (-value if negative else value), quantum
 
 
+_PACKED_CENTURY = {"I": 18, "J": 19, "K": 20, "L": 21}
+
+
+def _base62_digit(character: str) -> int:
+    if character.isdigit():
+        return int(character)
+    if "A" <= character <= "Z":
+        return ord(character) - ord("A") + 10
+    if "a" <= character <= "z":
+        return ord(character) - ord("a") + 36
+    raise ValueError(character)
+
+
+def _unpack_provisional(packed: str) -> str:
+    """``K08R06B`` → ``2008 RB6``; ``J95X00A`` → ``1995 XA``; ``""`` if not packed."""
+    if len(packed) != 7 or packed[0] not in _PACKED_CENTURY or not packed[1:3].isdigit():
+        return ""
+    year = 100 * _PACKED_CENTURY[packed[0]] + int(packed[1:3])
+    try:
+        cycle = 10 * _base62_digit(packed[4]) + int(packed[5])
+    except ValueError:
+        return ""
+    half_month, last = packed[3], packed[6]
+    if not half_month.isalpha() or not half_month.isupper():
+        return ""
+    if last.isupper():
+        # Minor planet: half-month letter, second letter, cycle count.
+        return f"{year} {half_month}{last}{cycle or ''}"
+    # Comet: '0' or a lowercase fragment letter follows the number.
+    fragment = f"-{last.upper()}" if last.islower() else ""
+    return f"{year} {half_month}{cycle}{fragment}"
+
+
+def unpack_mpc80_designation(field: str, include_fragment: bool = True) -> str:
+    """Readable designation of MPC80 columns 1-12, or ``""`` when unrecognized.
+
+    ``0205P      a`` → ``205P-A``, ``0205PI96R020`` → ``205P``,
+    ``    PK08R060`` → ``P/2008 R6``, ``00433`` → ``433``,
+    ``A0345`` → ``100345``, ``     K24B01X`` → ``2024 BX1``.  The number in
+    columns 1-5 takes precedence over a provisional designation.
+    """
+    field = (field or "")[:12].ljust(12)
+    number, provisional = field[:5], field[5:12]
+    fragment = ""
+    if include_fragment and not provisional[:5].strip():
+        letters = provisional[5:7].strip()
+        if letters.isalpha() and letters.islower():
+            fragment = f"-{letters.upper()}"
+    if number[:4].isdigit() and number[4] in "PDI":
+        return f"{int(number[:4])}{number[4]}{fragment}"
+    comet_type = number[4]
+    if not number[:4].strip() and comet_type in "PCDXAI":
+        unpacked = _unpack_provisional(provisional)
+        if unpacked and not include_fragment:
+            unpacked = unpacked.split("-", 1)[0]
+        return f"{comet_type}/{unpacked}" if unpacked else ""
+    if number.strip():
+        try:
+            if number.isdigit():
+                return str(int(number))
+            if number[0] == "~":
+                value = 0
+                for character in number[1:]:
+                    value = 62 * value + _base62_digit(character)
+                return str(620_000 + value)
+            if number[1:].isdigit():
+                return str(_base62_digit(number[0]) * 10_000 + int(number[1:]))
+        except ValueError:
+            return ""
+        return ""
+    return _unpack_provisional(provisional)
+
+
 def parse_mpc80(text: str, fallback_designation: str = "") -> list[Observation]:
     """Parse optical astrometry in the MPC 80-column observation format.
 

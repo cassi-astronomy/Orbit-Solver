@@ -18,6 +18,12 @@ from orbit_app.planet_relations import (  # noqa: E402
 from orbit_app.planetary import PLANETS  # noqa: E402
 
 J2000 = 2451545.0
+
+try:
+    from qt_support import dispose, qt_application  # noqa: E402
+except ImportError:  # run as tests.<module> from the repository root
+    from tests.qt_support import dispose, qt_application  # noqa: E402
+
 DATA = Path(__file__).with_name("data")
 
 
@@ -156,6 +162,43 @@ class ImpactReportingTests(unittest.TestCase):
         )
         self.assertIsNone(impact.imminent_impact(harmless, days=30.0))
 
+    def test_close_nonimpacting_flyby_checks_covariance_clones(self):
+        epoch = J2000
+        earth = PLANETS.position("earth", epoch)
+        earth_velocity = (
+            PLANETS.position("earth", epoch + 1e-3) - earth
+        ) / 1e-3
+        offset = np.array([50_000.0, 0.0, 0.0]) / impact.AU_KM
+        velocity = earth_velocity + np.array([
+            0.0, 12.0 * 86400.0 / impact.AU_KM, 0.0,
+        ])
+        sigma = 50_000.0 / impact.AU_KM
+        covariance = np.diag([
+            sigma * sigma, 1e-18, 1e-18, 1e-18, 1e-18, 1e-18,
+        ])
+        solution = OrbitSolution(
+            "VIRTUAL IMPACTOR", epoch, 1.0, .1, 1.0, 0.0, 0.0, 0.0,
+            position_au=tuple(earth + offset), velocity_au_per_day=tuple(velocity),
+            state_covariance=tuple(tuple(row) for row in covariance),
+        )
+        self.assertIsNone(impact.imminent_impact(solution, days=.2))
+        risk = impact.close_approach_impact_risk(
+            solution, days=.2,
+            minimum_clones=100, maximum_clones=200,
+        )
+        repeated = impact.close_approach_impact_risk(
+            solution, days=.2,
+            minimum_clones=100, maximum_clones=200,
+        )
+        self.assertIsNotNone(risk)
+        self.assertEqual(risk, repeated)
+        self.assertEqual(risk.body, "earth")
+        self.assertGreater(risk.impacting, 0)
+        self.assertLess(risk.impacting, risk.clones)
+        low, high = risk.confidence_interval_95
+        self.assertLess(low, risk.probability)
+        self.assertGreater(high, risk.probability)
+
     def test_preview_positions_end_at_the_impact(self):
         from orbit_app.preview_orbit import heliocentric_xyz
 
@@ -183,11 +226,9 @@ class ImpactReportingTests(unittest.TestCase):
     def test_elements_tab_announces_the_impact(self):
         from dataclasses import replace
 
-        from PySide6.QtWidgets import QApplication
-
         from orbit_app.main_window import ElementsPanel
 
-        _application = QApplication.instance() or QApplication([])
+        _application = qt_application()
         solution = _earth_bound_solution()
         solution = replace(solution, impact=impact.imminent_impact(solution, days=2.0))
         panel = ElementsPanel(solution)
@@ -195,8 +236,18 @@ class ImpactReportingTests(unittest.TestCase):
         self.assertFalse(panel.impact_banner.isHidden())
         self.assertIn("DOPADU", panel.impact_banner.text())
         self.assertIn("PŘEDPOVĚĎ DOPADU", panel.text.toPlainText())
+        risk = impact.ImpactRisk(
+            body="earth", closest_epoch_jd=J2000 + 1.0,
+            nominal_distance_au=.001, position_sigma_au=.0005,
+            clones=400, impacting=2,
+            impact_epochs_jd=(J2000 + 1.01, J2000 + 1.02),
+        )
+        panel.set_solution(replace(solution, impact=None, impact_risk=risk))
+        self.assertIn("NENULOVÉ RIZIKO DOPADU", panel.impact_banner.text())
+        self.assertIn("NENULOVÉ RIZIKO DOPADU", panel.text.toPlainText())
         panel.set_solution(replace(solution, impact=None))
         self.assertTrue(panel.impact_banner.isHidden())
+        dispose(panel)
 
 
 class NearEarthShortArcTests(unittest.TestCase):
@@ -252,12 +303,10 @@ class BoundCentreTests(unittest.TestCase):
 
 class EvolutionViewTests(unittest.TestCase):
     def test_planetocentric_view_is_offered_only_for_captures(self):
-        from PySide6.QtWidgets import QApplication
-
         from orbit_app.main_window import OrbitEvolutionPanel
         from orbit_app.orbit_evolution import CaptureInterval, EvolutionResult
 
-        _application = QApplication.instance() or QApplication([])
+        _application = qt_application()
         solution = OrbitSolution(
             "X", J2000, 5.2, .05, 1.0, 0.0, 0.0, 0.0,
             position_au=(5.2, 0.0, 0.0), velocity_au_per_day=(0.0, .0075, 0.0),
@@ -277,6 +326,7 @@ class EvolutionViewTests(unittest.TestCase):
         panel._relation_series = lambda planet: None  # no background thread in a unit test
         panel.element_center.setCurrentIndex(panel.element_center.findData("relation:earth"))
         self.assertEqual(panel.graph_metric.itemData(0), "distance")
+        dispose(panel)
 
 
 if __name__ == "__main__":

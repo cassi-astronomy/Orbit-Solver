@@ -401,6 +401,7 @@ def demo_solution() -> OrbitSolution:
         arg_peri_deg=145.0,
         mean_anomaly_deg=35.0,
         absolute_magnitude=18.0,
+        absolute_magnitude_known=False,
         provisional=True,
     )
 

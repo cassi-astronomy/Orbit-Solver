@@ -43,8 +43,8 @@ CATALOG: dict[str, str] = {
         "# STATE {0} — {1} UTC; q={2:.9f} AU; e={3:.10f}; a={4:.9f} AU; 1/a={5:+.10e} AU^-1; i={6:.7f}; Omega={7:.7f}; omega={8:.7f}",
     "# ZACHYCENÍ {0}: {1} až {2} UTC; minimum={3:.6f} AU ({4:.3f} Hillova poloměru)":
         "# CAPTURE {0}: {1} to {2} UTC; minimum={3:.6f} AU ({4:.3f} Hill radii)",
-    "# Řádky začínající # jsou komentáře a planetární setkání.":
-        "# Lines starting with # are comments and planetary encounters.",
+    "# Řádky začínající # jsou komentáře a setkání s planetami či Měsícem.":
+        "# Lines starting with # are comments and planetary or lunar encounters.",
     "+X  ♈ jarní bod":
         "+X  ♈ vernal equinox",
     "+Z  sever ekliptiky":
@@ -617,8 +617,8 @@ CATALOG: dict[str, str] = {
         "Performing the differential correction of the orbit…",
     "Prověřuji kandidátní větev krátkého oblouku…":
         "Checking a candidate branch of the short arc…",
-    "První hodnota je nevážené RMS v obloukových sekundách; druhá zohledňuje nejistoty rmsRA/rmsDec uvedené v ADES a částečnou korelaci série ze stejné stanice během jedné noci.":
-        "The first value is the unweighted RMS in arcseconds; the second takes into account the rmsRA/rmsDec uncertainties given in ADES and the partial correlation of a series from the same station during one night.",
+    "První hodnota je nevážené RMS v obloukových sekundách; druhá zohledňuje úplnou kovarianci ADES (rmsRA/rmsDec/rmsCorr), časovou nejistotu podél pohybu a částečnou korelaci série ze stejné stanice během jedné noci.":
+        "The first value is the unweighted RMS in arcseconds; the second includes the full ADES covariance (rmsRA/rmsDec/rmsCorr), along-track timing uncertainty, and the partial correlation of a series from the same station during one night.",
     "PŘEDBĚŽNÉ ŘEŠENÍ — DRÁHA NENÍ JEDNOZNAČNĚ URČENA\n\nMetoda: {0}\nEpocha: JD {1:.6f}\na = {2:.8g} AU\ne = {3:.8f}\nq = {4:.8f} AU\ni = {5:.6f}°\nΩ = {6:.6f}°\nω = {7:.6f}°\nM = {8:.6f}°\n\nVolba „Použít a zpřesnit“ spustí běžnou diferenciální korekci ze všech vybraných měření. Efemerida bude přednastavena po 10 minutách na 48 hodin.":
         "PRELIMINARY SOLUTION — THE ORBIT IS NOT UNIQUELY DETERMINED\n\nMethod: {0}\nEpoch: JD {1:.6f}\na = {2:.8g} AU\ne = {3:.8f}\nq = {4:.8f} AU\ni = {5:.6f}°\nΩ = {6:.6f}°\nω = {7:.6f}°\nM = {8:.6f}°\n\n“Use and refine” starts the regular differential correction from all selected measurements. The ephemeris will be preset to 10-minute steps over 48 hours.",
     "Předběžná dráha":
@@ -761,6 +761,8 @@ CATALOG: dict[str, str] = {
         "Centred azimuthal",
     "Středový azimutální pohled":
         "Centred azimuthal view",
+    "těleso":
+        "object",
     "Světelná křivka":
         "Light curve",
     "Systematické hledání vzdálenosti (doporučeno)":
@@ -833,8 +835,8 @@ CATALOG: dict[str, str] = {
         "Forward ▶",
     "Vracím do fitu měření, která na výslednou dráhu sedí…":
         "Returning measurements that fit the final orbit back into the fit…",
-    "Vstup a výstup jsou oskulační stavy na hranicích zvoleného intervalu. Svislé značky v grafu ukazují planetární setkání. Dvojklikem zobrazíte stav ve Sluneční soustavě.":
-        "Inbound and outbound are osculating states at the limits of the chosen interval. Vertical marks in the plot show planetary encounters. Double-click to show the state in the Solar System.",
+    "Vstup a výstup jsou oskulační stavy na hranicích zvoleného intervalu. Svislé značky v grafu ukazují setkání s planetami či Měsícem. Dvojklikem zobrazíte stav ve Sluneční soustavě.":
+        "Inbound and outbound are osculating states at the limits of the chosen interval. Vertical marks in the plot show planetary or lunar encounters. Double-click to show the state in the Solar System.",
     "Vybere a vyřadí všechna dosud zařazená pozorování, u nichž |O−C RA| nebo |O−C Dec| přesahuje 2 obloukové sekundy. Poté je potřeba dráhu přepočítat.":
         "Selects and excludes all currently included observations whose |O−C RA| or |O−C Dec| exceeds 2 arcseconds. The orbit then needs to be recomputed.",
     "Vyberte objekt":
@@ -929,6 +931,20 @@ CATALOG: dict[str, str] = {
         "YYYY or YYYY-MM-DD HH:MM",
     "Z astrometrie se nepodařilo sestavit použitelný počáteční odhad dráhy.":
         "No usable initial orbit estimate could be built from the astrometry.",
+    "Postupně rozšiřuji geocentrický pozorovací oblouk…":
+        "Extending the geocentric observing arc step by step…",
+    "Prověřuji tlak slunečního záření geocentrické dráhy…":
+        "Screening solar radiation pressure for the geocentric orbit…",
+    "Postupná korekce dočasně zachycené geocentrické dráhy selhala.":
+        "The staged correction of the temporarily captured geocentric orbit failed.",
+    "Připojuji řídká měření před hlavním geocentrickým obloukem…":
+        "Attaching sparse measurements preceding the main geocentric arc…",
+    "Zpřesňuji geocentrické řešení po kontrole odlehlých měření…":
+        "Refining the geocentric solution after the outlier check…",
+    "Dočasně zachycená geocentrická dráha byla určena postupným rozšířením oblouku; model zahrnuje zemské J2 a automaticky zvolený tlak záření A1={0:.3g} AU/den².":
+        "The temporarily captured geocentric orbit was determined by staged arc extension; the model includes Earth's J2 and automatically selected radiation pressure A1={0:.3g} AU/day².",
+    "Ručně zvolené A1/A2/A3 bylo při počátečním rozmotání geocentrických oběhů nahrazeno automaticky prověřeným tlakem záření.":
+        "Manually selected A1/A2/A3 was replaced by automatically screened radiation pressure while initially unwrapping the geocentric revolutions.",
     "Z ekliptiky":
         "From the ecliptic",
     "Z úhlů krátkého oblouku nelze sestavit předběžnou dráhu.":
@@ -1247,8 +1263,8 @@ CATALOG: dict[str, str] = {
         "Line {0} is not a valid optical MPC 80-col observation.",
     "Řádků: ":
         "Rows: ",
-    "Žádné perihelové průchody ani planetární setkání nebyly nalezeny.":
-        "No perihelion passages or planetary encounters were found.",
+    "Žádné perihelové průchody ani setkání s planetou či Měsícem nebyly nalezeny.":
+        "No perihelion passages or planetary or lunar encounters were found.",
     "Žádné zařazené pozorování nemá reziduum větší než 2″.":
         "No included observation has a residual larger than 2″.",
     "Žádný objekt":
@@ -1303,6 +1319,14 @@ CATALOG: dict[str, str] = {
         "Atmospheric entry ({0:.0f} km)",
     "Nejistota místa dopadu 1σ: {0:.2f} × {1:.2f} km (delší osa azimut {2:.0f}°); času {3:.2f} s.":
         "1σ impact-point uncertainty: {0:.2f} × {1:.2f} km (major axis azimuth {2:.0f}°); time {3:.2f} s.",
+    "Nenulové riziko dopadu na těleso {0}":
+        "Non-zero risk of impact on {0}",
+    "Nominální průlet: {0}; vzdálenost {1:.0f} km; největší formální polohová nejistota 1σ {2:.0f} km.":
+        "Nominal flyby: {0}; distance {1:.0f} km; largest formal 1σ position uncertainty {2:.0f} km.",
+    "Monte Carlo blízkého průletu: {0} z {1} klonů dopadá ({2:.3%}, 95% interval {3:.3%}–{4:.3%}, přibližně 1:{5:.0f}); střed času dopadů {6}.":
+        "Close-flyby Monte Carlo: {0} of {1} clones impact ({2:.3%}, 95% interval {3:.3%}–{4:.3%}, approximately 1:{5:.0f}); mean impact time {6}.",
+    "Jde o orientační screening z formální kovariance fitu, nikoli o autoritativní hodnocení rizika.":
+        "This is indicative screening from the formal fit covariance, not an authoritative risk assessment.",
     "excentricity":
         "eccentricity",
     "vzdálenost od planety [AU]":
@@ -1399,8 +1423,8 @@ CATALOG: dict[str, str] = {
         "descending node ☋",
     "Trajektorie narazila do tělesa {0}.":
         "The trajectory hit {0}.",
-    "Typ\tDatum UTC\tFáze / návrat / planeta\tq [AU]\te\ta [AU]\tP [roky]\t1/a [AU^-1]\ti [deg]\tOmega [deg]\tomega [deg]\tVzdálenost [AU]\tHillovy poloměry\tv rel. [km/s]\tDelta(1/a) [AU^-1]\tv_inf [km/s]\tDelta T\tDelta MOID [AU]":
-        "Type\tDate UTC\tPhase / return / planet\tq [AU]\te\ta [AU]\tP [years]\t1/a [AU^-1]\ti [deg]\tOmega [deg]\tomega [deg]\tDistance [AU]\tHill radii\tv rel. [km/s]\tDelta(1/a) [AU^-1]\tv_inf [km/s]\tDelta T\tDelta MOID [AU]",
+    "Typ\tDatum UTC\tFáze / návrat / těleso\tq [AU]\te\ta [AU]\tP [roky]\t1/a [AU^-1]\ti [deg]\tOmega [deg]\tomega [deg]\tVzdálenost [AU]\tHillovy poloměry\tv rel. [km/s]\tDelta(1/a) [AU^-1]\tv_inf [km/s]\tDelta T\tDelta MOID [AU]":
+        "Type\tDate UTC\tPhase / return / body\tq [AU]\te\ta [AU]\tP [years]\t1/a [AU^-1]\ti [deg]\tOmega [deg]\tomega [deg]\tDistance [AU]\tHill radii\tv rel. [km/s]\tDelta(1/a) [AU^-1]\tv_inf [km/s]\tDelta T\tDelta MOID [AU]",
     "Těleso v tomto intervalu dopadlo ({0}); efemerida obsahuje jen okamžiky před dopadem.":
         "The body impacted within this interval ({0}); the ephemeris contains only instants before the impact.",
     "srážka s planetou":
@@ -1409,16 +1433,28 @@ CATALOG: dict[str, str] = {
         "⚠ IMPACT PREDICTION: {0}",
     "PŘEDPOVĚĎ DOPADU: {0}":
         "IMPACT PREDICTION: {0}",
+    "NENULOVÉ RIZIKO DOPADU: {0}":
+        "NON-ZERO IMPACT RISK: {0}",
+    "⚠ NENULOVÉ RIZIKO DOPADU: {0}":
+        "⚠ NON-ZERO IMPACT RISK: {0}",
     "Kontroluji, zda dráha nevede ke srážce s planetou…":
         "Checking whether the orbit leads to a collision with a planet…",
     "POZOR: vypočtená dráha vede k dopadu na těleso {0}.":
         "WARNING: the computed orbit leads to an impact on {0}.",
+    "POZOR: klony nejistoty ukazují nenulové riziko dopadu na {0}.":
+        "WARNING: uncertainty clones show a non-zero risk of impact on {0}.",
     "Předpověď dopadu":
         "Impact prediction",
+    "Riziko dopadu":
+        "Impact risk",
     "Vypočtená dráha vede k dopadu na těleso {0}.":
         "The computed orbit leads to an impact on {0}.",
+    "Nenulové riziko dopadu na těleso {0}.":
+        "There is a non-zero risk of impact on {0}.",
     "\n\nKontroluje se {0:.0f} dní od epochy dráhy. Místo na povrchu je průsečík vakuové dráhy s elipsoidem WGS84; brzdění a rozpad v atmosféře nejsou modelovány. Podrobnosti jsou v záložce Elementy.":
         "\n\n{0:.0f} days after the orbit epoch are checked. The surface point is where the vacuum trajectory meets the WGS84 ellipsoid; atmospheric deceleration and fragmentation are not modelled. Details are in the Elements tab.",
+    "\n\nKontroluje se {0:.0f} dní od epochy dráhy. Výsledek je orientační a vyžaduje ověření autoritativním systémem.":
+        "\n\n{0:.0f} days after the orbit epoch are checked. The result is indicative and requires verification by an authoritative system.",
     "Těleso v tomto okamžiku neexistuje: dopadlo na těleso {0} ({1}).\nZvolte čas před dopadem.":
         "The body does not exist at this moment: it hit {0} ({1}).\nChoose a time before the impact.",
     "Těleso v tomto okamžiku neexistuje: jeho dráha předtím narazila do planety.\nZvolte dřívější čas.":
@@ -1449,8 +1485,8 @@ CATALOG: dict[str, str] = {
         "Linking of returns",
     "Zvlášť negravitační parametry pro historické návraty (A1H, A2H, A3H)":
         "Separate non-gravitational parameters for historical returns (A1H, A2H, A3H)",
-    "Před nejdelší mezerou v pozorováních platí vlastní sada A1H–A3H, po ní A1–A3. Hodí se pro komety, jejichž aktivita se mezi historickým a moderním návratem změnila (205P: ztracena 1896–2008). Historická sada se fituje až s připojením historického návratu.":
-        "Before the longest gap in the observations a separate set A1H–A3H applies, A1–A3 after it. Useful for comets whose activity changed between a historical and a modern return (205P: lost 1896–2008). The historical set is fitted once a historical return is joined.",
+    "Před okamžikem přepnutí (výchozí: střed nejdelší mezery v pozorováních) platí vlastní sada A1H–A3H, po něm A1–A3. Hodí se pro komety, jejichž aktivita se mezi historickým a moderním návratem změnila (205P: ztracena 1896–2008). Historická sada se fituje až s připojením historického návratu.":
+        "Before the switch epoch (default: the middle of the longest gap in the observations) a separate set A1H–A3H applies, A1–A3 after it. Useful for comets whose activity changed between a historical and a modern return (205P: lost 1896–2008). The historical set is fitted once a historical return is joined.",
     "Připojit návrat i nad limitem kvality (napětí modelu, do {0:g}σ)":
         "Join a return even above the quality limit (model tension, up to {0:g}σ)",
     "Běžně se návrat připojí, jen když sedí na vlastní astrometrii do 3σ. S touto volbou se přijme i horší shoda, pokud ostatní návraty zůstanou v pořádku – například u vizuální nebo fotografické historické astrometrie. Takový návrat je ve výsledku vždy označen jako napětí modelu.":
@@ -1461,4 +1497,219 @@ CATALOG: dict[str, str] = {
         "linking with model tension",
     "Okamžik přepnutí negravitačního modelu není konečný.":
         "The switch epoch of the non-gravitational model is not finite.",
+    "Služba MPC pro stahování pozorování fragmenty rozpadlých komet nevrací. Stáhněte z webu MPC textový výpis pozorování celé komety (např. {0}) a načtěte ho tlačítkem „Načíst pozorování z TXT…“; fragment pak zvolíte v nabídce Fragment komety.":
+        "The MPC observation service does not return fragments of split comets. Download the text listing of the whole comet's observations from the MPC website (e.g. {0}) and load it with “Load observations from TXT…”; then choose the fragment in the Comet fragment menu.",
+    "hlavní jádro":
+        "main nucleus",
+    "hlavní jádro – neoznačená měření ({0})":
+        "main nucleus – unlabelled measurements ({0})",
+    "Albedo musí být kladné.":
+        "The albedo must be positive.",
+    "Odhad průměru z H (albedo není známo):":
+        "Diameter estimate from H (albedo unknown):",
+    "  obvyklý rozsah  {0}  (světlé těleso typu S p_V = {1:.2f} až tmavé typu C p_V = {2:.2f})":
+        "  typical range   {0}  (bright S-type p_V = {1:.2f} to dark C-type p_V = {2:.2f})",
+    "  krajní meze     {0}  (p_V = {1:.2f} až {2:.2f})":
+        "  extreme limits  {0}  (p_V = {1:.2f} to {2:.2f})",
+    "  D = 1329 km / √p_V · 10^(−H/5); nejistota H ±0,3 mag sama mění průměr asi o ±15 %.":
+        "  D = 1329 km / √p_V · 10^(−H/5); an uncertainty of ±0.3 mag in H alone changes the diameter by about ±15 %.",
+    # Split comets: fragment banner, overview and split-epoch estimate.
+    'bez společných snímků':
+        'no common frames',
+    'Kopírovat':
+        'Copy',
+    'Astrometrie obsahuje více složek rozpadlé komety ({0}); fituje se vždy jen vybraná složka.':
+        'The astrometry contains several components of a split comet ({0}); only the selected component is fitted.',
+    '{0}: {1} měření, {2} nocí, {3} → {4}':
+        '{0}: {1} observations, {2} nights, {3} → {4}',
+    'Fit našel souvislou vedlejší stopu bez označení fragmentu: {0} měření ({1}), {2} → {3}. Může jít o nový úlomek.':
+        'The fit found a coherent secondary track without a fragment label: {0} observations ({1}), {2} → {3}. It may be a new fragment.',
+    'Přehled fragmentů…':
+        'Fragment overview…',
+    'Odhadnout čas rozpadu…':
+        'Estimate split time…',
+    'Pro každou vedlejší složku s vlastní drahou najde okamžik, kdy se oddělila od hlavní složky (rychlost oddělení a/nebo rozdílné zrychlení). Výpočet trvá zhruba minutu na složku.':
+        'For every secondary component with its own orbit, finds the moment it separated from the principal component (separation velocity and/or differential acceleration). Takes about a minute per component.',
+    'Vyčlenit stopu jako úlomek':
+        'Split off track as fragment',
+    'Měření vedlejší stopy se stanou samostatnou složkou (X1, X2…), kterou lze vybrat a fitovat; z dráhy hlavního jádra zůstanou vyřazena.':
+        'The measurements of the secondary track become a separate component (X1, X2…) that can be selected and fitted; they stay excluded from the main nucleus orbit.',
+    'Přehled fragmentů':
+        'Fragment overview',
+    'Složka':
+        'Component',
+    'Měření':
+        'Observations',
+    'Označeno MPC':
+        'MPC-labelled',
+    'Nocí':
+        'Nights',
+    'Návratů':
+        'Returns',
+    'První':
+        'First',
+    'Poslední':
+        'Last',
+    'Odstup od hlavní':
+        'Offset from principal',
+    'Vlastní dráha':
+        'Own orbit',
+    'Odstup je medián úhlové vzdálenosti od hlavní složky na snímcích téže stanice (do 2 minut). Neoznačená měření patří hlavní složce, pokud je fit nepřiřadil vedlejší.':
+        'The offset is the median angular distance from the principal component on frames of the same station (within 2 minutes). Unlabelled observations belong to the principal component unless the fit assigned them to a secondary one.',
+    ' (hlavní složka)':
+        ' (principal component)',
+    '✓ = složka s vlastní drahou. Další složky spočítáte výběrem fragmentu vlevo; fit vedlejší složky startuje z dráhy hlavní.':
+        '✓ = component with its own orbit. Compute the others by selecting the fragment on the left; a secondary fit starts from the principal orbit.',
+    'Neoznačená měření po rozpadu: {0} z {1} porovnaných přiřazeno vedlejším složkám ({2}); pro jejich nové rozdělení spusťte fit znovu.':
+        'Unlabelled post-split observations: {0} of {1} compared were assigned to secondary components ({2}); run the fit again to use the new assignment.',
+    'Neoznačená měření po rozpadu ({0}) odpovídají hlavní složce.':
+        'Unlabelled post-split observations ({0}) match the principal component.',
+    '{0} měření nelze rozlišit (stopy jsou blíž než chyby měření); zůstávají hlavní složce.':
+        '{0} observations cannot be resolved (the tracks are closer than the measurement errors); they stay with the principal component.',
+    ' (hlavní)':
+        ' (principal)',
+    'Odhad času rozpadu zatím nebyl spočítán.':
+        'The split time has not been estimated yet.',
+    ', {0:.1f}″ od hlavní složky':
+        ', {0:.1f}″ from the principal component',
+    'Nejprve spočítejte vlastní dráhu hlavní složky.':
+        'First compute the own orbit of the principal component.',
+    'Nejprve spočítejte vlastní dráhu alespoň jedné vedlejší složky.':
+        'First compute the own orbit of at least one secondary component.',
+    'Odhaduji čas rozpadu složky {0}…':
+        'Estimating the split time of component {0}…',
+    'Složka {0}: odhad času rozpadu se nezdařil – {1}':
+        'Component {0}: the split-time estimate failed – {1}',
+    'Sekaninův model – rozpad a rozdílné zrychlení, bez rychlosti oddělení':
+        "Sekanina's model – split and differential acceleration, no separation velocity",
+    'jen rychlost oddělení (impulz), bez rozdílného zrychlení':
+        'separation velocity only (impulse), no differential acceleration',
+    'rychlost oddělení i rozdílné zrychlení':
+        'separation velocity and differential acceleration',
+    'Vedlejší stopa na stejných snímcích jako hlavní jádro; vyčleněna jako samostatná složka {0}.':
+        'Secondary track on the same frames as the main nucleus; split off as separate component {0}.',
+    'Odhad rozpadu: fragment {0} od složky {1} ({2} měření fragmentu)':
+        'Split estimate: fragment {0} from component {1} ({2} fragment observations)',
+    '  ▶ = nejpravděpodobnější model (nejlepší shoda na stupeň volnosti s fyzikálně přijatelnými hodnotami). Dráha hlavní složky se bere jako přesná. Krátký oblouk fragmentu často připouští několik okamžiků rozpadu (jiná řešení s malým Δχ²); odhad je orientační.':
+        '  ▶ = most likely model (best fit per degree of freedom with physically acceptable values). The principal orbit is taken as exact. A short fragment arc often admits several split epochs (other solutions with small Δχ²); the estimate is indicative.',
+    'Neoznačené měření sedí na dráhu fragmentu {0} ({1:.1f}″), ne na hlavní složku {2} ({3:.1f}″).':
+        'Unlabelled observation matches the orbit of fragment {0} ({1:.1f}″), not the principal component {2} ({3:.1f}″).',
+    'Chybí kartézský stav dráhy.':
+        'The Cartesian state of the orbit is missing.',
+    'K odhadu rozpadu jsou potřeba alespoň 3 měření fragmentu.':
+        'The split estimate needs at least 3 fragment observations.',
+    ' ± {0:.1f} dne':
+        ' ± {0:.1f} days',
+    '      čas rozpadu {0} UTC{1}; r = {2:.2f} AU; RMS fragmentu {3:.2f}″':
+        '      split time {0} UTC{1}; r = {2:.2f} AU; fragment RMS {3:.2f}″',
+    'Neoznačené měření nelze přiřadit: dráhy hlavní složky a fragmentu {0} jsou zde blíž než chyba měření.':
+        'Unlabelled observation cannot be assigned: the orbits of the principal component and fragment {0} are closer here than the measurement error.',
+    'Výpočet byl zrušen.':
+        'The computation was cancelled.',
+    '      rychlost oddělení {0:.2f} m/s (radiální {1:+.2f}, příčná {2:+.2f}, normálová {3:+.2f})':
+        '      separation velocity {0:.2f} m/s (radial {1:+.2f}, transverse {2:+.2f}, normal {3:+.2f})',
+    '      rozdílné radiální zrychlení ΔA1 = {0:+.3e} AU/den² v 1 AU, ∝ r⁻² ({1:.1f}·10⁻⁵ sluneční gravitace)':
+        '      differential radial acceleration ΔA1 = {0:+.3e} AU/day² at 1 AU, ∝ r⁻² ({1:.1f}·10⁻⁵ solar gravity)',
+    '      jiné řešení: {0}, {1:.2f} m/s, RMS {2:.2f}″ (Δχ² = {3:+.1f})':
+        '      other solution: {0}, {1:.2f} m/s, RMS {2:.2f}″ (Δχ² = {3:+.1f})',
+    '      Rychlost nad {0:.0f} m/s je pro rozpad komety nefyzikální; model vyrovnává jiný, nemodelovaný efekt.':
+        '      A velocity above {0:.0f} m/s is unphysical for a comet split; the model compensates another, unmodelled effect.',
+    '      |ΔA1| nad {0:.1e} AU/den² je pro rozdílné zrychlení fragmentu nevěrohodné; model vyrovnává jiný efekt.':
+        '      |ΔA1| above {0:.1e} AU/day² is implausible for differential fragment acceleration; the model compensates another effect.',
+    '      Minimum leží na okraji prohledaného intervalu ({0:.0f} dní před prvním měřením fragmentu); okamžik rozpadu není určen.':
+        '      The minimum lies at the edge of the searched interval ({0:.0f} days before the first fragment observation); the split time is not determined.',
+    'Přiřazuji neoznačená měření po rozpadu ke složkám…':
+        'Assigning unlabelled post-split observations to components…',
+    '{0} hlavní':
+        '{0} main',
+    'Vedlejší stopa vyčleněna jako složka {0}. Vyberte ji vlevo a spusťte vlastní fit; začne z dráhy hlavního jádra.':
+        'Secondary track split off as component {0}. Select it on the left and run the own fit; it starts from the main nucleus orbit.',
+    'Odhad času rozpadu':
+        'Split time estimate',
+    'Vybrán fragment {0}: {1} měření; zobrazena jeho vlastní dráha. Pro aktuální O−C spusťte vlastní fit znovu.':
+        'Fragment {0} selected: {1} observations; its own orbit is shown. Run the own fit again for current O−C.',
+    'Odhad času rozpadu byl zrušen.':
+        'The split time estimate was cancelled.',
+    'Fragment {0} má oblouk jen {1:.0f} dní; počítám čistě gravitační dráhu bez negravitačních parametrů…':
+        'Fragment {0} has an arc of only {1:.0f} days; computing a purely gravitational orbit without non-gravitational parameters…',
+    '      Rozpad vychází těsně před prvním měřením fragmentu: fragment je čerstvý, nejvýše asi {0:.0f} dní starý; přesný okamžik uvnitř tohoto intervalu data neurčí.':
+        '      The split falls just before the first fragment measurement: the fragment is fresh, at most about {0:.0f} days old; the data do not fix the exact moment within this interval.',
+    'Zadaný okamžik přepnutí sil neleží v mezeře mezi pozorovanými návraty; použit je střed nejdelší mezery.':
+        'The requested force-switch epoch does not lie in a gap between observed returns; the middle of the longest gap is used.',
+    'střed nejdelší mezery':
+        'middle of the longest gap',
+    'Rok (desetinný), od kterého platí moderní A1–A3; dříve platí A1H–A3H. Musí ležet v mezeře mezi pozorovanými návraty. Nejvhodnější je okamžik změny aktivity, např. rozpad (205P: úlomek C koncem roku 1998) – nejlépe daleko od Slunce, kde je síla zanedbatelná.':
+        'Year (decimal) from which the modern A1–A3 apply; A1H–A3H apply before it. It must lie in a gap between observed returns. Best is the moment the activity changed, e.g. a split (205P: fragment C at the end of 1998) – preferably far from the Sun, where the force is negligible.',
+    'Zvětšit nejistotu měření pořízených před rokem':
+        'Increase the uncertainty of measurements made before',
+    'Stará mikrometrická a fotografická měření z mnoha observatoří mají soustavné chyby několika obloukových vteřin (katalog, měřítko desky, pozorovatel), které se průměrováním nezmenší. Zvětšením jejich nejistoty dostanou ve společném fitu odpovídající váhu.':
+        'Old micrometer and photographic measurements from many observatories carry systematic errors of several arcseconds (catalogue, plate scale, observer) that do not average out. Increasing their uncertainty gives them an appropriate weight in the joint fit.',
+    'Přepnutí sil v roce:':
+        'Force switch in year:',
+    'Chybí planetární efemeridy DE440':
+        'Planetary ephemeris DE440 missing',
+    'Pokračovat přesto s přibližným modelem planet?':
+        'Continue anyway with the approximate planetary model?',
+    'větší nejistota historických měření':
+        'larger uncertainty of historical measurements',
+    'POZOR: oblouk {0:.0f} let se počítá bez JPL DE440, jen s přibližným analytickým modelem planet. Po těsných průletech kolem Jupiteru může být napojení vzdálených návratů zcela chybné; stáhněte DE440 a výpočet zopakujte.':
+        'WARNING: the {0:.0f}-year arc is computed without JPL DE440, only with the approximate analytic planetary model. After close Jupiter approaches the linkage of distant returns may be completely wrong; download DE440 and repeat the computation.',
+    'Nejistota {0} měření pořízených před rokem {1:g} byla zvětšena {2:g}× (soustavné chyby historické astrometrie).':
+        'The uncertainty of {0} measurements made before {1:g} was increased {2:g}× (systematic errors of historical astrometry).',
+    'Rozptyl klonů':
+        'Clone spread',
+    'Kromě nominální dráhy integruje i klony z kovariance vlastního fitu (stav dráhy a fitované A1/A2/A3/DT) a v grafu ukáže jejich rozptyl. Po těsném průletu kolem planety je tak vidět, jak velká část předpovědi je skutečně určena pozorováním. Každý klon je jedna další integrace celého intervalu.':
+        'Besides the nominal orbit, integrates clones drawn from the covariance of the own fit (orbital state and the fitted A1/A2/A3/DT) and shows their spread in the plot. After a close planetary approach this shows how much of the prediction is actually determined by the observations. Each clone is one more integration of the whole interval.',
+    '{0} klonů, 5–95 %':
+        '{0} clones, 5–95 %',
+    'Klony {0}/{1}…':
+        'Clones {0}/{1}…',
+    'Rozptyl {0} klonů z kovariance fitu ({1}); pásmo 5–95 %:':
+        'Spread of {0} clones from the fit covariance ({1}); 5–95 % band:',
+    '  {0} ({1}): q {2:.4f}–{3:.4f} AU, e {4:.4f}–{5:.4f}':
+        '  {0} ({1}): q {2:.4f}–{3:.4f} AU, e {4:.4f}–{5:.4f}',
+    'Dráha nemá kovarianci fitu; rozptyl klonů lze spočítat jen pro vlastní fit z astrometrie.':
+        'The orbit has no fit covariance; the clone spread is available only for an own fit from astrometry.',
+    'Kovariance fitu není použitelná.':
+        'The fit covariance is not usable.',
+    'Vývoj dráhy neobsahuje časovou řadu elementů.':
+        'The orbit evolution contains no element time series.',
+    'Rozptyl klonů: žádný klon se nepodařilo integrovat.':
+        'Clone spread: no clone could be integrated.',
+    '  {0} klonů se nepodařilo integrovat (např. srážka).':
+        '  {0} clones could not be integrated (e.g. a collision).',
+    'návrat {0}':
+        'return {0}',
+    'konec výpočtu':
+        'end of the computation',
+    ', P {0:.2f}–{1:.2f} let':
+        ', P {0:.2f}–{1:.2f} years',
+    'stav i negravitační parametry':
+        'state and non-gravitational parameters',
+    'jen stav dráhy':
+        'orbital state only',
+    'Klony mění stav dráhy i fitované negravitační parametry ({0}).':
+        'The clones vary the orbital state and the fitted non-gravitational parameters ({0}).',
+    'Klony mění stav dráhy.':
+        'The clones vary the orbital state.',
+    'Rok nebo více let oddělených čárkou (desetinné hodnoty), kdy se mění negravitační síly; každé období mezi nimi má vlastní A1–A3 (nejnovější A1–A3, starší A1H–A3H, A1H2–A3H2 …, nejvýše {0} období). Každý rok musí ležet v mezeře mezi pozorovanými návraty. Nejvhodnější je okamžik změny aktivity – rozpad (205P: úlomek C koncem roku 1998) nebo těsný průlet kolem Jupiteru, který změnil dráhu (78P: 1995) – nejlépe daleko od Slunce.':
+        'One or more years separated by commas (decimal values) at which the non-gravitational forces change; each period between them has its own A1–A3 (the most recent A1–A3, older ones A1H–A3H, A1H2–A3H2 …, at most {0} periods). Each year must lie in a gap between observed returns. Best is the moment the activity changed – a split (205P: fragment C at the end of 1998) or a close Jupiter approach that changed the orbit (78P: 1995) – preferably far from the Sun.',
+    'Přepnutí sil v letech:':
+        'Force switches in years:',
+    'U {0} měření byla odečtena zonální a vlastní-pohybová oprava hvězdného katalogu podle mapy Eggl et al. (2020).':
+        'The zonal and proper-motion correction of the star catalogue from the Eggl et al. (2020) map was subtracted from {0} measurements.',
+    'Celý vnitřně souvislý tracklet je neslučitelný s ostatní astrometrií; byl vyřazen jako pravděpodobné chybné přiřazení.':
+        'The entire internally coherent tracklet is incompatible with the remaining astrometry; it was rejected as a probable misidentification.',
+    'Přepočítávám dráhu po vyřazení chybně přiřazeného trackletu…':
+        'Recomputing the orbit after rejecting a misidentified tracklet…',
+    'Prověřuji, zda astrometrie vyžaduje negravitační síly…':
+        'Checking whether the astrometry requires non-gravitational forces…',
+    'Přepočítávám dráhu s potvrzeným negravitačním modelem…':
+        'Recomputing the orbit with the confirmed non-gravitational model…',
+    'Astrometrie statisticky potvrdila automatický negravitační model: {0}; zlepšení ΔBIC={1:.1f}. Model bez negravitačních sil zůstal výchozí, dokud nebyla splněna hranice 3σ a ΔBIC>10.':
+        'The astrometry statistically confirmed the automatic non-gravitational model: {0}; improvement ΔBIC={1:.1f}. The force-free model remained the default until both the 3σ and ΔBIC>10 thresholds were met.',
+    'Silový model zahrnul 16 hmotných planetek s polohami a hmotnostmi z JPL SB441 prostřednictvím volitelného ASSIST.':
+        'The force model included 16 massive asteroids with positions and masses from JPL SB441 through optional ASSIST.',
+    '{0}={1:.3g} AU/den² ({2:.1f}σ)':
+        '{0}={1:.3g} AU/day² ({2:.1f}σ)',
 }

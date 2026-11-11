@@ -22,8 +22,9 @@ from orbit_app.presentation import (
     datetime_from_jd, equatorial_ra_ticks, format_dec_sexagesimal, format_ra_sexagesimal,
     observation_residual_score, observations_to_tsv, parse_output_epoch,
     perihelion_jd_from_solution, project_ecliptic_camera,
-    SKY_TRACK_HORIZONS, sky_track_sample_count, solar_orbit_clip_radius,
-    trajectory_return_masks,
+    projected_ecliptic_curtain_quads, lunar_orbit_path_epochs, SKY_TRACK_HORIZONS,
+    sky_track_sample_count, solar_orbit_clip_radius, trajectory_return_masks,
+    trajectory_display_indices,
 )
 from orbit_app.mpc import MpcClient, parse_mpc80
 from orbit_app.mpc_orbit import (
@@ -34,13 +35,16 @@ from orbit_app.observatories import (
     station_offsets_gcrs,
 )
 from orbit_app.orbit_engine import (
-    MU_SUN, NBodyIntegrator, StateVector, delayed_heliocentric_radius,
+    AU_KM, EARTH_J2, EARTH_POLE_ECLIPTIC, MU_SUN, NBodyIntegrator, StateVector,
+    delayed_heliocentric_radius, earth_j2_acceleration, earth_j2_jacobian,
     marsden_water_ice_law,
     nongravitational_acceleration, solar_post_newtonian_acceleration,
 )
 from orbit_app.orbit_evolution import (
-    EvolutionResult, EvolutionReturn, EvolutionSnapshot, PLANET_MU, PlanetEncounter,
-    centered_snapshot, evolution_span, format_evolution_mpc_report,
+    CaptureInterval, EvolutionResult, EvolutionReturn, EvolutionSnapshot,
+    PLANET_MU, PlanetEncounter, _refine_capture_trajectory,
+    calculate_orbit_evolution_between, centered_snapshot, evolution_span,
+    format_evolution_mpc_report,
     format_evolution_report,
 )
 from orbit_app.planetary import PLANETS
@@ -58,6 +62,8 @@ from orbit_app.orbit_fit import (
     _perihelion_offset_days_from_state,
     _prefer_parabolic_short_arc,
     _representative_indices, _truncate_rows_to_recent_years,
+    _should_check_temporary_capture,
+    _temporarily_captured_initial_seed,
     _update_apparition_linkage_metrics,
     fit_orbit, fit_selection_count, parse_observation_time,
 )
@@ -67,6 +73,11 @@ from orbit_app.preview_orbit import (
     orbital_curve_xyz, solve_kepler,
 )
 
+
+try:
+    from qt_support import qt_application  # noqa: E402
+except ImportError:  # run as tests.<module> from the repository root
+    from tests.qt_support import qt_application  # noqa: E402
 
 class PhotometryTests(unittest.TestCase):
     def test_unit_distances_equal_absolute_magnitude(self):
@@ -568,6 +579,77 @@ class PreviewGeometryTests(unittest.TestCase):
         np.testing.assert_allclose(position, [3.0, 5.0, 7.0])
         self.assertIsNone(SolarSystemPanel._trajectory_position((epochs, states), 99.0))
 
+    def test_solar_system_offers_object_center_without_evolution(self):
+
+        _application = qt_application()
+        playback = PlaybackBar()
+        panel = SolarSystemPanel(demo_solution(), playback)
+        self.assertTrue(panel.view_center.isEnabled())
+        self.assertGreaterEqual(panel.view_center.findData("object"), 0)
+        earth_index = panel.view_center.findData("earth")
+        panel.view_center.setCurrentIndex(earth_index)
+        self.assertIn("Měsíc", {text.get_text() for text in panel.canvas.axes.texts})
+        self.assertIn("#b9c8dc", {line.get_color() for line in panel.canvas.axes.lines})
+
+    def test_lunar_ephemeris_is_geocentric_at_earth_view_scale(self):
+        epoch = 2451545.0
+        relative = PLANETS.position("moon", epoch) - PLANETS.position("earth", epoch)
+        distance = float(np.linalg.norm(relative))
+        self.assertGreater(distance, .002)
+        self.assertLess(distance, .003)
+
+    def test_lunar_orbit_path_cache_follows_displayed_day(self):
+        first_key, first_epochs = lunar_orbit_path_epochs(2451545.25)
+        same_key, same_epochs = lunar_orbit_path_epochs(2451545.75)
+        next_key, next_epochs = lunar_orbit_path_epochs(2451546.25)
+        self.assertEqual(first_key, same_key)
+        np.testing.assert_array_equal(first_epochs, same_epochs)
+        self.assertNotEqual(first_key, next_key)
+        self.assertFalse(np.array_equal(first_epochs, next_epochs))
+        self.assertLess(first_epochs[0], 2451545.25)
+        self.assertGreater(first_epochs[-1], 2451545.75)
+
+    def test_capture_samples_survive_long_trajectory_thinning(self):
+        epochs = np.linspace(0.0, 100.0, 10001)
+        selected = trajectory_display_indices(
+            epochs, ((40.0, 41.0),), maximum_points=600,
+        )
+        capture = np.flatnonzero((epochs >= 40.0) & (epochs <= 41.0))
+        self.assertLessEqual(len(selected), 600)
+        self.assertTrue(set(capture).issubset(set(selected)))
+        self.assertEqual(selected[0], 0)
+        self.assertEqual(selected[-1], len(epochs) - 1)
+
+    def test_capture_trajectory_is_reintegrated_at_three_hour_cadence(self):
+        class LinearEngine:
+            @staticmethod
+            def propagate(initial, targets):
+                targets = np.asarray(targets, dtype=float)
+                delta = targets - initial.epoch_jd
+                positions = (
+                    initial.position_au[None, :]
+                    + delta[:, None] * initial.velocity_au_per_day[None, :]
+                )
+                velocities = np.broadcast_to(
+                    initial.velocity_au_per_day, positions.shape,
+                )
+                return np.column_stack((positions, velocities))
+
+        epochs = np.arange(0.0, 11.0)
+        states = np.column_stack((
+            epochs, np.zeros((len(epochs), 2)),
+            np.ones(len(epochs)), np.zeros((len(epochs), 2)),
+        ))
+        capture = CaptureInterval("earth", 3.0, 6.0, .001, .1)
+        refined_epochs, refined_states = _refine_capture_trajectory(
+            LinearEngine(), epochs, states, (capture,),
+        )
+        inside = refined_epochs[
+            (refined_epochs >= 2.0) & (refined_epochs <= 7.0)
+        ]
+        self.assertLessEqual(float(np.max(np.diff(inside))), .125 + 1e-12)
+        np.testing.assert_allclose(refined_states[:, 0], refined_epochs)
+
     def test_julian_date_conversion_does_not_use_windows_timestamp_range(self):
         self.assertEqual(datetime_from_jd(2451545.0), datetime(2000, 1, 1, 12, tzinfo=timezone.utc))
         self.assertIsNone(datetime_from_jd(-1e20))
@@ -600,6 +682,27 @@ class PreviewGeometryTests(unittest.TestCase):
         self.assertTrue(np.allclose(x, [-1.0, 0.0], atol=1e-12))
         self.assertTrue(np.allclose(y, [0.0, 1.0], atol=1e-12))
         self.assertTrue(np.allclose(depth, [0.0, 0.0], atol=1e-12))
+
+    def test_ecliptic_curtain_is_built_from_local_quadrilaterals(self):
+        orbit = np.array([
+            [1.0, 0.0, 2.0],
+            [0.0, 1.0, 3.0],
+            [-1.0, 0.0, 4.0],
+        ])
+        quads = projected_ecliptic_curtain_quads(orbit, 0.0, 0.0)
+        self.assertEqual(quads.shape, (2, 4, 2))
+        # Adjacent cells share exactly their orbit and ecliptic edges; no cell
+        # can introduce a chord spanning non-neighbouring orbit samples.
+        np.testing.assert_allclose(quads[0, 1], quads[1, 0])
+        np.testing.assert_allclose(quads[0, 2], quads[1, 3])
+
+    def test_ecliptic_curtain_rejects_invalid_geometry(self):
+        with self.assertRaises(ValueError):
+            projected_ecliptic_curtain_quads(np.zeros((3, 2)), 0.0, 0.0)
+        empty = projected_ecliptic_curtain_quads(
+            np.zeros((1, 3)), 0.0, 0.0,
+        )
+        self.assertEqual(empty.shape, (0, 4, 2))
 
     def test_preview_geometry_is_finite(self):
         result = apparent_geometry(demo_solution(), np.array([2460950.5, 2460951.5]))
@@ -678,6 +781,84 @@ class PreviewGeometryTests(unittest.TestCase):
 
 
 class OrbitFitSelectionTests(unittest.TestCase):
+    def test_pasted_object_rechecks_capture_when_ui_seed_is_for_another_object(self):
+        observation = Observation(
+            designation="J002E3", time="2002-09-03T00:00:00Z",
+            ra_deg=1.0, dec_deg=2.0,
+        )
+        rows = [(observation, parse_observation_time(observation.time), 1.0, 2.0)]
+        previous = OrbitSolution("C/2024 Y1", 2460000.5, 3.0, .5, 1, 2, 3, 4)
+        self.assertTrue(_should_check_temporary_capture(rows, previous))
+
+    def test_manual_a1_does_not_bypass_temporary_capture_staging(self):
+        observations = [
+            Observation(
+                designation="J002E3",
+                time=(datetime(2002, 9, 3, tzinfo=timezone.utc)
+                      + timedelta(days=8 * index)).isoformat(),
+                ra_deg=10.0 + index, dec_deg=3.0,
+            )
+            for index in range(6)
+        ]
+        seed = OrbitSolution(
+            "J002E3", 2452520.5, 1.0, .01, 1.0, 2.0, 3.0, 4.0,
+            position_au=(1.0, 0.0, 0.0), velocity_au_per_day=(0.0, .017, 0.0),
+        )
+        candidate = (seed, .7, len(observations))
+        automatic = {"A1": 2e-9, "R_EXPONENT": 2.0}
+        with (
+            patch(
+                "orbit_app.orbit_fit._temporarily_captured_initial_seed",
+                return_value=(seed, parse_observation_time(observations[0].time)),
+            ),
+            patch(
+                "orbit_app.orbit_fit._fit_temporarily_captured_arc",
+                return_value=(candidate, automatic),
+            ) as staged,
+            patch("orbit_app.orbit_fit._fit_orbit_once", return_value=candidate),
+            patch("orbit_app.orbit_fit._reject_isolated_blunders", return_value=candidate),
+            patch("orbit_app.orbit_fit._calibrate_fitted_photometry"),
+            patch("orbit_app.orbit_fit._attach_multi_apparition_elements"),
+        ):
+            result = fit_orbit(
+                observations, None,
+                nongravitational={"A1": 0.0, "R_EXPONENT": 2.0},
+            )
+        self.assertIs(result, candidate)
+        staged.assert_called_once()
+        self.assertIn("automaticky", seed.fit_model_note)
+
+    def test_temporary_capture_seed_uses_first_dense_local_track(self):
+        sparse = [
+            Observation(time=f"2002-06-{day:02d}T00:00:00Z", ra_deg=1.0, dec_deg=2.0)
+            for day in (15, 16)
+        ]
+        dense = [
+            Observation(
+                time=(datetime(2002, 9, 3, tzinfo=timezone.utc)
+                      + timedelta(hours=6 * index)).isoformat(),
+                ra_deg=10.0 + index, dec_deg=3.0,
+            )
+            for index in range(6)
+        ]
+        observations = sparse + dense
+        rows = [
+            (item, parse_observation_time(item.time), item.ra_deg, item.dec_deg)
+            for item in observations
+        ]
+        seed = OrbitSolution(
+            "J002E3", 2452520.5, 1.0, .01, 1.0, 2.0, 3.0, 4.0,
+            position_au=(1.0, 0.0, 0.0), velocity_au_per_day=(0.0, .017, 0.0),
+        )
+        with (
+            patch("orbit_app.orbit_fit.initial_orbit_from_observations", return_value=seed) as initial,
+            patch("orbit_app.orbit_fit._earth_relative_energy", return_value=(.005, -1e-7)),
+        ):
+            selected = _temporarily_captured_initial_seed(rows)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected[1], parse_observation_time(dense[0].time))
+        self.assertEqual(len(initial.call_args.args[0]), len(dense))
+
     def test_fit_can_be_cancelled_before_numerical_work_starts(self):
         with self.assertRaises(OrbitFitCancelled):
             fit_orbit([], None, cancel_callback=lambda: True)
@@ -1135,6 +1316,36 @@ class _NoPlanets:
 
 
 class NativeIntegratorTests(unittest.TestCase):
+    def test_earth_j2_has_equatorial_and_polar_quadrupole_geometry(self):
+        radius = .001
+        earth_mu = MU_SUN * 3.0034896e-6
+        equatorial = earth_j2_acceleration(np.array([radius, 0.0, 0.0]), earth_mu)
+        polar = earth_j2_acceleration(radius * EARTH_POLE_ECLIPTIC, earth_mu)
+        self.assertLess(equatorial[0], 0.0)
+        self.assertGreater(float(polar @ EARTH_POLE_ECLIPTIC), 0.0)
+        self.assertAlmostEqual(
+            np.linalg.norm(polar) / np.linalg.norm(equatorial), 2.0, places=12,
+        )
+        expected = 1.5 * EARTH_J2 * earth_mu * (6378.137 / 149_597_870.7) ** 2 / radius**4
+        self.assertAlmostEqual(np.linalg.norm(equatorial), expected, places=18)
+
+    def test_earth_j2_jacobian_matches_finite_difference(self):
+        earth_mu = MU_SUN * 3.0034896e-6
+        relative = np.array([.00018, -.00011, .00007])
+        step = 1e-10
+        numerical = np.empty((3, 3))
+        for column in range(3):
+            offset = np.zeros(3)
+            offset[column] = step
+            numerical[:, column] = (
+                earth_j2_acceleration(relative + offset, earth_mu)
+                - earth_j2_acceleration(relative - offset, earth_mu)
+            ) / (2.0 * step)
+        np.testing.assert_allclose(
+            earth_j2_jacobian(relative, earth_mu), numerical,
+            rtol=2e-8, atol=1e-14,
+        )
+
     def test_solar_post_newtonian_acceleration_for_circular_state(self):
         correction = solar_post_newtonian_acceleration(
             np.array([1.0, 0.0, 0.0]),
@@ -1160,6 +1371,31 @@ class NativeIntegratorTests(unittest.TestCase):
         distance = float(np.linalg.norm(moon - earth))
         self.assertGreater(distance, .0023)
         self.assertLess(distance, .0028)
+
+    def test_evolution_records_a_close_lunar_flyby(self):
+        epoch = 2451545.0
+        moon = PLANETS.position("moon", epoch)
+        moon_velocity = (
+            PLANETS.position("moon", epoch + .01)
+            - PLANETS.position("moon", epoch - .01)
+        ) / .02
+        position = moon + np.array([.00020, 0.0, 0.0])
+        velocity = moon_velocity + np.array([0.0, 20.0 * 86400.0 / AU_KM, 0.0])
+        solution = OrbitSolution(
+            "lunar flyby", epoch, 1.0, .1, 0.0, 0.0, 0.0, 0.0,
+            position_au=tuple(position), velocity_au_per_day=tuple(velocity),
+        )
+        result = calculate_orbit_evolution_between(
+            solution, epoch - 200.45, epoch + 199.55,
+        )
+        lunar = [item for item in result.encounters if item.planet == "moon"]
+        self.assertTrue(lunar)
+        encounter = min(lunar, key=lambda item: abs(item.epoch_jd - epoch))
+        # The flyby lasts minutes: the minimum must be found to the kilometre,
+        # not just bracketed (a search in raw Julian dates stopped ~0.04 d off).
+        self.assertAlmostEqual(encounter.distance_au * AU_KM, .00020 * AU_KM, delta=50.0)
+        self.assertLess(abs(encounter.epoch_jd - epoch) * 1440.0, 1.0)
+        self.assertGreater(encounter.relative_velocity_kms, 0.0)
 
     def test_planet_provider_includes_pluto_system_perturber(self):
         pluto = PLANETS.position("pluto", 2451545.0)
@@ -1302,12 +1538,12 @@ class NativeIntegratorTests(unittest.TestCase):
         # years each way, far outside DE440.
         from unittest import mock
 
-        from PySide6.QtWidgets import QApplication, QMessageBox
+        from PySide6.QtWidgets import QMessageBox
 
         from orbit_app import main_window
         from orbit_app.planetary import DE440_COVERAGE
 
-        _application = QApplication.instance() or QApplication([])
+        _application = qt_application()
         planets = mock.Mock(coverage_jd=DE440_COVERAGE, model_name="JPL DE440")
         solution = OrbitSolution(
             "78P", 2456000.5, 3.739, .463, 6.26, 210.6, 192.8, 0.3,

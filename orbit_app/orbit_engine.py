@@ -138,20 +138,67 @@ def delayed_heliocentric_radius(
 # cannot be described by one constant set; the switch is placed in the long
 # unobserved gap, normally near aphelion where the water-ice law is ~0.
 NONGRAVITATIONAL_SPLIT_KEY = "SPLIT_JD"
-HISTORICAL_NONGRAVITATIONAL = {"A1": "A1H", "A2": "A2H", "A3": "A3H"}
+# Several force periods: period 0 (A1–A3) is the most recent one, period 1
+# (A1H–A3H) applies before SPLIT_JD, period 2 (A1H2–A3H2) before SPLIT_JD2,
+# and so on; the switch epochs decrease with the period number.
+MAX_FORCE_PERIODS = 4
+
+
+def historical_period_names(period: int) -> dict[str, str]:
+    """Coefficient names of force period ``period`` ≥ 1 keyed by A1/A2/A3."""
+    suffix = "H" if period == 1 else f"H{period}"
+    return {name: name + suffix for name in ("A1", "A2", "A3")}
+
+
+def period_split_key(period: int) -> str:
+    """Key of the switch epoch before which period ``period`` ≥ 1 applies."""
+    return NONGRAVITATIONAL_SPLIT_KEY if period == 1 else f"{NONGRAVITATIONAL_SPLIT_KEY}{period}"
+
+
+HISTORICAL_NONGRAVITATIONAL = historical_period_names(1)
+ALL_HISTORICAL_NAMES = tuple(
+    name for period in range(1, MAX_FORCE_PERIODS)
+    for name in historical_period_names(period).values()
+)
+ALL_SPLIT_KEYS = tuple(period_split_key(period) for period in range(1, MAX_FORCE_PERIODS))
+
+
+def force_period_splits(parameters: dict[str, float] | None) -> tuple[float, ...]:
+    """Switch epochs (TDB JD) in period order; they must decrease."""
+    splits: list[float] = []
+    for period in range(1, MAX_FORCE_PERIODS):
+        key = period_split_key(period)
+        if not parameters or key not in parameters:
+            break
+        value = float(parameters[key])
+        if not np.isfinite(value) or (splits and value >= splits[-1]):
+            raise FloatingPointError(tr("Okamžik přepnutí negravitačního modelu není konečný."))
+        splits.append(value)
+    return tuple(splits)
+
+
+def force_period(splits: tuple[float, ...], jd: float | None) -> int:
+    """Index of the force period valid at TDB ``jd`` (0 = the most recent)."""
+    if jd is None:
+        return 0
+    return sum(1 for split in splits if jd < split)
+
+
+def period_coefficient_names(period: int) -> tuple[str, str, str]:
+    if period <= 0:
+        return ("A1", "A2", "A3")
+    names = historical_period_names(period)
+    return (names["A1"], names["A2"], names["A3"])
 
 
 def active_nongravitational_coefficients(
     parameters: dict[str, float] | None, jd: float | None,
 ) -> tuple[float, float, float]:
-    """(A1, A2, A3) in AU/day² valid at TDB ``jd`` (historical before the split)."""
+    """(A1, A2, A3) in AU/day² valid at TDB ``jd`` (its force period)."""
     if not parameters:
         return 0.0, 0.0, 0.0
-    split = parameters.get(NONGRAVITATIONAL_SPLIT_KEY)
-    names = ("A1", "A2", "A3")
-    if split is not None and jd is not None and float(jd) < float(split):
-        names = tuple(HISTORICAL_NONGRAVITATIONAL[name] for name in names)
-    return tuple(float(parameters.get(name, 0.0)) for name in names)
+    period = force_period(force_period_splits(parameters), jd)
+    return tuple(float(parameters.get(name, 0.0)) for name in period_coefficient_names(period))
 
 
 def nongravitational_acceleration(
@@ -205,6 +252,69 @@ class StateVector:
 
 
 AU_KM = 149_597_870.7
+# Dynamical form factor of the Earth (EGM2008 zero-tide value rounded to the
+# precision useful for small-body integration).  The pole is the ICRS/J2000
+# north pole expressed in the engine's J2000 ecliptic axes.
+EARTH_J2 = 1.08262668e-3
+_J2000_OBLIQUITY_RAD = math.radians(23.4392911)
+EARTH_POLE_ECLIPTIC = np.array((
+    0.0, math.sin(_J2000_OBLIQUITY_RAD), math.cos(_J2000_OBLIQUITY_RAD),
+))
+
+
+def earth_j2_acceleration(relative_position_au: np.ndarray, earth_mu: float) -> np.ndarray:
+    """Earth's J2 perturbation in J2000 ecliptic coordinates (AU/day²).
+
+    ``relative_position_au`` points from the Earth's centre to the test
+    particle.  This is the quadrupole correction only; point-mass attraction
+    remains part of the normal perturber sum.
+    """
+    relative = np.asarray(relative_position_au, dtype=float)
+    radius2 = float(relative @ relative)
+    if radius2 <= 0.0:
+        return np.zeros(3, dtype=float)
+    radius = math.sqrt(radius2)
+    axial = float(relative @ EARTH_POLE_ECLIPTIC)
+    axial_fraction = axial * axial / radius2
+    factor = 1.5 * EARTH_J2 * float(earth_mu) * (6378.137 / AU_KM) ** 2 / radius**5
+    return factor * (
+        (5.0 * axial_fraction - 1.0) * relative
+        - 2.0 * axial * EARTH_POLE_ECLIPTIC
+    )
+
+
+def earth_j2_jacobian(relative_position_au: np.ndarray, earth_mu: float) -> np.ndarray:
+    """Derivative of :func:`earth_j2_acceleration` with respect to position.
+
+    Input is the Earth-to-object vector in J2000-ecliptic AU; the returned
+    matrix has units day⁻².  The indirect heliocentric J2 term is independent
+    of the object's position and therefore contributes no derivative.
+    """
+    relative = np.asarray(relative_position_au, dtype=float)
+    radius2 = float(relative @ relative)
+    if radius2 <= 0.0:
+        return np.zeros((3, 3), dtype=float)
+    radius = math.sqrt(radius2)
+    pole = EARTH_POLE_ECLIPTIC
+    axial = float(relative @ pole)
+    axial2_over_radius2 = axial * axial / radius2
+    shape = 5.0 * axial2_over_radius2 - 1.0
+    shape_gradient = 10.0 * (
+        axial * pole / radius2
+        - axial * axial * relative / (radius2 * radius2)
+    )
+    bracket = shape * relative - 2.0 * axial * pole
+    bracket_jacobian = (
+        shape * np.eye(3)
+        + np.outer(relative, shape_gradient)
+        - 2.0 * np.outer(pole, pole)
+    )
+    coefficient = (
+        1.5 * EARTH_J2 * float(earth_mu) * (6378.137 / AU_KM) ** 2 / radius**5
+    )
+    return coefficient * (
+        bracket_jacobian - 5.0 * np.outer(bracket, relative) / radius2
+    )
 
 
 def _body_name(body: str) -> str:
@@ -306,6 +416,7 @@ class NBodyIntegrator:
         self.include_solar_relativity = bool(include_solar_relativity)
         self._names = tuple(body.name for body in perturbers)
         self._mu = np.asarray([body.mu_au3_day2 for body in perturbers], dtype=float)
+        self._earth_index = self._names.index("earth") if "earth" in self._names else None
         self.detect_collisions = bool(detect_collisions)
         self._radius2 = np.asarray(
             [(body.radius_km / AU_KM) ** 2 for body in perturbers], dtype=float,
@@ -313,7 +424,7 @@ class NBodyIntegrator:
         self._check_collisions = self.detect_collisions and bool(np.any(self._radius2 > 0.0))
         self._has_nongravitational = any(
             float(self.nongravitational_parameters.get(name, 0.0))
-            for name in ("A1", "A2", "A3", *HISTORICAL_NONGRAVITATIONAL.values())
+            for name in ("A1", "A2", "A3", *ALL_HISTORICAL_NAMES)
         )
         # Force-law constants resolved once; the integrator evaluates the law
         # millions of times per fit (same formulas as
@@ -322,13 +433,10 @@ class NBodyIntegrator:
         self._ng_coefficients = tuple(
             float(parameters.get(name, 0.0)) for name in ("A1", "A2", "A3")
         )
-        split = parameters.get(NONGRAVITATIONAL_SPLIT_KEY)
-        self._ng_split = float(split) if split is not None else None
-        if self._ng_split is not None and not np.isfinite(self._ng_split):
-            raise FloatingPointError(tr("Okamžik přepnutí negravitačního modelu není konečný."))
-        self._ng_historical = tuple(
-            float(parameters.get(HISTORICAL_NONGRAVITATIONAL[name], 0.0))
-            for name in ("A1", "A2", "A3")
+        self._ng_splits = force_period_splits(parameters)
+        self._ng_periods = tuple(
+            tuple(float(parameters.get(name, 0.0)) for name in period_coefficient_names(period))
+            for period in range(len(self._ng_splits) + 1)
         )
         self._ng_exponent = (
             float(parameters["R_EXPONENT"]) if "R_EXPONENT" in parameters else None
@@ -396,6 +504,8 @@ class NBodyIntegrator:
             acceleration = acceleration + solar_post_newtonian_acceleration(position, velocity)
         if self._names:
             planets = self._planet_positions(jd)
+            earth = planets[self._earth_index] if self._earth_index is not None else None
+            earth_mu = self._mu[self._earth_index] if self._earth_index is not None else None
             relative = planets - position
             distance2 = (relative * relative).sum(axis=1)
             if self._check_collisions:
@@ -416,6 +526,16 @@ class NBodyIntegrator:
                 (mu / (distance2 * np.sqrt(distance2))) @ relative
                 - (mu / (planet_radius2 * np.sqrt(planet_radius2))) @ planets
             )
+            if earth is not None and earth_mu is not None:
+                # A temporarily captured object can complete many close Earth
+                # revolutions during one astrometric arc.  The tiny J2 term
+                # then accumulates into a measurable nodal/perigee shift.  As
+                # with the point-mass force, subtract the acceleration of the
+                # heliocentric origin to retain a consistent non-inertial
+                # heliocentric frame.
+                acceleration = acceleration + earth_j2_acceleration(
+                    position - earth, earth_mu,
+                ) - earth_j2_acceleration(-earth, earth_mu)
         if velocity is not None and self._has_nongravitational:
             acceleration = acceleration + self._nongravitational_acceleration(
                 position, velocity, jd,
@@ -433,8 +553,8 @@ class NBodyIntegrator:
         scaled = max(activity_radius, 1e-12) / 2.808
         return 0.111262 * scaled ** -2.15 * (1.0 + scaled ** 5.093) ** -4.6142
 
-    def _historical(self, jd: float | None) -> bool:
-        return self._ng_split is not None and jd is not None and jd < self._ng_split
+    def _period(self, jd: float | None) -> int:
+        return force_period(self._ng_splits, jd) if self._ng_splits else 0
 
     def _nongravitational_acceleration(
         self, position: np.ndarray, velocity: np.ndarray, jd: float | None = None,
@@ -448,7 +568,7 @@ class NBodyIntegrator:
             return np.zeros(3, dtype=float)
         normal = normal_vector / normal_norm
         transverse = _cross(normal, radial)
-        a1, a2, a3 = self._ng_historical if self._historical(jd) else self._ng_coefficients
+        a1, a2, a3 = self._ng_periods[self._period(jd)]
         if not (a1 or a2 or a3):
             return np.zeros(3, dtype=float)
         direction = a1 * radial + a2 * transverse + a3 * normal
@@ -461,7 +581,7 @@ class NBodyIntegrator:
         """Return da/dr, da/dv and da/dp for variational integration.
 
         Position derivatives use analytic Newtonian gravity of the Sun and the
-        perturbers.  The tiny post-Newtonian and non-gravitational dependences
+        perturbers plus the Earth's J2 term.  The tiny post-Newtonian and non-gravitational dependences
         on r and v are deliberately omitted from the *derivatives* (they are
         always present in the trajectory itself): a Gauss-Newton Jacobian only
         has to point downhill, while the residuals, which decide convergence,
@@ -473,8 +593,19 @@ class NBodyIntegrator:
         inverse3 = MU_SUN / radius**3
         position_jacobian = (3.0 * inverse3 / (radius * radius)) * np.outer(position, position)
         trace_term = inverse3
+        earth_position = None
+        earth_mu = None
         if self._names:
-            relative = self._planet_positions(jd) - position
+            planet_positions = self._planet_positions(jd)
+            earth_position = (
+                planet_positions[self._earth_index]
+                if self._earth_index is not None else None
+            )
+            earth_mu = (
+                self._mu[self._earth_index]
+                if self._earth_index is not None else None
+            )
+            relative = planet_positions - position
             distance2 = (relative * relative).sum(axis=1)
             if np.all(distance2 > 0.0):
                 mu = self._mu
@@ -487,6 +618,10 @@ class NBodyIntegrator:
         position_jacobian[0, 0] -= trace_term
         position_jacobian[1, 1] -= trace_term
         position_jacobian[2, 2] -= trace_term
+        if earth_position is not None and earth_mu is not None:
+            position_jacobian += earth_j2_jacobian(
+                position - earth_position, float(earth_mu),
+            )
         # Non-gravitational accelerations are ~1e-8 of solar gravity; their
         # own dependence on r and v is negligible in a Gauss-Newton Jacobian.
         velocity_jacobian = np.zeros((3, 3), dtype=float)
@@ -502,12 +637,14 @@ class NBodyIntegrator:
         normal = normal / normal_norm
         transverse = _cross(normal, radial)
         law = self._activity_law(position, velocity, radius)
-        modern = {"A1": radial, "A2": transverse, "A3": normal}
-        historical = {
-            HISTORICAL_NONGRAVITATIONAL[name]: vector for name, vector in modern.items()
-        }
+        vectors = (radial, transverse, normal)
+        period_now = self._period(jd)
         # Only the coefficient set acting at ``jd`` has a derivative there.
-        active, inactive = (historical, modern) if self._historical(jd) else (modern, historical)
+        active = dict(zip(period_coefficient_names(period_now), vectors))
+        inactive = {
+            name for period in range(MAX_FORCE_PERIODS) if period != period_now
+            for name in period_coefficient_names(period)
+        }
         for column, (name, scale) in enumerate(zip(parameter_names, parameter_scales)):
             if name in active:
                 # d(a)/d(A_k) = g(r) * unit vector, exactly.

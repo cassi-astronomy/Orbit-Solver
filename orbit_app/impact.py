@@ -42,6 +42,20 @@ EARTH_ROTATION_RAD_PER_DAY = 2.0 * np.pi * 86400.0 / 86164.0905
 MONTE_CARLO_SECONDS = 30.0
 MONTE_CARLO_MINIMUM = 40
 MONTE_CARLO_MAXIMUM = 400
+# Close-pass risk: a fixed, seeded number of clones, so a result never
+# depends on the speed of the computer.  2500 clones detect a risk of about
+# 1:800 or more reliably (no hit among 2500 leaves a Wilson 95% upper bound
+# of about 0.15%, 1:650); rarer risks may show no impacting clone at all.
+RISK_MONTE_CARLO_MINIMUM = 2500
+RISK_MONTE_CARLO_MAXIMUM = 2500
+RISK_MONTE_CARLO_BATCH = 250
+RISK_MONTE_CARLO_TARGET_IMPACTS = 20
+# A nominal pass this close always warrants a clone check.  A more distant
+# pass is checked too when its 3-sigma propagated position covariance reaches
+# this screening corridor.  These are triggers, not collision radii.
+RISK_SCREEN_DISTANCE_AU = {"earth": .01, "moon": .001}
+RISK_SCREEN_SIGMA = 3.0
+RISK_SAMPLE_STEP_DAYS = .125
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +95,45 @@ class ImpactPrediction:
     entry: ImpactPoint | None     # Earth: atmospheric entry
     surface: ImpactPoint
     uncertainty: ImpactUncertainty | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ImpactRisk:
+    """Monte Carlo impacts found around a non-impacting nominal close pass."""
+    body: str
+    closest_epoch_jd: float       # TDB, nominal trajectory
+    nominal_distance_au: float
+    position_sigma_au: float      # largest 1-sigma position axis at closest pass
+    clones: int
+    impacting: int
+    impact_epochs_jd: tuple[float, ...] = ()
+    # Fitted force parameters varied together with the state (e.g. ("A2",)).
+    sampled_forces: tuple[str, ...] = ()
+
+    @property
+    def probability(self) -> float:
+        return self.impacting / self.clones if self.clones else float("nan")
+
+    @property
+    def confidence_interval_95(self) -> tuple[float, float]:
+        """Wilson 95% interval for the sampled clone fraction."""
+        if self.clones <= 0:
+            return float("nan"), float("nan")
+        z = 1.959963984540054
+        probability = self.probability
+        denominator = 1.0 + z * z / self.clones
+        centre = (probability + z * z / (2.0 * self.clones)) / denominator
+        half_width = z / denominator * np.sqrt(
+            probability * (1.0 - probability) / self.clones
+            + z * z / (4.0 * self.clones * self.clones)
+        )
+        return max(0.0, centre - half_width), min(1.0, centre + half_width)
+
+    @property
+    def mean_impact_epoch_jd(self) -> float:
+        if not self.impact_epochs_jd:
+            return self.closest_epoch_jd
+        return float(np.mean(self.impact_epochs_jd))
 
 
 def _ecliptic_to_equatorial(vector: np.ndarray) -> np.ndarray:
@@ -272,21 +325,68 @@ def _ground_offsets_km(latitudes: np.ndarray, longitudes: np.ndarray, latitude0:
     return np.column_stack((east, north))
 
 
+STATE_PARAMETER_NAMES = ("x", "y", "z", "vx", "vy", "vz")
+
+
+def covariance_clone_sampler(
+    solution: OrbitSolution,
+) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]] | None:
+    """(mean, factor, names) to draw clones ``mean + factor @ N(0, 1)``.
+
+    The full fit covariance is used when the fit determined A1/A2/A3/DT
+    (``OrbitSolution.parameter_covariance``): the clones then also vary the
+    force law with its correlations to the state, which matters for a
+    Yarkovsky A2 or for comets.  Otherwise only the Cartesian state is varied.
+    ``None`` when the solution carries no usable covariance.
+    """
+    if solution.position_au is None or solution.velocity_au_per_day is None:
+        return None
+    names = tuple(solution.parameter_names or ())
+    matrix = None
+    if solution.parameter_covariance is not None and len(names) > 6:
+        candidate = np.asarray(solution.parameter_covariance, dtype=float)
+        if candidate.shape == (len(names), len(names)) and np.all(np.isfinite(candidate)):
+            matrix = candidate
+    if matrix is None:
+        if solution.state_covariance is None:
+            return None
+        matrix = np.asarray(solution.state_covariance, dtype=float)[:6, :6]
+        names = STATE_PARAMETER_NAMES
+        if matrix.shape != (6, 6) or not np.all(np.isfinite(matrix)):
+            return None
+    values, vectors = np.linalg.eigh(.5 * (matrix + matrix.T))
+    factor = vectors * np.sqrt(np.clip(values, 0.0, None))
+    forces = solution.nongravitational_parameters or {}
+    mean = np.concatenate((
+        np.asarray(solution.position_au, dtype=float),
+        np.asarray(solution.velocity_au_per_day, dtype=float),
+        [float(forces.get(name, 0.0)) for name in names[6:]],
+    ))
+    return mean, factor, names
+
+
+def clone_engine(
+    engine: NBodyIntegrator, solution: OrbitSolution, names: tuple[str, ...],
+    vector: np.ndarray,
+) -> NBodyIntegrator:
+    """The integrator for one clone: its own sampled A1/A2/A3/DT, if any."""
+    if len(names) <= 6:
+        return engine
+    forces = dict(solution.nongravitational_parameters or {})
+    forces.update({name: float(value) for name, value in zip(names[6:], vector[6:])})
+    return engine.with_parameters(forces)
+
+
 def impact_uncertainty(
     solution: OrbitSolution, engine: NBodyIntegrator, nominal: ImpactPrediction,
     *, seconds: float = MONTE_CARLO_SECONDS, seed: int = 20081007,
     cancel_callback=None,
 ) -> ImpactUncertainty | None:
-    """Monte Carlo spread of the impact from the fit covariance (state only)."""
-    covariance = solution.state_covariance
-    if covariance is None or solution.position_au is None or solution.velocity_au_per_day is None:
+    """Monte Carlo spread of the impact from the fit covariance (state and fitted forces)."""
+    sampler = covariance_clone_sampler(solution)
+    if sampler is None:
         return None
-    matrix = np.asarray(covariance, dtype=float)[:6, :6]
-    if matrix.shape != (6, 6) or not np.all(np.isfinite(matrix)):
-        return None
-    values, vectors = np.linalg.eigh(.5 * (matrix + matrix.T))
-    factor = vectors * np.sqrt(np.clip(values, 0.0, None))
-    mean = np.concatenate((solution.position_au, solution.velocity_au_per_day))
+    mean, factor, names = sampler
     rng = np.random.default_rng(seed)
     stop = nominal.surface.epoch_jd + (
         max(.1, abs(nominal.surface.epoch_jd - solution.epoch_jd) * .02)
@@ -302,11 +402,13 @@ def impact_uncertainty(
             break
         if cancel_callback is not None and cancel_callback():
             break
-        vector = mean + factor @ rng.standard_normal(6)
+        vector = mean + factor @ rng.standard_normal(len(mean))
         clones += 1
+        clone_model = clone_engine(engine, solution, names, vector)
         try:
             events, _last = _surface_events(
-                engine, StateVector(solution.epoch_jd, vector[:3], vector[3:]), nominal.body, stop,
+                clone_model, StateVector(solution.epoch_jd, vector[:3], vector[3:6]),
+                nominal.body, stop,
             )
         except (RuntimeError, ValueError, FloatingPointError, OverflowError):
             continue
@@ -315,7 +417,7 @@ def impact_uncertainty(
             continue
         epochs.append(surface_jd)
         if nominal.body == "earth":
-            point = _impact_point(engine, nominal.body, surface_jd, surface_state, 0.0)
+            point = _impact_point(clone_model, nominal.body, surface_jd, surface_state, 0.0)
             latitudes.append(float(point.latitude_deg))
             longitudes.append(float(point.longitude_deg))
     impacting = len(epochs)
@@ -336,6 +438,133 @@ def impact_uncertainty(
         major_axis_azimuth_deg=azimuth,
         time_sigma_s=float(np.std(epochs) * 86400.0) if impacting >= 2 else float("nan"),
         latitudes_deg=tuple(latitudes), longitudes_deg=tuple(longitudes),
+    )
+
+
+def close_approach_impact_risk(
+    solution: OrbitSolution, days: float,
+    *, seed: int = 20311001,
+    minimum_clones: int = RISK_MONTE_CARLO_MINIMUM,
+    maximum_clones: int = RISK_MONTE_CARLO_MAXIMUM,
+    cancel_callback=None,
+) -> ImpactRisk | None:
+    """Search Earth/Moon virtual impactors around a close nominal pass.
+
+    The nominal trajectory is sampled in the full N-body model.  Monte Carlo
+    is triggered when its closest distance is inside the fixed screening
+    corridor, or when the corridor plus three propagated formal position
+    sigmas reaches the nominal pass.  The returned probability is the direct
+    fraction of covariance clones that collide; it is an indicative screening
+    result, not an authoritative impact-monitoring solution.
+    """
+    from .orbit_evolution import _evolution_engine
+    from .orbit_engine import ImpactDetected
+
+    covariance = solution.state_covariance
+    if (
+        covariance is None or solution.position_au is None
+        or solution.velocity_au_per_day is None or days <= 0.0
+    ):
+        return None
+    matrix = np.asarray(covariance, dtype=float)[:6, :6]
+    if matrix.shape != (6, 6) or not np.all(np.isfinite(matrix)):
+        return None
+    matrix = .5 * (matrix + matrix.T)
+    end_jd = solution.epoch_jd + float(days)
+    engine = _evolution_engine(solution, solution.epoch_jd, end_jd)
+    model = engine.without_collision_detection()
+    initial = StateVector(
+        solution.epoch_jd, np.asarray(solution.position_au, dtype=float),
+        np.asarray(solution.velocity_au_per_day, dtype=float),
+    )
+    sample_count = max(2, int(np.ceil(days / RISK_SAMPLE_STEP_DAYS)) + 1)
+    sample_epochs = np.linspace(solution.epoch_jd, end_jd, sample_count)
+    states = model.propagate(initial, sample_epochs)
+    raw_candidates: list[tuple[str, float, float]] = []
+    for body in RISK_SCREEN_DISTANCE_AU:
+        index, _perturber_item = _perturber(model, body)
+        body_positions = np.stack([
+            model._planet_positions(float(epoch))[index]  # noqa: SLF001
+            for epoch in sample_epochs
+        ])
+        distances = np.linalg.norm(states[:, :3] - body_positions, axis=1)
+        closest_index = int(np.argmin(distances))
+        raw_candidates.append((
+            body, float(sample_epochs[closest_index]),
+            float(distances[closest_index]),
+        ))
+
+    closest_epochs = np.asarray([item[1] for item in raw_candidates], dtype=float)
+    _states, partials = model.propagate_with_partials(initial, closest_epochs)
+    encounters: dict[str, tuple[float, float, float]] = {}
+    candidates: set[str] = set()
+    for (body, epoch_jd, distance_au), partial in zip(raw_candidates, partials):
+        transition = partial[:, :6]
+        propagated = transition @ matrix @ transition.T
+        position_covariance = .5 * (propagated[:3, :3] + propagated[:3, :3].T)
+        position_sigma = float(np.sqrt(max(
+            0.0, float(np.max(np.linalg.eigvalsh(position_covariance))),
+        )))
+        encounters[body] = (epoch_jd, distance_au, position_sigma)
+        trigger = RISK_SCREEN_DISTANCE_AU[body] + RISK_SCREEN_SIGMA * position_sigma
+        if distance_au <= trigger:
+            candidates.add(body)
+    if not candidates:
+        return None
+
+    sampler = covariance_clone_sampler(solution)
+    if sampler is None:
+        return None
+    mean, factor, names = sampler
+    rng = np.random.default_rng(seed)
+    stop_jd = min(end_jd, max(encounters[body][0] for body in candidates) + 5.0)
+    # A geocentric close pass can exchange the Earth and Moon as the actual
+    # impactor target across nearby clones, so record both once either body
+    # has triggered the expensive scan.
+    impacts: dict[str, list[float]] = {
+        body: [] for body in RISK_SCREEN_DISTANCE_AU
+    }
+    maximum_clones = max(1, int(maximum_clones))
+    minimum_clones = min(maximum_clones, max(1, int(minimum_clones)))
+    clones = 0
+    attempts = 0
+    while clones < maximum_clones and attempts < 2 * maximum_clones:
+        if cancel_callback is not None and cancel_callback():
+            return None
+        batch_end = min(maximum_clones, clones + RISK_MONTE_CARLO_BATCH)
+        while clones < batch_end and attempts < 2 * maximum_clones:
+            if cancel_callback is not None and cancel_callback():
+                return None
+            attempts += 1
+            vector = mean + factor @ rng.standard_normal(len(mean))
+            clone = StateVector(solution.epoch_jd, vector[:3], vector[3:6])
+            try:
+                clone_engine(engine, solution, names, vector).propagate(clone, np.array([stop_jd]))
+            except ImpactDetected as hit:
+                if hit.body in impacts:
+                    impacts[hit.body].append(float(hit.epoch_jd))
+            except (RuntimeError, ValueError, FloatingPointError, OverflowError):
+                continue
+            clones += 1
+        if (
+            clones >= minimum_clones
+            and sum(len(items) for items in impacts.values())
+            >= RISK_MONTE_CARLO_TARGET_IMPACTS
+        ):
+            break
+    if not clones:
+        return None
+    body = max(impacts, key=lambda name: len(impacts[name]))
+    if not impacts[body]:
+        return None
+    closest_epoch, nominal_distance, position_sigma = encounters[body]
+    return ImpactRisk(
+        body=body, closest_epoch_jd=closest_epoch,
+        nominal_distance_au=nominal_distance,
+        position_sigma_au=position_sigma,
+        clones=clones, impacting=len(impacts[body]),
+        impact_epochs_jd=tuple(impacts[body]),
+        sampled_forces=tuple(names[6:]),
     )
 
 
@@ -422,3 +651,43 @@ def describe_impact(prediction: ImpactPrediction, body_label: str) -> str:
                 uncertainty.major_axis_azimuth_deg, uncertainty.time_sigma_s,
             ))
     return "\n".join(lines)
+
+
+def describe_impact_risk(risk: ImpactRisk, body_label: str) -> str:
+    """Human-readable summary of virtual impactors near a nominal flyby."""
+    closest = tdb_to_utc(risk.closest_epoch_jd)
+    closest_text = (
+        closest.strftime("%Y-%m-%d %H:%M UTC")
+        if closest is not None else f"JD {risk.closest_epoch_jd:.6f} TDB"
+    )
+    mean_impact = tdb_to_utc(risk.mean_impact_epoch_jd)
+    impact_text = (
+        mean_impact.strftime("%Y-%m-%d %H:%M UTC")
+        if mean_impact is not None else f"JD {risk.mean_impact_epoch_jd:.6f} TDB"
+    )
+    ratio = risk.clones / risk.impacting
+    interval_low, interval_high = risk.confidence_interval_95
+    return "\n".join((
+        tr("Nenulové riziko dopadu na těleso {0}", body_label),
+        tr(
+            "Nominální průlet: {0}; vzdálenost {1:.0f} km; největší formální "
+            "polohová nejistota 1σ {2:.0f} km.",
+            closest_text, risk.nominal_distance_au * AU_KM,
+            risk.position_sigma_au * AU_KM,
+        ),
+        tr(
+            "Monte Carlo blízkého průletu: {0} z {1} klonů dopadá ({2:.3%}, "
+            "95% interval {3:.3%}–{4:.3%}, přibližně 1:{5:.0f}); střed času "
+            "dopadů {6}.",
+            risk.impacting, risk.clones, risk.probability,
+            interval_low, interval_high, ratio, impact_text,
+        ),
+        tr(
+            "Klony mění stav dráhy i fitované negravitační parametry ({0}).",
+            ", ".join(risk.sampled_forces),
+        ) if risk.sampled_forces else tr("Klony mění stav dráhy."),
+        tr(
+            "Jde o orientační screening z formální kovariance fitu, nikoli o "
+            "autoritativní hodnocení rizika.",
+        ),
+    ))

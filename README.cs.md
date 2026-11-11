@@ -38,6 +38,12 @@ společně s drahami planet a jejich aktuálními polohami:
   dotazu do MPC; tlačítko **Aktualizovat astrometrii z MPC** stáhne aktuální
   data včetně nových pozorování a cache přepíše (objekty z NEOCP/PCCP se
   kvůli rychlým změnám neukládají);
+- u komet služba MPC pro pozorování vynechává měření rozpadlé komety označená
+  písmenem fragmentu (205P: 680 z 2016 řádků); program proto po ní načte
+  textový výpis objektu z webu MPC (stránka `show_object` a její soubor
+  `tmp2/…txt`) a přidá z něj měření fragmentů A, B, C …, přičemž řádky ADES
+  si ponechají své nejistoty; bez webu MPC se použijí jen řádky ze služby;
+  komety uložené v cache dříve se jednou stáhnou znovu;
 - import pozorování ze souboru a vložení ze schránky ve formátu MPC 80-column;
 - krátké oblouky těles velmi blízko Země (až několik zemských poloměrů, např.
   2008 TC3 hodinu a 2024 BX1 minuty před dopadem): předběžné hledání
@@ -46,6 +52,10 @@ společně s drahami planet a jejich aktuálními polohami:
   trajektorie procházející planetou se odmítne jako srážka; u 2024 BX1
   souhlasí předpovězený vstup (00:32:37 UTC, 15,20 km/s, 75,6°) s pozorovaným
   bolidem;
+- dlouhé oblouky dočasně zachycených družic Země (například J002E3) se nejprve
+  určí z prvního hustého lokálního úseku a potom se rozšiřují po krocích bez
+  ztráty fáze; fit zahrnuje zploštění Země J2 a prověří konstantní radiální
+  tlak slunečního záření A1/r² vhodný pro prázdný raketový stupeň;
 - podpora družicových pozorování a topocentrické paralaxy podle kódu stanice MPC;
 - vlastní šestiparametrový fit kartézského stavu s planetárními perturbacemi;
 - rychlý fit velkých souborů z časově i početně reprezentativního vzorku;
@@ -57,10 +67,11 @@ společně s drahami planet a jejich aktuálními polohami:
 - import historických 80sloupcových záznamů s nižší přesností (RA na celé
   sekundy či minuty, Dec na desetiny minuty); jejich nejistota nikdy není
   menší než polovina posledního publikovaného řádu;
-- individuální nejistoty ADES (s dolní mezí 0,3″ kvůli katalogovým a
-  časovým systematikám); u měření bez nich výchozí nejistota podle
-  techniky (mikrometr 3″, fotografická deska 1,5–2,5″, CCD 1–2″, jinak podle
-  epochy); série jedné stanice z jedné místní noci se převáží pravidlem
+- úplná kovariance každého měření ADES: `rmsRA`, `rmsDec` a `rmsCorr`, přičemž
+  `rmsTime`/`uncTime` se promítne podél změřeného pohybu po obloze; nejistota
+  má nadále dolní mez 0,3″ kvůli neuvedeným systematikám; u měření bez RMS
+  z ADES se použijí výchozí hodnoty podle techniky, epochy a běžných stanic
+  podle Vereše et al. (2017); série jedné stanice z jedné místní noci se převáží pravidlem
   `sqrt(N/4)` podle Vereše et al. (2017), aby stovky snímků nepředstíraly
   stovky nezávislých absolutních poloh;
 - duplicitní redukce téhož měření (MPC je často uvádí vůči více hvězdným
@@ -79,7 +90,31 @@ společně s drahami planet a jejich aktuálními polohami:
 - neoznačená druhá stopa, kterou jedna stanice změřila na stejných snímcích
   (fragment nebo jiný objekt, např. ZTF u 205P v roce 2021, 65″ od komety), se
   rozpozná i tehdy, když dráhu stáhla mezi obě stopy, a vyřadí se jako
-  souvislá vedlejší stopa;
+  souvislá vedlejší stopa (i když vážená stopa nejdřív přišla o několik
+  měření jako izolovaná odlehlá); stejně se vyřadí celý kompaktní tracklet
+  `trkSub` nebo stanice/noc, který je silně neslučitelný alespoň se šesti dobře
+  fitovanými nezávislými měřeními; důvod je viditelný a bezpečnostní limit je
+  15 % všech měření;
+- nad tabulkou pozorování upozorní pruh na rozpadlou kometu: složky, období
+  pozorování, počet nocí a medián odstupu od hlavní složky na společných
+  snímcích; **Přehled fragmentů…** ukáže složky i s jejich vlastními drahami.
+  Nalezenou neoznačenou stopu lze udělat samostatnou složkou (**Vyčlenit stopu
+  jako úlomek**, označení X1, X2…). Vedlejší složka se fituje od dráhy hlavní
+  (při oblouku kratším než rok čistě gravitačně). Po každém fitu složky se
+  neoznačená měření po rozpadu poblíž měření vedlejší složky přiřadí té
+  složce, jejíž dráze odpovídají (do 3″ a třikrát blíž než ke druhé); měření,
+  na která sedí obě dráhy stejně, zůstanou hlavní složce;
+- **Odhadnout čas rozpadu…** určí okamžik oddělení každé vedlejší složky
+  s vlastní drahou od hlavní třemi modely – Sekaninův rozpad s rozdílným
+  radiálním zrychlením (∝ r⁻²), impulz rychlosti oddělení Δv (R/T/N) a oba
+  současně – hledá až 1,6 oběžné doby zpět a uvede okamžik s nejistotou,
+  heliocentrickou vzdálenost, Δv/ΔA1, konkurenční řešení a varování pro
+  nefyzikální rychlost (> 10 m/s), nadměrné rozdílné zrychlení nebo minimum
+  na starším okraji intervalu (okamžik neurčen); minimum těsně před prvním
+  měřením fragmentu je platný výsledek – čerstvý fragment – a tak se i uvede.
+  Krátký oblouk fragmentu často připouští více okamžiků; výsledek je orientační;
+- ostatní složky s vlastní drahou se kreslí jako průvodci (růžově) v pohledech
+  Sluneční soustava a Pohled ze Země; pohled ze Země nabízí i pole 0,25°, 1° a 5°;
 - časy před rokem 1960 jsou světový čas UT a na TT se převádějí podle ΔT
   z rekonstrukce rotace Země (Espenak & Meeus), ne pevným posunem 32,184 s;
 - navazování vzdálených návratů pro jakékoli těleso (periodické komety,
@@ -103,15 +138,28 @@ společně s drahami planet a jejich aktuálními polohami:
   požadované A1/A2 se fitují, jakmile oblouk pokrývá celý oběh (dvě perihelia),
   ostatní požadované parametry v závěrečném společném řešení; takto se např. 206P/Barnard–Boattini (1892
   a 2008, 20 oběhů a tři přiblížení k Jupiteru) naváže i bez katalogové dráhy;
-- dvě volby navazování ve **Vlastním nastavení…**: *zvlášť negravitační
-  parametry pro historické návraty* fitují vlastní A1H/A2H/A3H před středem
-  nejdelší mezery v pozorováních a A1–A3 po něm (kometa, jejíž aktivita se
-  změnila, zatímco byla ztracená; 205P: 1896 a 2008–2021); *připojit návrat i
-  nad limitem kvality* přijme návrat až do 15σ, pokud ostatní návraty zůstanou
-  v mezích napětí modelu – pro vizuální či fotografickou historickou
-  astrometrii – a vždy ho vykáže jako napětí modelu; u 205P obě volby společně
-  připojí rok 1896 k letům 2008–2021 (1896 14″/4,7σ s A1H/A2H, 31″/10σ
-  s jedním silovým modelem);
+- volby navazování ve **Vlastním nastavení…**: *zvlášť negravitační
+  parametry pro historické návraty* fitují vlastní A1H/A2H/A3H před okamžikem
+  přepnutí a A1–A3 po něm (kometa, jejíž aktivita se změnila, zatímco byla
+  ztracená; 205P: 1896 a 2008–2021); výchozí přepnutí je ve středu nejdelší
+  mezery v pozorováních a lze ho zadat jako libovolný rok uvnitř mezery –
+  nejlépe okamžik změny aktivity, např. rozpad daleko od Slunce; více let
+  oddělených čárkou dá až čtyři období sil (A1–A3, A1H–A3H, A1H2–A3H2,
+  A1H3–A3H3), každé fitované ze svých návratů (78P s přepnutím v letech 1993
+  a 2008, kolem průletu u Jupiteru 1995: RMS 1,16″ proti 1,42″ se dvěma obdobími a 2,04″ s jednou sadou; příčné A2 tří období, −0,66, −1,28 a −1,13·10⁻⁹ AU/den², odpovídá Kinoshitovým −0,43, −1,26 a −1,23); *připojit
+  návrat i nad limitem kvality* přijme návrat až do 15σ, pokud ostatní návraty
+  zůstanou v mezích napětí modelu, a vždy ho vykáže jako napětí modelu;
+  *zvětšit nejistotu měření pořízených před rokem* násobí σ staré mikrometrické
+  a fotografické astrometrie, jejíž soustavné chyby (katalog, měřítko desky,
+  pozorovatel) se průměrováním nezmenší;
+  u 205P (s JPL DE440, A1+A2 a A1H/A2H přepnutými koncem roku 1998, kdy se
+  oddělil úlomek C) se napojí všechny čtyři návraty bez volby napojení nad
+  limitem: 1896 na 9,5″/3,1σ, se 3× větší nejistotou před rokem 1950 na
+  12,8″/1,4σ, 2008–2021 na 1,0–1,9″; historické A2H (+2,8·10⁻¹⁰) má opačné
+  znaménko než dnešní A2 (−3,6·10⁻¹⁰);
+- fit oblouku delšího než 10 let bez JPL DE440 před spuštěním i ve výsledku
+  varuje: s analytickým modelem planet může být napojení přes těsná setkání
+  s Jupiterem zcela chybné (206P, 1892–2008: 8″ s DE440, 14 000″ bez něj);
 - integrace oblouků delších než dva roky používá přesnou toleranci
   (`rtol = 1e-12`); přes staletí a těsná setkání s Jupiterem by volnější
   tolerance vnesla chybu stovek obloukových vteřin;
@@ -121,10 +169,19 @@ společně s drahami planet a jejich aktuálními polohami:
 - volitelný fit negravitačních parametrů A1, A2 a A3 pro libovolné těleso:
   Marsdenův vodní model s volitelným časovým posunem aktivity DT pro komety,
   nebo mocninný model `g(r) = r^-m` (výchozí `m = 2`) pro tlak záření a
-  Yarkovského A2 u planetek; označení tělesa funkci neomezuje;
+  Yarkovského A2 u planetek; označení tělesa funkci neomezuje; pokud uživatel
+  silový model nezvolil, fit konzervativně prověří A1 (u dostatečně dlouhého
+  oblouku komety A1+A2), případně planetkové A2/r² na oblouku delším než dva
+  roky, ale přijme je jen tehdy, když má každý nový parametr významnost
+  alespoň 3σ a zlepšení je ΔBIC > 10;
 - nejistoty elementů a základní diagnostika fitu; při singulární nebo extrémně
   špatně podmíněné normální matici se nejistota raději neuvede, než aby
-  pseudoinverze vytvořila falešně přesné číslo.
+  pseudoinverze vytvořila falešně přesné číslo;
+- u planetek výpis elementů uvádí průměr odpovídající H,
+  D = 1329 km / √p_V · 10^(−H/5), pro obvyklý rozsah albeda 0,25 (světlý typ S)
+  až 0,05 (tmavý typ C) a krajní meze 0,50–0,03; u komet se neuvádí (H/M aktivní
+  komety měří komu) ani tehdy, když je H jen zástupná hodnota (bez katalogového
+  H a bez fotometrie);
 
 ### Elementy a efemerida
 
@@ -152,8 +209,11 @@ společně s drahami planet a jejich aktuálními polohami:
 
 ### Vizualizace
 
-- interaktivní heliocentrický pohled na Sluneční soustavu s otáčením a plynulým
-  logaritmickým přiblížením;
+- interaktivní pohled na Sluneční soustavu s otáčením, plynulým logaritmickým
+  přiblížením a volitelným středem na Slunci, planetě nebo fitovaném tělese;
+  geocentrický detail zobrazuje Měsíc na efemeridové dráze odpovídající
+  zvolenému datu a smyčky zjištěných dočasných zachycení se znovu integrují
+  jemným krokem, takže zůstávají hladké i v dlouhém vývoji;
 - oskulační křivka tělesa se odvozuje z N-body stavu aktuálního snímku, takže
   animovaný bod neleží mimo starou křivku z epochy původního fitu;
 - volitelná průsvitná projekční plocha dráhy k rovině ekliptiky pro názorné
@@ -173,10 +233,23 @@ společně s drahami planet a jejich aktuálními polohami:
   na její pokrytí a integrace delší než 1000 let vyžaduje potvrzení;
 - tabulka oskulačních elementů v jednotlivých perihelových průchodech, označených
   přímo rokem návratu;
+- volitelný **rozptyl klonů** (standardně vypnutý, 5–500 klonů): klony
+  z kovariance vlastního fitu – stav dráhy i fitované A1/A2/A3/DT – se integrují
+  přes stejný interval a v grafu se kreslí jako slabé křivky s pásmem 5–95 %;
+  TXT přehled uvádí rozptyl q, e a P u každého návratu. Ukazuje, jak velkou
+  část předpovědi určují pozorování, ale jen v rámci zvoleného silového
+  modelu: u 78P zůstane 30 klonů v rozmezí q 5,051–5,057 AU i po průletech
+  kolem Jupiteru v letech 2029 (0,018 AU) a 2046, zatímco řešení s jiným
+  negravitačním modelem (Kinoshita) skončí jinde – tam rozhoduje volba
+  modelu, ne astrometrie. Každý klon je jedna další úplná integrace (asi 5 s
+  na 125 let);
 - hledání přiblížení k planetám, vzdálenost v AU a Hillových poloměrech,
   relativní rychlost a orientační změna `1/a`;
 - automatická detekce planetocentrického zachycení podle záporné relativní
   orbitální energie uvnitř Hillovy sféry;
+- těsné průlety kolem Měsíce se vypisují odděleně od setkání se Zemí; gravitace
+  Měsíce je zahrnuta po celou integraci, takže se v dráze zachová i měsíční
+  postrčení měnící dočasné zachycení nebo únik;
 - přepínatelný graf průběžného vývoje `q`, `a`, `e`, periody, `1/a`, sklonu,
   uzlu nebo argumentu perihelu na lineární časové ose; změny při setkáních se
   projeví v okamžiku setkání a setkání jsou v grafu vyznačena;
@@ -208,6 +281,15 @@ společně s drahami planet a jejich aktuálními polohami:
   bod na povrchu pro vakuovou dráhu (WGS84), s nejistotou Monte Carlo z
   kovariance fitu (podíl dopadajících klonů, elipsa 1σ na zemi, čas); u
   2008 TC3 souhlasí vstup s předpovědí JPL do 1 s a 1,4 km;
+- těsný nominální průlet kolem Země nebo Měsíce spustí také Monte Carlo
+  screening virtuálních impaktorů z formální kovariance fitu, i když nominální
+  dráha mine; použije pevný počet 2 500 klonů s pevným
+  semínkem (stejný výsledek na každém počítači; riziko zhruba 1:800 a vyšší se
+  najde spolehlivě, vzácnější nemusí zasáhnout žádný klon) a uvede Wilsonův
+  95% interval; pokud fit určil A1/A2/A3/DT (např. Yarkovského A2), klony je
+  mění také, i s jejich korelacemi se stavem dráhy. Nenulový
+  výsledek je výslovně označen jako orientační a vyžaduje ověření
+  autoritativním systémem sledování dopadového rizika;
 - planetocentrické elementy během zachycení planetou;
   volitelný lokální planetocentrický pohled pro zachycené objekty; lunární
   perturbace jsou zahrnuty (z DE440, nebo přibližným modelem bez něj).
@@ -324,17 +406,25 @@ aplikací nutné porovnat s MPC, JPL Horizons nebo jiným nezávislým softwarem
   kliknutím stáhnout a aktivovat JPL DE440 (přibližně 114 MB, 1549–2650).
   Výpočty mimo pokrytí aktivního kernelu program odmítne místo tichého přechodu
   na méně přesný model.
-- Samostatný Měsíc i první postnewtonovská (Schwarzschildova) korekce Slunce
-  jsou zahrnuty. Úplný EIH/PPN model a perturbace 16 hmotných planetek z
-  `sb441-n16.bsp` zatím zahrnuty nejsou; tento přibližně 650MB asteroidový
-  kernel vyžaduje čtečku SPK typu používaného SB441, kterou současná knihovna
-  `jplephem` neposkytuje.
+- Samostatný Měsíc, zploštění Země J2 pro blízké geocentrické dráhy i první
+  postnewtonovská (Schwarzschildova) korekce Slunce jsou zahrnuty. Šestnáct
+  hmotných planetek se přidá automaticky, je-li nainstalován volitelný
+  [ASSIST](https://github.com/matthewholman/assist) a JPL kernel
+  [`sb441-n16.bsp`](https://ssd.jpl.nasa.gov/ftp/eph/small_bodies/asteroids_de441/sb441-n16.bsp)
+  leží vedle `de440.bsp` v `orbit-data` (nebo `ORBIT_SOLVER_DATA_DIR`). Adaptér
+  se instaluje příkazem `pip install assist rebound`; Windows může do vydání
+  vhodných wheels vyžadovat WSL2. ASSIST má licenci GPL-3.0 a zůstává
+  nepřibalenou volitelnou součástí. Úplný EIH/PPN model zatím implementován není.
 - Navazování návratů předpokládá jeden společný silový model. Návrat, který
   společné řešení nepotvrdí, program výslovně označí a zobrazí jen jako
   předpověď; to samo o sobě identitu návratů nevyvrací.
-- Systematické chyby hvězdných katalogů (debiasing podle Farnocchii et al.)
-  zatím korigovány nejsou; u historických měření se projevují jako rozdíly
-  mezi stanicemi v řádu obloukových vteřin.
+- Zónový debiasing a oprava vlastních pohybů katalogů podle Eggla et al. (2020)
+  se aktivuje, pokud se soubor `bias.dat` z oficiálního archivu JPL
+  [`debias_2018.tgz`](https://ssd.jpl.nasa.gov/ftp/eph/small_bodies/asteroids_debias/debias_2018.tgz)
+  uloží jako
+  `orbit-data/debias_2018/bias.dat` (nebo pod `ORBIT_SOLVER_DATA_DIR`). Tabulka
+  se záměrně nepřibaluje; bez ní se fit nemění a žádnou opravu debiasingu
+  nehlásí.
 - Konstantní A1/A2/A3/DT při integraci komety přes mnoho návratů jsou modelový
   předpoklad; skutečná negravitační aktivita komety se může mezi návraty měnit.
   DT je vhodné uvolnit až pro dlouhý oblouk, protože na jednom krátkém zjevení

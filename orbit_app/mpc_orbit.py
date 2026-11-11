@@ -226,6 +226,7 @@ def parse_mpc_orbit(body: object, designation: str) -> OrbitSolution:
         arg_peri_deg=elements[4],
         mean_anomaly_deg=elements[5],
         absolute_magnitude=float(h_value) if h_value is not None else 18.0,
+        absolute_magnitude_known=h_value is not None,
         slope_g=float(g_value) if g_value is not None else 0.15,
         photometric_exponent=4.0 if comet else 2.0,
         phase_correction=not comet,

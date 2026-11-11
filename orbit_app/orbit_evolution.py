@@ -10,7 +10,10 @@ from scipy.optimize import minimize_scalar
 
 from .domain import OrbitSolution, is_comet_designation
 from .i18n import tr
-from .impact import ImpactPrediction, describe_impact, impact_uncertainty, locate_impact
+from .impact import (
+    ImpactPrediction, clone_engine, covariance_clone_sampler, describe_impact,
+    impact_uncertainty, locate_impact,
+)
 from .mpc_orbit import cartesian_to_elements
 from .orbit_engine import (
     AU_KM, DEFAULT_PERTURBERS, MU_SUN, ImpactDetected, NBodyIntegrator, StateVector,
@@ -27,6 +30,10 @@ JULIAN_YEAR_DAYS = 365.25
 HILL_RADII_AU = {
     "mercury": .00147, "venus": .00671, "earth": .00980, "mars": .00658,
     "jupiter": .355, "saturn": .436, "uranus": .468, "neptune": .769,
+    # Lunar Hill sphere with respect to the Earth (about 61 000 km).  The
+    # Moon was always a force-model perturber; including it here additionally
+    # records close lunar flybys in evolution reports and plots.
+    "moon": .000408,
 }
 PLANET_LABELS = {
     "mercury": tr("Merkur"), "venus": tr("Venuše"), "earth": tr("Země"), "mars": "Mars",
@@ -208,7 +215,7 @@ def format_evolution_report(
         "",
         tr("Chronologický přehled (elementy jsou oskulační v uvedené epoše)"),
         tr(
-            "Typ\tDatum UTC\tFáze / návrat / planeta\tq [AU]\te\ta [AU]\tP [roky]\t1/a "
+            "Typ\tDatum UTC\tFáze / návrat / těleso\tq [AU]\te\ta [AU]\tP [roky]\t1/a "
             "[AU^-1]\ti [deg]\tOmega [deg]\tomega [deg]\tVzdálenost [AU]\tHillovy "
             "poloměry\tv rel. [km/s]\tDelta(1/a) [AU^-1]\tv_inf [km/s]\tDelta T\t"
             "Delta MOID [AU]",
@@ -236,7 +243,7 @@ def format_evolution_report(
                 tr(
                     "SETKÁNÍ\t{0}\t{1}\t\t\t\t\t\t\t\t\t{2:.9f}\t{3:.6f}\t{4:.5f}\t{5}",
                     _format_jd_utc(item.epoch_jd),
-                    PLANET_LABELS.get(item.planet, item.planet),
+                    BODY_LABELS.get(item.planet, item.planet),
                     item.distance_au,
                     item.hill_radii,
                     item.relative_velocity_kms,
@@ -249,7 +256,7 @@ def format_evolution_report(
                 ))
             )
     if not events:
-        lines.append(tr("Žádné perihelové průchody ani planetární setkání nebyly nalezeny."))
+        lines.append(tr("Žádné perihelové průchody ani setkání s planetou či Měsícem nebyly nalezeny."))
     if result.captures:
         lines.extend(("", tr("Dočasná planetocentrická zachycení")))
         for capture in result.captures:
@@ -258,7 +265,7 @@ def format_evolution_report(
                     "ZACHYCENÍ\t{0}\t{1}\t{2}\tminimum {3:.9f} AU\t{4:.5f} Hillova poloměru",
                     _format_jd_utc(capture.start_jd),
                     _format_jd_utc(capture.end_jd),
-                    PLANET_LABELS.get(capture.planet, capture.planet),
+                    BODY_LABELS.get(capture.planet, capture.planet),
                     capture.minimum_distance_au,
                     capture.minimum_hill_radii,
                 )
@@ -346,7 +353,7 @@ def format_evolution_mpc_report(
             _format_jd_utc(result.end_jd),
         ),
         tr("# Elementy jsou oskulační v okamžiku příslušného perihelu."),
-        tr("# Řádky začínající # jsou komentáře a planetární setkání."),
+        tr("# Řádky začínající # jsou komentáře a setkání s planetami či Měsícem."),
         f"# {result.model_note}",
     ]
     events: list[tuple[float, int, EvolutionReturn | EvolutionSnapshot | PlanetEncounter]] = []
@@ -387,7 +394,7 @@ def format_evolution_mpc_report(
                     "# SETKÁNÍ {0} UTC — {1}; d={2:.6f} AU = {3:.3f} Hillova poloměru; "
                     "v_rel={4:.2f} km/s; Delta(1/a)={5}",
                     _format_jd_utc(item.epoch_jd),
-                    PLANET_LABELS.get(item.planet, item.planet),
+                    BODY_LABELS.get(item.planet, item.planet),
                     item.distance_au,
                     item.hill_radii,
                     item.relative_velocity_kms,
@@ -404,7 +411,7 @@ def format_evolution_mpc_report(
             tr(
                 "# ZACHYCENÍ {0}: {1} až {2} UTC; minimum={3:.6f} AU ({4:.3f} Hillova "
                 "poloměru)",
-                PLANET_LABELS.get(capture.planet, capture.planet),
+                BODY_LABELS.get(capture.planet, capture.planet),
                 _format_jd_utc(capture.start_jd),
                 _format_jd_utc(capture.end_jd),
                 capture.minimum_distance_au,
@@ -563,38 +570,133 @@ def _states_near_samples(
     return output
 
 
-def _closest_approach_time(
-    engine: NBodyIntegrator, epochs: np.ndarray, states: np.ndarray,
-    distances: np.ndarray, index: int, planet: str,
-) -> float:
-    """Epoch (TDB) of minimum distance to ``planet`` around sample ``index``.
+CAPTURE_TRAJECTORY_STEP_DAYS = .125
+MAXIMUM_REFINED_CAPTURE_POINTS = 12001
 
-    The sampled distances only bracket the encounter: a flyby lasting hours
-    is far shorter than the sample step, so a parabola through three samples
-    can miss the minimum by a large margin.  A bounded 1-D search with
-    integrations from the bracketing sample gives the actual minimum.
+
+def _refine_capture_trajectory(
+    engine: NBodyIntegrator, epochs: np.ndarray, states: np.ndarray,
+    captures: list[CaptureInterval] | tuple[CaptureInterval, ...],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Add N-body states at three-hour cadence inside captured intervals."""
+    if not captures or len(epochs) < 2:
+        return np.asarray(epochs, dtype=float), np.asarray(states, dtype=float)
+
+    sample_step = float(np.median(np.diff(epochs)))
+    extra_epochs: list[np.ndarray] = []
+    extra_states: list[np.ndarray] = []
+    remaining = MAXIMUM_REFINED_CAPTURE_POINTS
+    per_capture_limit = max(2, MAXIMUM_REFINED_CAPTURE_POINTS // len(captures))
+    for capture in sorted(captures, key=lambda item: item.start_jd):
+        if remaining < 2:
+            break
+        start = max(float(epochs[0]), capture.start_jd - sample_step)
+        end = min(float(epochs[-1]), capture.end_jd + sample_step)
+        if end <= start:
+            continue
+        requested = int(np.ceil((end - start) / CAPTURE_TRAJECTORY_STEP_DAYS)) + 1
+        count = min(max(2, requested), per_capture_limit, remaining)
+        targets = np.linspace(start, end, count)
+        start_index = max(0, int(np.searchsorted(epochs, start, side="right")) - 1)
+        initial = StateVector(
+            float(epochs[start_index]), states[start_index, :3], states[start_index, 3:],
+        )
+        refined = engine.propagate(initial, targets)
+        extra_epochs.append(targets)
+        extra_states.append(refined)
+        remaining -= count
+
+    if not extra_epochs:
+        return np.asarray(epochs, dtype=float), np.asarray(states, dtype=float)
+    merged_epochs = np.concatenate((np.asarray(epochs, dtype=float), *extra_epochs))
+    merged_states = np.vstack((np.asarray(states, dtype=float), *extra_states))
+    order = np.argsort(merged_epochs, kind="stable")
+    merged_epochs = merged_epochs[order]
+    merged_states = merged_states[order]
+    unique = np.concatenate((
+        np.array([True]), np.diff(merged_epochs) > 1e-10,
+    ))
+    return merged_epochs[unique], merged_states[unique]
+
+
+def _closest_approach_between(
+    engine: NBodyIntegrator, epochs: np.ndarray, states: np.ndarray,
+    left: int, right: int, planet: str, distances: np.ndarray | None = None,
+) -> float:
+    """Epoch (TDB) of minimum distance to ``planet`` in a sample interval.
+
+    The state at ``left`` starts a bounded one-dimensional search.  This also
+    handles a lunar flyby that falls completely between two daily samples and
+    therefore has no sampled local minimum below the screening distance.
     """
-    if index <= 0 or index >= len(epochs) - 1:
-        return float(epochs[index])
-    start = StateVector(float(epochs[index - 1]), states[index - 1, :3], states[index - 1, 3:])
+    left = max(0, int(left))
+    right = min(len(epochs) - 1, int(right))
+    if right <= left:
+        return float(epochs[left])
+    start = StateVector(float(epochs[left]), states[left, :3], states[left, 3:])
 
     def distance(epoch: float) -> float:
         try:
             state = engine.propagate(start, np.array([epoch]))[0]
         except ImpactDetected:
             return 0.0
+        except (RuntimeError, ValueError, FloatingPointError, OverflowError):
+            return float("inf")
         return float(np.linalg.norm(state[:3] - PLANETS.position(planet, epoch)))
 
+    # Best sampled epoch of the interval: the fallback, and the bar the
+    # search has to beat (a bounded search over an interval with several
+    # minima may settle in a worse one).
+    if distances is not None:
+        sampled = left + int(np.argmin(distances[left:right + 1]))
+        sampled_distance = float(distances[sampled])
+    else:
+        sampled, sampled_distance = left, float("inf")
+    # Search in days from the interval start: SciPy's bounded search also
+    # stops at a relative tolerance √ε·|x|, which for a Julian date (~2.46e6)
+    # is ~0.04 day – far too coarse for a flyby lasting minutes.
+    origin = float(epochs[left])
     try:
         result = minimize_scalar(
-            distance, bounds=(float(epochs[index - 1]), float(epochs[index + 1])),
-            method="bounded", options={"xatol": 1e-6},
+            lambda offset: distance(origin + offset),
+            bounds=(0.0, float(epochs[right]) - origin),
+            method="bounded", options={"xatol": 1e-7},
         )
-    except (RuntimeError, ValueError, FloatingPointError):
+    except (RuntimeError, ValueError, FloatingPointError, OverflowError):
+        return float(epochs[sampled])
+    if not np.isfinite(result.x) or not np.isfinite(result.fun) or (
+        result.fun > sampled_distance * (1.0 + 1e-9)
+    ):
+        return float(epochs[sampled])
+    return origin + float(result.x)
+
+
+def _closest_approach_time(
+    engine: NBodyIntegrator, epochs: np.ndarray, states: np.ndarray,
+    distances: np.ndarray, index: int, planet: str,
+) -> float:
+    """Epoch (TDB) of minimum distance around sampled local minimum ``index``."""
+    if index <= 0 or index >= len(epochs) - 1:
+        return float(epochs[index])
+    epoch = _closest_approach_between(
+        engine, epochs, states, index - 1, index + 1, planet,
+    )
+    # A search that failed or ended above the sampled minimum: the parabola
+    # through the three samples is the better estimate.
+    if not np.isfinite(epoch) or epoch == float(epochs[index - 1]):
         return _parabolic_vertex_time(epochs, distances, index)
-    if not np.isfinite(result.x) or result.fun > float(distances[index]) * (1.0 + 1e-9):
-        return _parabolic_vertex_time(epochs, distances, index)
-    return float(result.x)
+    return epoch
+
+
+def _merge_sample_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge overlapping sample-index intervals deterministically."""
+    merged: list[list[int]] = []
+    for left, right in sorted(intervals):
+        if merged and left <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], right)
+        else:
+            merged.append([left, right])
+    return [(left, right) for left, right in merged]
 
 
 def perihelion_returns_between(
@@ -646,7 +748,7 @@ def calculate_orbit_evolution_between(
     solution: OrbitSolution, start_jd: float, end_jd: float,
     *, maximum_samples: int = 80001, include_encounters: bool = True,
 ) -> EvolutionResult:
-    """Integrate once and extract perihelia, planetary encounters and captures.
+    """Integrate once and extract perihelia, planetary/lunar encounters and captures.
 
     ``start_jd``/``end_jd`` are TDB Julian dates.  Return index 0 is the
     perihelion nearest to the solution epoch.  The complete sampled trajectory
@@ -737,17 +839,46 @@ def calculate_orbit_evolution_between(
             & (distances[1:-1] <= distances[2:])
             & (distances[1:-1] < 3.0 * hill_radius)
         ) + 1
-        for sample_index in candidate_indices:
-            encounter_jd = _closest_approach_time(
-                engine, sample_epochs, states, distances, int(sample_index), planet,
+        candidate_intervals = [
+            (max(0, int(index) - 1), min(len(sample_epochs) - 1, int(index) + 1))
+            for index in candidate_indices
+        ]
+        if planet == "moon":
+            # At the normal long-term cadence a fast lunar flyby may occur
+            # wholly between adjacent samples.  The closest point on each
+            # relative-position chord is a cheap conservative bracket; the
+            # full N-body trajectory is still used for the actual minimum.
+            relative = states[:, :3] - planet_positions
+            segment = relative[1:] - relative[:-1]
+            segment2 = np.sum(segment * segment, axis=1)
+            fraction = np.zeros(len(segment), dtype=float)
+            usable = segment2 > 0.0
+            fraction[usable] = np.clip(
+                -np.sum(relative[:-1][usable] * segment[usable], axis=1)
+                / segment2[usable],
+                0.0, 1.0,
             )
-            influence_window = max(30.0, 3.0 * sample_step)
+            chord = relative[:-1] + fraction[:, None] * segment
+            for index in np.flatnonzero(
+                np.linalg.norm(chord, axis=1) < 3.0 * hill_radius
+            ):
+                candidate_intervals.append((int(index), int(index) + 1))
+        for left, right in _merge_sample_intervals(candidate_intervals):
+            encounter_jd = _closest_approach_between(
+                engine, sample_epochs, states, left, right, planet, distances,
+            )
+            influence_window = (
+                max(2.0, 3.0 * sample_step) if planet == "moon"
+                else max(30.0, 3.0 * sample_step)
+            )
             evaluation = np.array([
                 encounter_jd - influence_window, encounter_jd, encounter_jd + influence_window,
             ])
             encounter_states = _states_near_samples(engine, sample_epochs, states, evaluation)
             planet_at_encounter = PLANETS.position(planet, encounter_jd)
             separation = float(np.linalg.norm(encounter_states[1, :3] - planet_at_encounter))
+            if separation >= 3.0 * hill_radius:
+                continue
             # Central difference is adequate for the displayed encounter speed
             # and avoids requiring a velocity API from the planet provider.
             velocity_step = .02
@@ -763,13 +894,16 @@ def calculate_orbit_evolution_between(
                 delta_1a = float(1.0 / after - 1.0 / before)
             excess2 = relative_velocity ** 2 - 2.0 * PLANET_MU[planet] / max(separation, 1e-15)
             delta_tisserand = delta_moid = None
-            try:
-                relation_before = planet_relation(encounter_states[0], planet, evaluation[0])
-                relation_after = planet_relation(encounter_states[2], planet, evaluation[2])
-                delta_tisserand = relation_after.tisserand - relation_before.tisserand
-                delta_moid = relation_after.moid_au - relation_before.moid_au
-            except (ValueError, FloatingPointError):
-                pass
+            # Tisserand and heliocentric MOID use planetary mean elements;
+            # they are not defined for the Moon's geocentric orbit.
+            if planet != "moon":
+                try:
+                    relation_before = planet_relation(encounter_states[0], planet, evaluation[0])
+                    relation_after = planet_relation(encounter_states[2], planet, evaluation[2])
+                    delta_tisserand = relation_after.tisserand - relation_before.tisserand
+                    delta_moid = relation_after.moid_au - relation_before.moid_au
+                except (ValueError, FloatingPointError):
+                    pass
             encounters.append(PlanetEncounter(
                 epoch_jd=float(encounter_jd), planet=planet,
                 distance_au=separation,
@@ -789,6 +923,18 @@ def calculate_orbit_evolution_between(
                 ),
             ))
     encounters.sort(key=lambda item: item.epoch_jd)
+    trajectory_epochs, trajectory_states = _refine_capture_trajectory(
+        engine, sample_epochs, states, captures,
+    )
+    if len(trajectory_epochs) != len(sample_epochs):
+        # Keep the distance graph aligned with the refined trajectory arrays.
+        for planet in tuple(planet_distances):
+            planet_positions = np.asarray(
+                PLANETS.position_series(planet, trajectory_epochs), dtype=float,
+            )
+            planet_distances[planet] = np.linalg.norm(
+                trajectory_states[:, :3] - planet_positions, axis=1,
+            )
     # Keep the complete integrated trajectory for the Solar System animation,
     # but calculate osculating elements only for a display-sized time series.
     # Extra points around perihelia and encounters preserve the dynamically
@@ -839,8 +985,8 @@ def calculate_orbit_evolution_between(
         ),
         snapshots=snapshots,
         timeline=timeline,
-        trajectory_epochs=np.asarray(sample_epochs, dtype=float),
-        trajectory_states=np.asarray(states, dtype=float),
+        trajectory_epochs=trajectory_epochs,
+        trajectory_states=trajectory_states,
         captures=tuple(sorted(captures, key=lambda item: item.start_jd)),
         impacts=tuple(impacts),
         planet_distances=planet_distances,
@@ -967,9 +1113,144 @@ def return_solution(source: OrbitSolution, item: EvolutionReturn) -> OrbitSoluti
         epoch_jd=item.epoch_jd, semi_major_axis_au=item.semi_major_axis_au,
         eccentricity=item.eccentricity, inclination_deg=item.inclination_deg,
         node_deg=item.node_deg, arg_peri_deg=item.arg_peri_deg, mean_anomaly_deg=0.0,
-        absolute_magnitude=source.absolute_magnitude, slope_g=source.slope_g,
+        absolute_magnitude=source.absolute_magnitude,
+        absolute_magnitude_known=source.absolute_magnitude_known, slope_g=source.slope_g,
         photometric_exponent=source.photometric_exponent,
         phase_correction=source.phase_correction, provisional=source.provisional,
         position_au=tuple(item.state[:3]), velocity_au_per_day=tuple(item.state[3:]),
         nongravitational_parameters=source.nongravitational_parameters,
     )
+
+
+# --------------------------------------------------------------------------
+# Spread of covariance clones (optional companion to an evolution run)
+# --------------------------------------------------------------------------
+
+CLONE_SPREAD_SEED = 20261031
+CLONE_SPREAD_ATTRIBUTES = (
+    "perihelion_au", "semi_major_axis_au", "eccentricity", "period_years",
+    "reciprocal_a", "inclination_deg", "node_deg", "arg_peri_deg",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CloneSpread:
+    """Osculating elements of covariance clones on the nominal timeline grid."""
+    epochs: np.ndarray                 # TDB JD, same grid as EvolutionResult.timeline
+    elements: dict[str, np.ndarray]    # attribute -> (clones, epochs), NaN where undefined
+    requested: int
+    failed: int                        # clones whose integration failed (e.g. an impact)
+    sampled_names: tuple[str, ...]     # fitted quantities that were varied
+
+    @property
+    def count(self) -> int:
+        return int(next(iter(self.elements.values())).shape[0]) if self.elements else 0
+
+    @property
+    def includes_forces(self) -> bool:
+        return any(name not in ("x", "y", "z", "vx", "vy", "vz") for name in self.sampled_names)
+
+
+def _element_rows(states: np.ndarray) -> dict[str, np.ndarray]:
+    values = {name: np.full(len(states), np.nan) for name in CLONE_SPREAD_ATTRIBUTES}
+    for index, state in enumerate(states):
+        if not np.all(np.isfinite(state)):
+            continue
+        item = _return_from_state(0, 0.0, state)
+        for name in CLONE_SPREAD_ATTRIBUTES:
+            value = getattr(item, name)
+            values[name][index] = np.nan if value is None else float(value)
+    return values
+
+
+def evolution_clone_spread(
+    solution: OrbitSolution, result: EvolutionResult, count: int,
+    *, seed: int = CLONE_SPREAD_SEED, cancel_callback=None, progress_callback=None,
+) -> CloneSpread:
+    """Integrate ``count`` clones drawn from the fit covariance over ``result``'s span.
+
+    The clones vary the Cartesian state and, when the fit determined them,
+    the free A1/A2/A3/DT with their correlations.  Each clone is integrated
+    once with the same force model and its osculating elements are taken on
+    the nominal timeline, so the spread can be drawn around the nominal curve.
+    After a close planetary encounter the clones show how much of the
+    nominal prediction is actually determined by the observations.  The
+    seed is fixed: the same fit always gives the same spread.
+    """
+    if not result.timeline:
+        raise ValueError(tr("Vývoj dráhy neobsahuje časovou řadu elementů."))
+    sampler = covariance_clone_sampler(solution)
+    if sampler is None:
+        raise ValueError(tr(
+            "Dráha nemá kovarianci fitu; rozptyl klonů lze spočítat jen pro vlastní "
+            "fit z astrometrie.",
+        ))
+    mean, factor, names = sampler
+    epochs = np.array([item.epoch_jd for item in result.timeline], dtype=float)
+    rng = np.random.default_rng(seed)
+    engine = _evolution_engine(solution, float(epochs[0]), float(epochs[-1]))
+    before = epochs < solution.epoch_jd
+    rows: dict[str, list[np.ndarray]] = {name: [] for name in CLONE_SPREAD_ATTRIBUTES}
+    failed = 0
+    count = max(1, int(count))
+    for clone_index in range(count):
+        if cancel_callback is not None and cancel_callback():
+            break
+        if progress_callback is not None:
+            progress_callback(clone_index, count)
+        vector = mean + factor @ rng.standard_normal(len(mean))
+        model = clone_engine(engine, solution, names, vector)
+        start = StateVector(solution.epoch_jd, vector[:3], vector[3:6])
+        states = np.full((len(epochs), 6), np.nan)
+        try:
+            # Integrate away from the epoch in both directions separately.
+            if np.any(before):
+                states[before] = model.propagate(start, epochs[before])
+            if np.any(~before):
+                states[~before] = model.propagate(start, epochs[~before])
+        except (ImpactDetected, RuntimeError, ValueError, FloatingPointError, OverflowError):
+            failed += 1
+            continue
+        for name, series in _element_rows(states).items():
+            rows[name].append(series)
+    elements = {
+        name: np.vstack(series) if series else np.empty((0, len(epochs)))
+        for name, series in rows.items()
+    }
+    return CloneSpread(
+        epochs=epochs, elements=elements, requested=count, failed=failed,
+        sampled_names=names,
+    )
+
+
+def clone_spread_summary(spread: CloneSpread, result: EvolutionResult) -> list[str]:
+    """Text lines: element spread (5-95 %) at the nominal returns and at the end."""
+    if not spread.count:
+        return [tr("Rozptyl klonů: žádný klon se nepodařilo integrovat.")]
+    lines = [tr(
+        "Rozptyl {0} klonů z kovariance fitu ({1}); pásmo 5–95 %:",
+        spread.count,
+        tr("stav i negravitační parametry") if spread.includes_forces else tr("jen stav dráhy"),
+    )]
+    if spread.failed:
+        lines.append(tr("  {0} klonů se nepodařilo integrovat (např. srážka).", spread.failed))
+    checkpoints = [(item.epoch_jd, tr("návrat {0}", item.index)) for item in result.returns]
+    checkpoints.append((float(spread.epochs[-1]), tr("konec výpočtu")))
+    for epoch, label in checkpoints:
+        index = int(np.argmin(np.abs(spread.epochs - epoch)))
+        q = spread.elements["perihelion_au"][:, index]
+        e = spread.elements["eccentricity"][:, index]
+        period = spread.elements["period_years"][:, index]
+        q, e = q[np.isfinite(q)], e[np.isfinite(e)]
+        if not q.size:
+            continue
+        date = _format_jd_utc(float(spread.epochs[index]))[:10]
+        text = tr(
+            "  {0} ({1}): q {2:.4f}–{3:.4f} AU, e {4:.4f}–{5:.4f}",
+            label, date, *np.percentile(q, (5, 95)), *np.percentile(e, (5, 95)),
+        )
+        finite_period = period[np.isfinite(period)]
+        if finite_period.size:
+            text += tr(", P {0:.2f}–{1:.2f} let", *np.percentile(finite_period, (5, 95)))
+        lines.append(text)
+    return lines

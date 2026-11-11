@@ -19,6 +19,8 @@
 - `orbit_app/translations_en.py`: English catalogue keyed by the Czech source templates.
 - `orbit_app/mpc_orbit.py`: MPC orbit-response parsing and Cartesian-to-element conversion.
 - `orbit_app/astrometry.py`: measurement metadata independent of dynamics — default uncertainties by technique/epoch, Vereš batch deweighting, duplicate re-reductions, MPC-deprecated records, normal places, and time parsing.
+- `orbit_app/fragments.py`: split comets without Qt — component summaries, assignment of unlabelled post-split rows, detected secondary tracks, and the split-epoch fit (Δv/ΔA1 models through the principal orbit's variational equations).
+- `orbit_app/fragment_ui.py`: Qt parts of the split-comet tools — banner text and widget, fragment overview dialog, split-estimate worker.
 - `orbit_app/orbit_fit.py`: preliminary-orbit search, one differential correction (`_fit_orbit_once`), short-arc branch screening, blunder rejection, apparition grouping, and fit uncertainties.
 - `orbit_app/linkage.py`: linkage of separate apparitions for any object (catalogue shortcut, anchor apparition, line-of-variations branch search, staged joint correction with per-apparition quality gate).
 - `orbit_app/orbit_engine.py`: state vectors, N-body integration, post-Newtonian solar correction, and non-gravitational acceleration laws.
@@ -38,8 +40,13 @@
 - `tests/test_i18n.py`: catalogue consistency, coverage of every literal `tr()` template, language switching and the English default.
 - `tests/test_planet_relations.py`: MOID/Tisserand/resonance geometry, collision detection, geodetic round trip, 2008 TC3 impact vs. JPL (skipped without DE440), near-Earth range search, planetocentric-view gating.
 - `tests/test_mpc_cache.py`: cache round trip, normalization, damaged files, and the GUI cache/update paths.
+- `tests/test_size_estimate.py`: asteroid diameter from H over the albedo range, units, no estimate for comets or a placeholder H (`OrbitSolution.absolute_magnitude_known`).
+- `tests/qt_support.py`: the one process-wide QApplication for GUI tests and its explicit shutdown; GUI tests must use `qt_application()`/`dispose()` (a test-local QApplication makes Linux/Qt abort at exit and fails CI).
 - `tests/test_historical_force.py`: historical A1H–A3H switch in the engine (fast law vs reference, partials), split placement and parameter release in linkage, the relaxed model-tension gate.
 - `tests/test_fragments.py`: comet fragment labels (MPC80/ADES), principal-component selection, simultaneous double-track detection, and the GUI fragment selector.
+- `tests/test_clone_spread.py`: optional clone spread of the orbit evolution, the full fit covariance (state + A1–A3/DT) and the shared clone sampler of the impact Monte Carlo.
+- `tests/test_historical_options.py`: historical force switch epoch, historical uncertainty scaling, the no-DE440 long-arc warning, and the settings dialog round trip.
+- `tests/test_fragment_tools.py`: component summaries, assignment of unlabelled post-split rows, splitting off a detected track, the post-blunder track recheck, a synthetic split-epoch recovery, and the fragment banner/companions in the GUI.
 - `diagnose_78p.py`: focused developer diagnostic for comet 78P; not part of the normal application entry path.
 
 ## Setup, Run, and Test
@@ -136,6 +143,11 @@ formatter or static type checker; do not claim those checks passed.
 - ADES field names are case-insensitive (the MPC service returns lower case, e.g. `astcat`, `permid`); read them through `MpcClient._first()` or a case-folded lookup.
 - Observation times before 1960 are UT; use `observatories.dynamical_jd()` (ΔT) rather than Astropy's UTC fallback. Never use Unix timestamps (`datetime.timestamp()`/`fromtimestamp()`) for observation epochs: they fail on Windows before 1970. Use `astrometry.seconds_since_j2000()`.
 - Split comets: rows of fragments other than the selected one carry `raw["inactive_fragment"]` (`astrometry.select_fragment()`); unlabelled rows belong to the principal component, which is the one labelled in the most observed returns (`primary_fragment()`; 73P → C), never assumed to be `A`. Components measured on one exposure are never duplicates of each other.
+- Fragment assignment: MPC labels (`astrometry.explicit_fragment()`) are never overwritten; fits only set `raw["assigned_fragment"]` (`fragments.assign_unlabelled_rows()`, recomputed after every component fit) or split off a detected track (`fragments.split_off_track()`, `raw["split_off_track"]`, kept across reassignments). `observation_fragment()` combines both. The split-epoch model lives in `fragments.estimate_split()`; GUI pieces are in `fragment_ui.py`, and `MainWindow.component_solutions` holds each component's own orbit (reset for a new object).
+- Covariance clones: `impact.covariance_clone_sampler()` draws the state and, when present, the fitted forces from `OrbitSolution.parameter_covariance`/`parameter_names` (physical units); `impact.clone_engine()` gives each clone its own force law. Use them for every Monte Carlo (impact risk, impact footprint, `orbit_evolution.evolution_clone_spread()`).
+- Multi-decade linkage results (205P, 206P) are only meaningful with JPL DE440 (`orbit-data/de440.bsp`, or `ORBIT_SOLVER_DATA_DIR`). Without it the analytic planetary model is used silently by the engine; `orbit_fit.long_arc_ephemeris_warning()` flags arcs over 10 years. Check `PLANETS.model_name` before trusting or reporting a long-arc diagnostic.
+- Force periods: `orbit_engine.MAX_FORCE_PERIODS` (4); period 0 is A1–A3, period k ≥ 1 uses `historical_period_names(k)` (A1H…, A1H2…) before `period_split_key(k)` (SPLIT_JD, SPLIT_JD2, … decreasing); always resolve coefficients through `force_period()`/`active_nongravitational_coefficients()`. In the linkage each period's set is released only when one of its returns takes part (`_Linker.period()`, `free_for()`).
+- Historical linkage options: `fit_orbit(historical_split_jd=…)` moves the A1H–A3H → A1–A3 switch (`linkage.historical_split_epoch()`; a request outside a gap falls back to the middle of the longest gap); `historical_sigma=(year, factor)` sets `raw["sigma_scale"]` via `astrometry.scale_historical_sigmas()`, applied in `observation_sigma_arcsec()`.
 - Duplicate re-reductions (`raw["duplicate_measurement"]`) and MPC-deprecated records are not fit candidates. Use `astrometry.is_fit_candidate()` wherever rows are selected for fitting.
 - Do not loosen tolerances merely to make a failing numerical test pass. First identify whether the failure is caused by a model change, units, frame/time conversion, conditioning, or platform-level floating-point variation.
 - Prefer vectorized NumPy operations in hot paths, but do not trade away readable unit/frame semantics for compactness.

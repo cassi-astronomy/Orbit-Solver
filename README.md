@@ -38,6 +38,12 @@ planetary orbits and their current positions:
   next time without querying the MPC; **Update astrometry from the MPC**
   downloads the current data including new observations and overwrites the
   cache (NEOCP/PCCP objects change quickly and are not cached);
+- for comets the MPC observation service omits the lettered records of a
+  split comet (205P: 680 of 2016 rows); after it the program reads the MPC
+  text listing of the object (the `show_object` page and its `tmp2/…txt`
+  file) and adds the records of fragments A, B, C …, keeping the ADES rows
+  with their uncertainties; without the MPC web site only the service rows
+  are used; comets cached before this was added are downloaded once more;
 - import of observations from a file or from the clipboard in the MPC
   80-column format;
 - short arcs of objects very close to the Earth (down to a few Earth radii,
@@ -47,6 +53,11 @@ planetary orbits and their current positions:
   coarse search misses, and a trajectory passing through a planet is rejected
   as a collision; for 2024 BX1 the predicted entry (00:32:37 UTC, 15.20 km/s,
   75.6°) matches the observed bolide;
+- long arcs of temporarily captured Earth satellites (for example J002E3)
+  are initialized on the first dense local track and extended in phase-safe
+  stages; the fit includes the Earth's J2 oblateness and screens a constant
+  radial A1/r² solar-radiation-pressure term suitable for a hollow rocket
+  stage;
 - support for satellite observations and topocentric parallax from the MPC
   station code;
 - own six-parameter fit of the Cartesian state with planetary perturbations;
@@ -60,10 +71,11 @@ planetary orbits and their current positions:
 - import of historical 80-column records with lower precision (RA to whole
   seconds or minutes, Dec to tenths of an arcminute); their uncertainty is
   never smaller than half of the last published digit;
-- individual ADES uncertainties (with a floor of 0.3″ for catalogue and
-  timing systematics); measurements without them get a default uncertainty
-  by technique (micrometer 3″, photographic plate 1.5–2.5″, CCD 1–2″,
-  otherwise by epoch); a series from one station in one local night is
+- the complete per-observation ADES covariance: `rmsRA`, `rmsDec` and
+  `rmsCorr`, with `rmsTime`/`uncTime` projected along the measured sky motion;
+  uncertainties retain a floor of 0.3″ for unreported systematics;
+  measurements without ADES RMS values get Vereš et al. (2017) technique,
+  epoch and common-station defaults; a series from one station in one local night is
   deweighted by the `sqrt(N/4)` rule of Vereš et al. (2017), so hundreds of
   frames do not pretend to be hundreds of independent absolute positions;
 - duplicate reductions of the same measurement (the MPC often lists them
@@ -84,7 +96,33 @@ planetary orbits and their current positions:
 - an unlabelled second track measured by one station on the same exposures
   (a fragment or another object, e.g. ZTF on 205P in 2021, 65″ from the
   comet) is recognised even when it has dragged the orbit between the two
-  tracks, and is excluded as a coherent secondary track;
+  tracks, and is excluded as a coherent secondary track (also when a weighted
+  track first had to lose some rows as isolated outliers); likewise, a whole
+  compact `trkSub`/station-night tracklet that is strongly incompatible with
+  at least six well-fitted independent measurements is rejected as a unit,
+  with a separate visible reason and a 15% safety limit;
+- a banner above the observation table announces a split comet: components,
+  observed period, nights and the median offset from the principal one on
+  shared exposures; **Fragment overview…** lists the components with their own
+  orbits. A detected unlabelled track can be made a component (**Split off
+  track as fragment**, labels X1, X2…). A secondary component is fitted
+  starting from the principal orbit (gravity only when its arc is shorter than
+  a year). After each component fit, unlabelled post-split rows near the
+  secondary's measurements are given to the component whose orbit they follow
+  (within 3″ and three times closer than the other); rows both orbits fit
+  equally stay with the principal component;
+- **Estimate split time…** dates the separation of each fitted secondary from
+  the principal component with three models – Sekanina's split with a
+  differential radial acceleration (∝ r⁻²), a separation impulse Δv (R/T/N),
+  and both – searching up to 1.6 orbital periods back; it reports the epoch with
+  its uncertainty, heliocentric distance, Δv/ΔA1, competing solutions and
+  warnings for unphysical velocities (> 10 m/s), excessive differential
+  acceleration, or a minimum at the early edge of the search (epoch not
+  determined); a minimum just before the first fragment measurement is a
+  valid result – a fresh fragment – and is reported as such. Short fragment
+  arcs often allow several epochs; the result is indicative;
+- the other fitted components are drawn as companions (pink) in the Solar
+  System and Sky views; the sky view also offers 0.25°, 1° and 5° fields;
 - times before 1960 are Universal Time UT and are converted to TT with ΔT
   from the reconstruction of the Earth's rotation (Espenak & Meeus), not with
   a fixed 32.184 s offset;
@@ -110,15 +148,29 @@ planetary orbits and their current positions:
   requested parameters in the final joint solution; this way, e.g.,
   206P/Barnard–Boattini (1892 and 2008, 20 revolutions and three approaches to
   Jupiter) is linked even without a catalogue orbit;
-- two linkage options in **Custom settings…**: *separate non-gravitational
-  parameters for historical returns* fits its own A1H/A2H/A3H before the
-  middle of the longest observing gap and A1–A3 after it (a comet whose
-  activity changed while it was lost; 205P: 1896 and 2008–2021); *join a
-  return even above the quality limit* accepts a return up to 15σ as long as
-  the other returns stay within the tension limit – for visual or
-  photographic historical astrometry – and always reports it as model
-  tension; for 205P the two options together link 1896 to 2008–2021
-  (1896 14″/4.7σ with A1H/A2H, 31″/10σ with one force law);
+- linkage options in **Custom settings…**: *separate non-gravitational
+  parameters for historical returns* fits its own A1H/A2H/A3H before a switch
+  epoch and A1–A3 after it (a comet whose activity changed while it was lost;
+  205P: 1896 and 2008–2021); the switch defaults to the middle of the longest
+  observing gap and can be set to any year inside a gap – best the moment the
+  activity changed, e.g. a split far from the Sun; several years separated by
+  commas give up to four force periods (A1–A3, A1H–A3H, A1H2–A3H2, A1H3–A3H3),
+  each fitted from its own returns (78P with switches in 1993 and 2008, around
+  the 1995 Jupiter approach: RMS 1.16″ against 1.42″ with two periods and 2.04″ with one set; the transverse A2 of the three periods, −0.66, −1.28 and −1.13·10⁻⁹ AU/day², follows Kinoshita's −0.43, −1.26 and −1.23); *join a return even above
+  the quality limit* accepts a return up to 15σ as long as the other returns
+  stay within the tension limit and always reports it as model tension;
+  *increase the uncertainty of measurements made before a year* multiplies
+  the σ of old micrometer and plate astrometry, whose systematic errors
+  (catalogue, plate scale, observer) do not average out;
+  for 205P (with JPL DE440, A1+A2 and A1H/A2H switched at the end of 1998,
+  when fragment C separated) all four returns are linked without the
+  above-limit option: 1896 at 9.5″/3.1σ, and with 3× larger uncertainty
+  before 1950 at 12.8″/1.4σ, 2008–2021 at 1.0–1.9″; the historical A2H
+  (+2.8·10⁻¹⁰) has the opposite sign of today's A2 (−3.6·10⁻¹⁰);
+- a fit of an arc longer than 10 years without JPL DE440 warns before it
+  starts and in the result: with the analytic planetary model the linkage
+  across close Jupiter encounters can be completely wrong (206P, 1892–2008:
+  8″ with DE440, 14 000″ without);
 - integration of arcs longer than two years uses a precise tolerance
   (`rtol = 1e-12`); over centuries and close Jupiter encounters a looser
   tolerance would introduce errors of hundreds of arcseconds;
@@ -130,10 +182,18 @@ planetary orbits and their current positions:
   body: the Marsden water-ice model with an optional activity time shift DT
   for comets, or the power law `g(r) = r^-m` (default `m = 2`) for radiation
   pressure and the Yarkovsky A2 of asteroids; the designation of the body does
-  not restrict the function;
+  not restrict the function; when the user has not selected a force model,
+  the fit conservatively tests A1 (and on a long enough comet arc A1+A2), or
+  asteroidal r⁻² A2 on arcs over two years, but accepts it only when every new
+  parameter is at least 3σ significant and the improvement is ΔBIC > 10;
 - element uncertainties and basic fit diagnostics; with a singular or
   extremely ill-conditioned normal matrix the uncertainty is rather not shown
-  than letting a pseudo-inverse produce a falsely precise number.
+  than letting a pseudo-inverse produce a falsely precise number;
+- for asteroids the elements report gives the diameter implied by H,
+  D = 1329 km / √p_V · 10^(−H/5), for the typical albedo range 0.25 (bright
+  S type) to 0.05 (dark C type) and the extreme limits 0.50–0.03; it is
+  omitted for comets (H/M of an active comet measures the coma) and while H
+  is only a placeholder (no catalogue H and no photometry);
 
 ### Elements and ephemeris
 
@@ -162,8 +222,11 @@ planetary orbits and their current positions:
 
 ### Visualisation
 
-- interactive heliocentric view of the Solar System with rotation and smooth
-  logarithmic zoom;
+- interactive Solar System view with rotation, smooth logarithmic zoom and a
+  selectable centre on the Sun, a planet or the fitted body; the Earth-centred
+  close view shows the Moon on a date-matched ephemeris orbit, and detected
+  temporary-capture loops are reintegrated at fine cadence so they remain
+  smooth even in a long evolution;
 - the osculating curve of the body is derived from the N-body state of the
   current frame, so the animated point does not lie off an old curve from the
   epoch of the original fit;
@@ -188,10 +251,23 @@ planetary orbits and their current positions:
   1000 years asks for confirmation;
 - table of osculating elements at individual perihelion passages, labelled
   directly by the year of the return;
+- optional **clone spread** (off by default, 5–500 clones): clones drawn from
+  the covariance of the own fit – the state and the fitted A1/A2/A3/DT – are
+  integrated over the same interval and drawn as faint curves with a 5–95 %
+  band; the TXT summary lists the spread of q, e and P at every return. It
+  shows how much of a prediction the observations determine, but only within
+  the chosen force model: for 78P the 30 clones stay within q 5.051–5.057 AU
+  even after the 2029 (0.018 AU) and 2046 Jupiter encounters, while a
+  solution with a different non-gravitational model (Kinoshita) lands
+  elsewhere – the model choice, not the astrometry, dominates there. Each
+  clone is one more full integration (about 5 s for 125 years);
 - search for planetary approaches, distance in AU and Hill radii, relative
   velocity and an approximate change of `1/a`;
 - automatic detection of a planetocentric capture by negative relative
   orbital energy inside the Hill sphere;
+- close lunar flybys are listed separately from Earth encounters; the Moon's
+  gravity is included throughout the integration, so a lunar kick that changes
+  a temporary capture or escape is retained in the trajectory;
 - switchable plot of the continuous evolution of `q`, `a`, `e`, the period,
   `1/a`, inclination, node or argument of perihelion on a linear time axis;
   changes at encounters appear at the moment of the encounter and the
@@ -228,6 +304,15 @@ planetary orbits and their current positions:
   trajectory (WGS84), with a Monte Carlo uncertainty from the fit covariance
   (impacting fraction of clones, 1σ ellipse on the ground, time); for
   2008 TC3 the entry agrees with the JPL prediction within 1 s and 1.4 km;
+- a close nominal pass by the Earth or Moon also triggers Monte Carlo virtual
+  impactor screening from the formal fit covariance, even when the nominal
+  orbit misses; it uses a fixed number of 2,500 seeded clones
+  (the same result on any computer; risks of about 1:800 and above are found
+  reliably, rarer ones may show no impacting clone) and reports a Wilson 95%
+  interval; when the fit determined A1/A2/A3/DT (e.g. a Yarkovsky A2), the
+  clones vary them too, with their correlations to the state. A non-zero
+  result is explicitly labelled as indicative and requires verification by an
+  authoritative impact-monitoring system;
 - optional planetocentric elements while a planet holds the body (capture);
   optional local planetocentric view for captured objects; lunar
   perturbations are included (from DE440, or with an approximate model
@@ -352,17 +437,26 @@ software.
   downloaded and activated with one click. Computations outside the coverage
   of the active kernel are refused instead of silently falling back to a less
   precise model.
-- The Moon and the first post-Newtonian (Schwarzschild) correction of the Sun
-  are included. The full EIH/PPN model and the perturbations of the 16 massive
-  asteroids from `sb441-n16.bsp` are not included yet; this roughly 650 MB
-  asteroid kernel requires a reader for the SPK type used by SB441, which the
-  current `jplephem` library does not provide.
+- The Moon, the Earth's J2 oblateness for close geocentric trajectories, and
+  the first post-Newtonian (Schwarzschild) correction of the Sun are included.
+  The 16 massive asteroids are added automatically when optional
+  [ASSIST](https://github.com/matthewholman/assist) is installed and the JPL
+  [`sb441-n16.bsp`](https://ssd.jpl.nasa.gov/ftp/eph/small_bodies/asteroids_de441/sb441-n16.bsp)
+  kernel is placed beside `de440.bsp` in `orbit-data` (or
+  `ORBIT_SOLVER_DATA_DIR`). Install the adapter with `pip install assist
+  rebound`; Windows may require WSL2 until suitable wheels are available.
+  ASSIST is GPL-3.0 and remains an unbundled optional component. The full
+  EIH/PPN model is still not implemented.
 - The linkage of returns assumes one common force model. A return that the
   joint solution does not confirm is explicitly flagged and shown only as a
   prediction; this alone does not disprove the identity of the returns.
-- Systematic errors of star catalogues (debiasing after Farnocchia et al.) are
-  not corrected yet; for historical measurements they appear as differences
-  between stations of the order of arcseconds.
+- Eggl et al. (2020) catalogue zonal and proper-motion debiasing is activated
+  when `bias.dat` from the official JPL
+  [`debias_2018.tgz`](https://ssd.jpl.nasa.gov/ftp/eph/small_bodies/asteroids_debias/debias_2018.tgz)
+  archive is placed at
+  `orbit-data/debias_2018/bias.dat` (or under `ORBIT_SOLVER_DATA_DIR`). It is
+  intentionally not bundled; without the table the fit remains unchanged and
+  reports no debias correction.
 - Constant A1/A2/A3/DT when integrating a comet over many returns are a model
   assumption; the real non-gravitational activity of a comet may change
   between returns. DT should be released only for a long arc, because on a

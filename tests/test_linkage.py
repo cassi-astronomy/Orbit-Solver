@@ -44,6 +44,11 @@ BARNARD_1892 = (
 )
 
 
+try:
+    from qt_support import qt_application  # noqa: E402
+except ImportError:  # run as tests.<module> from the repository root
+    from tests.qt_support import qt_application  # noqa: E402
+
 class TimeScaleTests(unittest.TestCase):
     def test_historical_delta_t_follows_earth_rotation_record(self):
         # Morrison & Stephenson / Espenak & Meeus: about -6 s in 1892 and
@@ -486,12 +491,11 @@ class SyntheticLinkageTests(unittest.TestCase):
 
 class ObservedEvolutionPanelTests(unittest.TestCase):
     def test_fit_integration_is_shown_without_rerunning_it(self):
-        from PySide6.QtWidgets import QApplication
 
         from orbit_app.main_window import OrbitEvolutionPanel
         from orbit_app.orbit_evolution import EvolutionResult, EvolutionReturn, PlanetEncounter
 
-        _application = QApplication.instance() or QApplication([])
+        _application = qt_application()
         returns = tuple(
             EvolutionReturn(index, epoch, (1.0, 0, 0, 0, .02, 0), 3.4, .58, 31.3,
                             204.0, 181.0, 1.43, 6.4, 1 / 3.4)

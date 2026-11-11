@@ -1,5 +1,4 @@
 """Split comets: fragment labels, component selection and the GUI selector."""
-import atexit
 import os
 import unittest
 from dataclasses import replace
@@ -7,36 +6,17 @@ from dataclasses import replace
 os.environ["ORBIT_SOLVER_LANGUAGE"] = "cs"
 
 from orbit_app.astrometry import (  # noqa: E402
-    designation_fragment, fragment_counts, fragment_return_counts, is_fit_candidate,
+    MAIN_UNLABELLED, designation_fragment, fragment_counts, fragment_return_counts, is_fit_candidate,
     mark_duplicate_measurements, mpc80_fragment, observation_fragment, primary_fragment,
     select_fragment,
 )
-from orbit_app.mpc import MpcClient, parse_mpc80  # noqa: E402
+from orbit_app.mpc import MpcClient, parse_mpc80, unpack_mpc80_designation  # noqa: E402
 
 
-# Keep the QApplication wrapper alive for the rest of the test process.  If the
-# last Python reference disappears while Qt still owns shared objects created by
-# MainWindow, Linux/Qt may abort during interpreter shutdown even though every
-# assertion passed.
-_QT_APPLICATION = None
-_QT_SHUTDOWN_REGISTERED = False
-
-
-def _shutdown_qt_application() -> None:
-    """Destroy Qt explicitly before PySide's interpreter-shutdown cleanup."""
-    global _QT_APPLICATION
-
-    from PySide6.QtCore import QEvent
-    from PySide6.QtWidgets import QApplication
-
-    application = QApplication.instance()
-    if application is None:
-        return
-    QApplication.closeAllWindows()
-    QApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-    application.processEvents()
-    application.shutdown()
-    _QT_APPLICATION = None
+try:
+    from qt_support import dispose, qt_application  # noqa: E402
+except ImportError:  # run as tests.<module> from the repository root
+    from tests.qt_support import dispose, qt_application  # noqa: E402
 
 # 205P/Giacobini, split in 2008 (MPC astrometry): undivided comet in 1896 and
 # early 2008 under the provisional designation, labelled components A/B/C
@@ -111,6 +91,91 @@ class FragmentLabelTests(unittest.TestCase):
         self.assertEqual(observation_fragment(with_obs80), "C")
 
 
+# A comet whose main nucleus the MPC leaves unlabelled while it labels the
+# small secondary pieces (b, c) seen for a few nights of one return.
+FIXTURE_UNLABELLED_MAIN = """\
+0141P         C1994 09 01.10000 01 00 00.00 +10 00 00.0                 01234568
+0141P         C1994 09 05.10000 01 05 00.00 +10 10 00.0                 01234568
+0141P         C1994 09 09.10000 01 10 00.00 +10 20 00.0                 01234568
+0141P      b  C1994 09 09.10000 01 10 05.00 +10 20 05.0                 01234568
+0141P      c  C1994 09 09.10000 01 10 09.00 +10 20 09.0                 01234568
+0141P         C1994 09 12.10000 01 15 00.00 +10 30 00.0                 01234568
+0141P      b  C1994 09 12.10000 01 15 05.00 +10 30 05.0                 01234568
+0141P         C1999 12 01.10000 03 00 00.00 +12 00 00.0                 01234568
+0141P         C1999 12 05.10000 03 05 00.00 +12 10 00.0                 01234568
+"""
+
+
+class DesignationTests(unittest.TestCase):
+    def test_mpc80_designations_are_unpacked(self):
+        for packed, expected in (
+            ("0205P      a", "205P-A"), ("0205PI96R020", "205P"), ("0073P     bt", "73P-BT"),
+            ("    PK08R060", "P/2008 R6"), ("    PK08R06c", "P/2008 R6-C"),
+            ("    CK19Y040", "C/2019 Y4"), ("00433       ", "433"), ("A0345       ", "100345"),
+            ("     K24B01X", "2024 BX1"), ("     K08T03C", "2008 TC3"),
+            ("     J95X00A", "1995 XA"), ("     K07Tf8A", "2007 TA418"),
+            ("2008 TC3    ", ""), ("", ""),
+        ):
+            with self.subTest(packed=packed):
+                self.assertEqual(unpack_mpc80_designation(packed), expected)
+        self.assertEqual(unpack_mpc80_designation("0205P      a", include_fragment=False), "205P")
+        self.assertEqual(unpack_mpc80_designation("    PK08R06c", include_fragment=False), "P/2008 R6")
+
+    def test_imported_astrometry_keeps_a_queryable_comet_designation(self):
+        # The packed 0205PI96R020 used to become the object name: MPC queries
+        # failed and 205P was not even recognized as a comet.
+        from orbit_app.domain import is_comet_designation
+        from orbit_app.main_window import imported_designation
+
+        designation = imported_designation(parse_mpc80(FIXTURE_205P))
+        self.assertEqual(designation, "205P")
+        self.assertTrue(is_comet_designation(designation))
+        self.assertFalse(is_comet_designation("0205PI96R020"))
+
+    def test_observer_tracklet_names_are_not_fragments(self):
+        row = MpcClient._to_observation(  # noqa: SLF001
+            {"permid": "73P", "trksub": "0073Pbt", "obstime": "2017-04-20T09:41:12Z",
+             "ra": 200.0, "dec": -10.0, "stn": "G39"}, "73P",
+        )
+        self.assertEqual(observation_fragment(row), "")
+        row = MpcClient._to_observation(  # noqa: SLF001
+            {"permid": "73P", "trksub": "73P-B", "obstime": "2017-04-20T09:41:12Z",
+             "ra": 200.0, "dec": -10.0, "stn": "G39"}, "73P",
+        )
+        self.assertEqual(observation_fragment(row), "")
+
+
+class FragmentDownloadHintTests(unittest.TestCase):
+    def test_missing_fragment_points_to_the_text_listing(self):
+        # The MPC observation API returns no rows for any form of a fragment
+        # designation (205P-A, P/2008 R6-A, 73P-C …; checked against the MPC).
+        from unittest import mock
+
+        from PySide6.QtCore import QByteArray
+        from PySide6.QtNetwork import QNetworkReply
+
+        from orbit_app.main_window import MpcNetworkClient
+
+        qt_application()
+        client = MpcNetworkClient()
+
+        def message_for(designation):
+            reply = mock.Mock()
+            reply.error.return_value = QNetworkReply.NoError
+            reply.readAll.return_value = QByteArray(b'[{"ADES_DF": []}]')
+            messages = []
+            client.error.connect(messages.append)
+            client._finished(reply, designation, False, False)  # noqa: SLF001
+            client.error.disconnect(messages.append)
+            return messages
+
+        messages = message_for("205P-A")
+        self.assertEqual(len(messages), 1)
+        self.assertIn("(např. 205P)", messages[0])
+        self.assertIn("TXT", messages[0])
+        self.assertNotIn("TXT", message_for("2024 AB")[0])
+
+
 class FragmentSelectionTests(unittest.TestCase):
     def setUp(self):
         self.rows = parse_mpc80(FIXTURE_205P)
@@ -134,6 +199,14 @@ class FragmentSelectionTests(unittest.TestCase):
         select_fragment(self.rows, "B")
         self.assertEqual(select_fragment(self.rows, None), len(self.rows))
         self.assertTrue(all(is_fit_candidate(row) for row in self.rows))
+
+    def test_unlabelled_main_nucleus_is_kept_apart_from_minor_pieces(self):
+        rows = parse_mpc80(FIXTURE_UNLABELLED_MAIN)
+        self.assertEqual(primary_fragment(rows), MAIN_UNLABELLED)
+        self.assertEqual(select_fragment(rows, MAIN_UNLABELLED), 6)
+        fitted = [row for row in rows if is_fit_candidate(row)]
+        self.assertEqual({observation_fragment(row) for row in fitted}, {""})
+        self.assertEqual(select_fragment(rows, "B"), 2)
 
     def test_unlabelled_astrometry_is_never_filtered(self):
         rows = [row for row in self.rows if not observation_fragment(row)]
@@ -278,16 +351,7 @@ class SecondaryTrackBudgetTests(unittest.TestCase):
 class FragmentSelectorWindowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        global _QT_APPLICATION, _QT_SHUTDOWN_REGISTERED
-
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        from PySide6.QtWidgets import QApplication
-
-        _QT_APPLICATION = QApplication.instance() or QApplication([])
-        if not _QT_SHUTDOWN_REGISTERED:
-            atexit.register(_shutdown_qt_application)
-            _QT_SHUTDOWN_REGISTERED = True
-        cls._application = _QT_APPLICATION
+        cls._application = qt_application()
 
     def setUp(self):
         from unittest import mock
@@ -298,13 +362,7 @@ class FragmentSelectorWindowTests(unittest.TestCase):
         self.window.mpc_network.observations = mock.Mock()
 
     def tearDown(self):
-        from PySide6.QtCore import QEvent
-        from PySide6.QtWidgets import QApplication
-
-        self.window.close()
-        self.window.deleteLater()
-        QApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-        self._application.processEvents()
+        dispose(self.window)
 
     def test_split_comet_offers_components_and_fits_the_principal_one(self):
         rows = parse_mpc80(FIXTURE_205P)
@@ -332,11 +390,40 @@ class FragmentSelectorWindowTests(unittest.TestCase):
         self.assertEqual(selector.currentData(), "C")
         self.assertIn("7 z 13", self.window.fit_button.text())
 
+    def test_unlabelled_main_nucleus_is_offered_first(self):
+        rows = parse_mpc80(FIXTURE_UNLABELLED_MAIN)
+        self.window._observations_loaded("141P", rows)  # noqa: SLF001
+        selector = self.window.fragment_selector
+        self.assertEqual(
+            [selector.itemData(i) for i in range(selector.count())], [MAIN_UNLABELLED, "B", "C"],
+        )
+        self.assertEqual(selector.currentData(), MAIN_UNLABELLED)
+        self.assertIn("hlavní jádro", selector.currentText())
+        self.assertIn("6 z 9", self.window.fit_button.text())
+
     def test_selector_is_hidden_for_an_undivided_object(self):
         rows = parse_mpc80(FIXTURE_205P.splitlines()[0] + "\n")
         self.window._observations_loaded("205P", rows)  # noqa: SLF001
         self.assertTrue(self.window.fragment_selector.isHidden())
         self.assertTrue(all(is_fit_candidate(row) for row in rows))
+
+    def test_pasting_another_object_resets_hidden_fit_configuration(self):
+        self.window.current_designation = "C/2024 Y1"
+        self.window.nongravitational_fit = {"A2": 1e-10, "R_EXPONENT": 2.0}
+        self.window.fit_constraints = {"e": .5}
+        self.window.compute_original_future = True
+        self.window.fit_output_epoch = "2030"
+        self.window.fit_interval.setCurrentIndex(1)
+        rows = parse_mpc80(FIXTURE_205P.splitlines()[0] + "\n")
+
+        self.window._observations_loaded("205P", rows)  # noqa: SLF001
+
+        self.assertEqual(self.window.nongravitational_fit, {})
+        self.assertEqual(self.window.fit_constraints, {})
+        self.assertFalse(self.window.compute_original_future)
+        self.assertEqual(self.window.fit_output_epoch, "")
+        self.assertEqual(self.window.fit_interval.currentIndex(), 0)
+        self.assertEqual(self.window.constraints_button.text(), "Vlastní nastavení…")
 
 
 if __name__ == "__main__":

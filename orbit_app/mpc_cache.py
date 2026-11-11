@@ -36,11 +36,19 @@ class CachedAstrometry:
     downloaded_utc: datetime
     rows: list[dict[str, Any]]
     path: Path
+    # MPC 80-column records of split-comet fragments (a, b, c …) taken from
+    # the MPC text listing, which the get-obs service omits.
+    mpc80_lines: tuple[str, ...] = ()
+    # Whether the text listing was consulted (comets only).
+    fragments_checked: bool = False
 
     def observations(self) -> list[Observation]:
-        from .mpc import MpcClient
+        from .mpc import MpcClient, parse_mpc80
 
-        return [MpcClient._to_observation(row, self.designation) for row in self.rows]
+        rows = [MpcClient._to_observation(row, self.designation) for row in self.rows]
+        if self.mpc80_lines:
+            rows.extend(parse_mpc80("\n".join(self.mpc80_lines), self.designation))
+        return rows
 
 
 def cache_directory() -> Path:
@@ -89,18 +97,22 @@ def load(designation: str) -> CachedAstrometry | None:
         downloaded = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
     if downloaded.tzinfo is None:
         downloaded = downloaded.replace(tzinfo=timezone.utc)
+    lines = payload.get("mpc80_fragments") or []
     return CachedAstrometry(
         designation=str(payload["designation"]),
         downloaded_utc=downloaded,
         rows=[row for row in rows if isinstance(row, dict)],
         path=path,
+        mpc80_lines=tuple(str(line) for line in lines if isinstance(line, str)),
+        fragments_checked=bool(payload.get("fragments_checked")),
     )
 
 
 def save(
     designation: str, rows: list[dict[str, Any]], downloaded_utc: datetime | None = None,
+    *, mpc80_lines: list[str] | tuple[str, ...] | None = None, fragments_checked: bool = False,
 ) -> Path:
-    """Store raw ADES rows atomically and return the cache file path."""
+    """Store raw ADES rows (and fragment MPC80 records) atomically; return the path."""
     path = cache_path(designation)
     path.parent.mkdir(parents=True, exist_ok=True)
     stamp = (downloaded_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -111,6 +123,9 @@ def save(
         "source": "MPC get-obs (ADES_DF 2022)",
         "rows": rows,
     }
+    if mpc80_lines or fragments_checked:
+        payload["mpc80_fragments"] = list(mpc80_lines or ())
+        payload["fragments_checked"] = bool(fragments_checked)
     handle, temporary = tempfile.mkstemp(prefix=".tmp-", dir=path.parent)
     try:
         with os.fdopen(handle, "wb") as raw, gzip.GzipFile(

@@ -50,3 +50,23 @@ def hg_phase_correction(phase_deg: np.ndarray, slope_g: float = 0.15) -> np.ndar
     flux = np.maximum((1.0 - slope_g) * phi1 + slope_g * phi2, 1e-12)
     return -2.5 * np.log10(flux)
 
+
+
+# Diameter of a body of absolute magnitude H and geometric albedo p_V:
+# D = 1329 km / sqrt(p_V) * 10^(-H/5)  (Fowler & Chillemi 1992; Pravec &
+# Harris 2007).  The constant is the diameter of an H = 0, p_V = 1 body.
+DIAMETER_CONSTANT_KM = 1329.0
+# Geometric albedos for a size estimate without a measured albedo.  Most
+# asteroids lie between dark carbonaceous (C/D/P types, p_V ~ 0.05) and
+# bright stony (S types, p_V ~ 0.25) surfaces; 0.03 and 0.50 bound the very
+# darkest bodies and rare high-albedo E types.
+ASTEROID_ALBEDO_TYPICAL = (0.25, 0.05)
+ASTEROID_ALBEDO_EXTREME = (0.50, 0.03)
+
+
+def diameter_from_absolute_magnitude_km(absolute_magnitude: float, albedo: float) -> float:
+    """Effective diameter in km for asteroid H (mag) and geometric albedo p_V."""
+    albedo = float(albedo)
+    if not np.isfinite(albedo) or albedo <= 0.0:
+        raise ValueError(tr("Albedo musí být kladné."))
+    return float(DIAMETER_CONSTANT_KM / np.sqrt(albedo) * 10.0 ** (-0.2 * float(absolute_magnitude)))

@@ -7,6 +7,7 @@ import re
 import hashlib
 import html
 import time
+import warnings
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -61,21 +62,32 @@ from PySide6.QtWidgets import (
 import matplotlib.dates as mdates
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
-from matplotlib.collections import LineCollection
+from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.figure import Figure
 from matplotlib.projections import register_projection
 from mpl_toolkits.mplot3d import Axes3D
 
 from .astrometry import (
-    fragment_counts, observation_fragment, primary_fragment, select_fragment,
+    ASSIGNED_FRAGMENT_KEY, MAIN_UNLABELLED, designation_fragment, fragment_components,
+    mpc80_fragment, observation_fragment, primary_fragment, select_fragment,
 )
 from .domain import Observation, OrbitSolution, is_comet_designation
+from .fragment_ui import (
+    FragmentBanner, FragmentOverviewDialog, SplitEstimateWorker, describe_split_results,
+    fragment_banner_text, show_text_dialog,
+)
+from .fragments import (
+    AMBIGUOUS_FRAGMENT_KEY, ASSIGNMENT_REASON_KEY, SPLIT_OFF_KEY, assign_unlabelled_rows, component_summaries, primary_label, secondary_tracks,
+    split_off_track,
+)
 from .linkage import LINKAGE_RELAXED_NORMALIZED_RMS
-from .orbit_engine import HISTORICAL_NONGRAVITATIONAL, NONGRAVITATIONAL_SPLIT_KEY
+from .orbit_engine import (
+    ALL_HISTORICAL_NAMES, MAX_FORCE_PERIODS, force_period_splits, historical_period_names,
+)
 from .comet_dynamics import analyze_original_future_orbit
 from .i18n import SUPPORTED_LANGUAGES, language, save_language, tr
 from . import mpc_cache
-from .mpc import MpcClient, MpcError, parse_mpc80
+from .mpc import MpcClient, MpcError, parse_mpc80, unpack_mpc80_designation
 from .mpc_orbit import (
     OrbitParseError, cartesian_to_elements, mpc_identifier_choices, parse_mpc_orbit,
 )
@@ -84,8 +96,8 @@ from .observatories import (
     observatory_details, station_offsets_gcrs,
 )
 from .orbit_fit import (
-    OrbitFitCancelled, fit_orbit, fit_selection_count, initial_orbit_from_observations,
-    parse_observation_time,
+    OrbitFitCancelled, _evaluate_solution_observations, fit_orbit, fit_selection_count,
+    initial_orbit_from_observations, long_arc_ephemeris_warning, parse_observation_time,
 )
 from .orbit_engine import MU_SUN, NBodyIntegrator, StateVector
 from .orbit_evolution import (
@@ -95,18 +107,24 @@ from .orbit_evolution import (
     calculate_orbit_evolution, centered_snapshot, centered_solution, evolution_span,
     usable_coverage,
     format_evolution_mpc_report, format_evolution_report, return_solution,
+    CloneSpread, clone_spread_summary, evolution_clone_spread,
 )
-from .impact import IMPACT_CHECK_DAYS, describe_impact, imminent_impact
+from .impact import (
+    IMPACT_CHECK_DAYS, ImpactRisk, close_approach_impact_risk,
+    describe_impact, describe_impact_risk, imminent_impact,
+)
 from .planet_relations import RELATION_PLANETS, nearby_resonances, planet_period_years
 from .planetary import DE440_MD5, DE440_URL, PLANETS, de440_path
 from .photometry import estimate_absolute_magnitude, hg_phase_correction, power_law_magnitude
 from .presentation import (
     LINKAGE_STATUS_LABELS, SKY_TRACK_HORIZONS,
-    apparition_linkage_summary, apparition_observation_count_text,
+    apparition_linkage_summary, asteroid_size_lines, apparition_observation_count_text,
     datetime_from_jd, equatorial_ra_ticks, format_dec_sexagesimal,
     format_ra_sexagesimal, observation_residual_score, observations_to_tsv,
     parse_output_epoch, perihelion_jd_from_solution, project_ecliptic_camera,
-    sky_track_sample_count, solar_orbit_clip_radius, trajectory_return_masks,
+    projected_ecliptic_curtain_quads, lunar_orbit_path_epochs, sky_track_sample_count,
+    solar_orbit_clip_radius, trajectory_return_masks,
+    trajectory_display_indices,
 )
 from .preview_orbit import apparent_geometry, datetime_to_jd, demo_solution, heliocentric_xyz, orbital_curve_xyz
 
@@ -392,13 +410,29 @@ class MpcNetworkClient(QObject):
                         designation, not confirmation_page, allow_fallback=False
                     )
                     return
-                self.error.emit(
-                    tr(
-                        "Pro objekt „{0}“ nebyla nalezena pozorování ani v běžném MPC, ani na "
-                        "NEOCP/PCCP.",
-                        designation,
-                    )
+                message = tr(
+                    "Pro objekt „{0}“ nebyla nalezena pozorování ani v běžném MPC, ani na "
+                    "NEOCP/PCCP.",
+                    designation,
                 )
+                if designation_fragment(designation):
+                    # The MPC observation API returns only the unlabelled
+                    # rows of a split comet (205P: 680 of 2016); no form of a
+                    # fragment designation is accepted.  Point to the text
+                    # listing, which keeps the fragment letters.
+                    message += "\n\n" + tr(
+                        "Služba MPC pro stahování pozorování fragmenty rozpadlých komet "
+                        "nevrací. Stáhněte z webu MPC textový výpis pozorování celé komety "
+                        "(např. {0}) a načtěte ho tlačítkem „Načíst pozorování z TXT…“; "
+                        "fragment pak zvolíte v nabídce Fragment komety.",
+                        designation.split("-", 1)[0],
+                    )
+                self.error.emit(message)
+                return
+            if not confirmation_page and wants_fragment_listing(designation):
+                # get-obs omits the lettered rows of a split comet (205P:
+                # 680 of 2016); the MPC text listing keeps them.
+                self._request_fragment_listing(designation, raw_rows, rows)
                 return
             if not confirmation_page:
                 try:
@@ -408,6 +442,76 @@ class MpcNetworkClient(QObject):
             self.success.emit((designation, rows, confirmation_page, None))
         finally:
             reply.deleteLater()
+
+    # -- fragments of split comets from the MPC text listing -----------------
+    LISTING_PAGE_URL = "https://www.minorplanetcenter.net/db_search/show_object"
+
+    def _request_fragment_listing(
+        self, designation: str, raw_rows: list[dict], rows: list[Observation],
+    ) -> None:
+        url = QUrl(
+            self.LISTING_PAGE_URL + "?" + urlencode({"utf8": "✓", "object_id": designation})
+        )
+        request = QNetworkRequest(url)
+        request.setRawHeader(b"User-Agent", b"OrbitSolver/1.0")
+        request.setTransferTimeout(30_000)
+        reply = self.manager.get(request)
+        self._active.add(reply)
+        reply.finished.connect(
+            lambda: self._listing_page_finished(reply, designation, raw_rows, rows)
+        )
+
+    def _listing_page_finished(
+        self, reply: QNetworkReply, designation: str, raw_rows: list[dict],
+        rows: list[Observation],
+    ) -> None:
+        self._active.discard(reply)
+        try:
+            link = None
+            if reply.error() == QNetworkReply.NoError:
+                page = bytes(reply.readAll()).decode("utf-8", errors="replace")
+                link = fragment_listing_link(page)
+            if link is None:
+                self._finish_with_fragments(designation, raw_rows, rows, [], checked=False)
+                return
+            request = QNetworkRequest(reply.url().resolved(QUrl(link)))
+            request.setRawHeader(b"User-Agent", b"OrbitSolver/1.0")
+            request.setTransferTimeout(60_000)
+            listing = self.manager.get(request)
+            self._active.add(listing)
+            listing.finished.connect(
+                lambda: self._listing_text_finished(listing, designation, raw_rows, rows)
+            )
+        finally:
+            reply.deleteLater()
+
+    def _listing_text_finished(
+        self, reply: QNetworkReply, designation: str, raw_rows: list[dict],
+        rows: list[Observation],
+    ) -> None:
+        self._active.discard(reply)
+        try:
+            if reply.error() != QNetworkReply.NoError:
+                self._finish_with_fragments(designation, raw_rows, rows, [], checked=False)
+                return
+            text = bytes(reply.readAll()).decode("utf-8", errors="replace")
+            lines = fragment_listing_lines(text)
+            fragments = parse_mpc80("\n".join(lines), designation) if lines else []
+            self._finish_with_fragments(
+                designation, raw_rows, rows + fragments, lines, checked=True,
+            )
+        finally:
+            reply.deleteLater()
+
+    def _finish_with_fragments(
+        self, designation: str, raw_rows: list[dict], rows: list[Observation],
+        lines: list[str], *, checked: bool,
+    ) -> None:
+        try:
+            mpc_cache.save(designation, raw_rows, mpc80_lines=lines, fragments_checked=checked)
+        except OSError:
+            pass  # an unwritable data folder must not block the download
+        self.success.emit((designation, rows, False, None))
 
     def _orbit_finished(self, reply: QNetworkReply, designation: str) -> None:
         self._active.discard(reply)
@@ -562,6 +666,7 @@ class MpcNetworkClient(QObject):
             semi_major_axis_au=a, eccentricity=e, inclination_deg=inc,
             node_deg=node, arg_peri_deg=arg_peri, mean_anomaly_deg=mean,
             photometric_exponent=4.0, phase_correction=False,
+            absolute_magnitude_known=False,
             position_au=tuple(state[:3]), velocity_au_per_day=tuple(state[3:]),
             data_source=(
                 tr("JPL Horizons (reprezentativní počáteční stav fragmentu G)")
@@ -717,9 +822,14 @@ class OrbitFitWorker(QObject):
         nongravitational: dict[str, float] | None = None,
         compute_original_future: bool = False,
         linkage_options: dict[str, bool] | None = None,
+        fragment_context: dict | None = None,
     ) -> None:
         super().__init__()
         self.observations = observations
+        # {"component": letters, "solutions": {letters: OrbitSolution}} for a
+        # split comet: after the fit the unlabelled post-split rows are
+        # re-assigned to the component whose orbit they follow.
+        self.fragment_context = fragment_context
         self.initial = initial
         self.constraints = constraints
         self.truncate_years = truncate_years
@@ -733,6 +843,46 @@ class OrbitFitWorker(QObject):
 
     def is_cancel_requested(self) -> bool:
         return self._cancel_requested
+
+    def _assign_fragments(self, working: list[Observation], solution: OrbitSolution):
+        component = self.fragment_context.get("component") or ""
+        solutions = dict(self.fragment_context.get("solutions") or {})
+        if component:
+            solutions[component] = solution
+        if len(solutions) < 2:
+            return None
+        self.progress.emit(
+            tr("Přiřazuji neoznačená měření po rozpadu ke složkám…"), 0, 0,
+        )
+        keys = (ASSIGNED_FRAGMENT_KEY, AMBIGUOUS_FRAGMENT_KEY, ASSIGNMENT_REASON_KEY)
+        saved = [
+            {key: item.raw[key] for key in keys if key in item.raw} for item in working
+        ]
+        try:
+            report = assign_unlabelled_rows(
+                working, solutions,
+                lambda rows, item: _evaluate_solution_observations(rows, item),
+            )
+        except (ValueError, RuntimeError, FloatingPointError, OverflowError):
+            # Keep the previous assignment rather than a half-cleared one.
+            for item, values in zip(working, saved):
+                for key in keys:
+                    item.raw.pop(key, None)
+                item.raw.update(values)
+            return None
+        select_fragment(working, component or None)
+        return report
+
+    def _warm_companion_previews(self) -> None:
+        """Integrate the other components to now in this thread, not the GUI's."""
+        now = np.array([datetime_to_jd(datetime.now(timezone.utc))])
+        for item in (self.fragment_context.get("solutions") or {}).values():
+            if self.is_cancel_requested():
+                return
+            try:
+                heliocentric_xyz(item, now)
+            except (ValueError, RuntimeError, FloatingPointError, OverflowError):
+                pass
 
     @Slot()
     def run(self) -> None:
@@ -754,6 +904,13 @@ class OrbitFitWorker(QObject):
                     self.linkage_options.get("historical_nongravitational")
                 ),
                 accept_model_tension=bool(self.linkage_options.get("accept_model_tension")),
+                historical_split_jd=split_years_to_jds(
+                    self.linkage_options.get("historical_split_year")
+                ),
+                historical_sigma=(
+                    tuple(self.linkage_options["historical_sigma"])
+                    if self.linkage_options.get("historical_sigma") else None
+                ),
             )
             solution = result[0]
             if self.compute_original_future:
@@ -787,6 +944,24 @@ class OrbitFitWorker(QObject):
             if prediction is not None:
                 solution = replace(solution, impact=prediction)
                 result = (solution, result[1], result[2])
+            elif solution.state_covariance is not None:
+                try:
+                    risk = close_approach_impact_risk(
+                        solution, IMPACT_CHECK_DAYS,
+                        cancel_callback=self.is_cancel_requested,
+                    )
+                except (
+                    ValueError, RuntimeError, FloatingPointError, OverflowError,
+                    np.linalg.LinAlgError,
+                ):
+                    risk = None
+                # A cancelled clone scan returns None; it must not pass for
+                # "no risk found".
+                if self.is_cancel_requested():
+                    raise OrbitFitCancelled()
+                if risk is not None:
+                    solution = replace(solution, impact_risk=risk)
+                    result = (solution, result[1], result[2])
             if (
                 solution.nongravitational_parameters
                 and solution.position_au is not None
@@ -802,13 +977,104 @@ class OrbitFitWorker(QObject):
                     )
                 except (ValueError, RuntimeError, FloatingPointError, OverflowError):
                     pass
-            self.success.emit((result, working))
+            report = None
+            if self.fragment_context:
+                report = self._assign_fragments(working, solution)
+                self._warm_companion_previews()
+                if self.is_cancel_requested():
+                    raise OrbitFitCancelled()
+            self.success.emit((result, working, report))
         except OrbitFitCancelled:
             self.cancelled.emit()
         except Exception as exc:
             self.error.emit(str(exc))
         finally:
             self.finished.emit()
+
+
+def decimal_year_to_jd(year: object) -> float | None:
+    """TDB-ish Julian date of a decimal year (``None``/0 → ``None``)."""
+    try:
+        value = float(year)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(value) or value <= 0.0:
+        return None
+    whole = int(np.floor(value))
+    start = datetime(whole, 1, 1, tzinfo=timezone.utc)
+    end = datetime(whole + 1, 1, 1, tzinfo=timezone.utc)
+    return datetime_to_jd(start + (end - start) * (value - whole))
+
+
+def parse_split_years(text: str) -> list[float]:
+    """Decimal years from '1993, 2008.5' (commas, semicolons or spaces; decimal comma kept)."""
+    values: list[float] = []
+    for token in re.split(r"[;\s]+|,(?=\s)|,(?=\d{4})", str(text or "").strip()):
+        token = token.strip().replace(",", ".")
+        if not token:
+            continue
+        try:
+            value = float(token)
+        except ValueError:
+            continue
+        if np.isfinite(value) and 0.0 < value < 3000.0:
+            values.append(value)
+    return sorted(set(values))
+
+
+def format_split_years(value: object) -> str:
+    if value is None:
+        return ""
+    items = value if isinstance(value, (list, tuple)) else [value]
+    return ", ".join(f"{float(item):g}" for item in items if item)
+
+
+def split_years_to_jds(value: object) -> list[float] | None:
+    """Switch epochs (JD) from a saved year or list of years (``None`` = default)."""
+    if value is None:
+        return None
+    items = value if isinstance(value, (list, tuple)) else [value]
+    jds = [jd for jd in (decimal_year_to_jd(item) for item in items) if jd is not None]
+    return jds or None
+
+
+def wants_fragment_listing(designation: str) -> bool:
+    """Whether the MPC text listing should complete get-obs (whole comets only)."""
+    return is_comet_designation(designation) and not designation_fragment(designation)
+
+
+def fragment_listing_link(page: str) -> str | None:
+    """Link of the MPC80 observation file on an MPC ``show_object`` page."""
+    match = re.search(r'href="([^"]*tmp2/[^"]+\.txt)"', page or "")
+    return match.group(1) if match else None
+
+
+def fragment_listing_lines(text: str) -> list[str]:
+    """MPC80 records of comet fragments (a, b, c …) in an MPC text listing.
+
+    Only these are added to the get-obs rows: the unlabelled records are
+    already there, with their ADES uncertainties.
+    """
+    return [
+        line for line in (text or "").splitlines()
+        if len(line) >= 80 and mpc80_fragment(line)
+    ]
+
+
+def imported_designation(rows: list[Observation]) -> str:
+    """Object designation of imported astrometry in the form the MPC expects.
+
+    MPC80 columns 1-12 are packed (``0205PI96R020``, ``    PK08R060``); MPC
+    queries, comet recognition and the cache need ``205P`` / ``P/2008 R6``.
+    The fragment suffix is dropped: one file may hold every component and
+    the fragment selector chooses among them.
+    """
+    for row in rows:
+        source = str(row.raw.get("mpc80") or "")
+        unpacked = unpack_mpc80_designation(source[:12], include_fragment=False)
+        if unpacked:
+            return unpacked
+    return rows[0].designation if rows else ""
 
 
 def apply_fitted_observations(
@@ -902,11 +1168,12 @@ class EpochPropagationWorker(QObject):
 class OrbitEvolutionWorker(QObject):
     success = Signal(object)
     error = Signal(str)
+    progress = Signal(int, int)
     finished = Signal()
 
     def __init__(
         self, solution: OrbitSolution, mode: str, past: int, future: int,
-        span: tuple[float, float] | None = None,
+        span: tuple[float, float] | None = None, clone_count: int = 0,
     ) -> None:
         super().__init__()
         self.solution = solution
@@ -914,6 +1181,11 @@ class OrbitEvolutionWorker(QObject):
         self.past = past
         self.future = future
         self.span = span
+        self.clone_count = int(clone_count)
+        self._cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
 
     @Slot()
     def run(self) -> None:
@@ -922,7 +1194,18 @@ class OrbitEvolutionWorker(QObject):
                 self.solution, self.mode, self.past, self.future, span=self.span,
             )
             # Impact location uncertainty from the fit covariance (Monte Carlo).
-            self.success.emit(with_impact_uncertainties(self.solution, result))
+            result = with_impact_uncertainties(self.solution, result)
+            spread = None
+            if self.clone_count > 0:
+                try:
+                    spread = evolution_clone_spread(
+                        self.solution, result, self.clone_count,
+                        cancel_callback=lambda: self._cancel_requested,
+                        progress_callback=self.progress.emit,
+                    )
+                except ValueError as exc:
+                    spread = str(exc)
+            self.success.emit((result, spread))
         except Exception as exc:
             self.error.emit(str(exc))
         finally:
@@ -1123,6 +1406,7 @@ class OrbitEvolutionPanel(QWidget):
         self._relation_pending: str | None = None
         self.thread: QThread | None = None
         self.worker: OrbitEvolutionWorker | None = None
+        self.clone_spread: CloneSpread | None = None
 
         layout = QVBoxLayout(self)
         controls = QHBoxLayout()
@@ -1147,7 +1431,24 @@ class OrbitEvolutionPanel(QWidget):
         controls.addWidget(self.past_label); controls.addWidget(self.past)
         controls.addWidget(self.future_label); controls.addWidget(self.future)
         controls.addWidget(self.span_hint)
-        controls.addWidget(self.calculate); controls.addStretch()
+        # Optional spread of covariance clones (off by default: every clone is
+        # one more full-length integration).
+        self.clones_enabled = QCheckBox(tr("Rozptyl klonů"))
+        self.clones_enabled.setToolTip(
+            tr(
+                "Kromě nominální dráhy integruje i klony z kovariance vlastního fitu "
+                "(stav dráhy a fitované A1/A2/A3/DT) a v grafu ukáže jejich rozptyl. Po "
+                "těsném průletu kolem planety je tak vidět, jak velká část předpovědi je "
+                "skutečně určena pozorováním. Každý klon je jedna další integrace celého "
+                "intervalu.",
+            )
+        )
+        self.clone_count = QSpinBox(); self.clone_count.setRange(5, 500); self.clone_count.setValue(30)
+        self.clone_count.setEnabled(False)
+        self.clones_enabled.toggled.connect(self.clone_count.setEnabled)
+        controls.addWidget(self.calculate)
+        controls.addWidget(self.clones_enabled); controls.addWidget(self.clone_count)
+        controls.addStretch()
         layout.addLayout(controls)
 
         self.note = QLabel(
@@ -1346,6 +1647,7 @@ class OrbitEvolutionPanel(QWidget):
         self._update_source_note()
         self._update_span_hint()
         self.result = None
+        self.clone_spread = None
         self._centered_cache.clear()
         self._relation_cache.clear()
         self._populate_views()
@@ -1399,13 +1701,17 @@ class OrbitEvolutionPanel(QWidget):
             )
         )
         thread = QThread(self)
+        clones = self.clone_count.value() if self.clones_enabled.isChecked() else 0
         worker = OrbitEvolutionWorker(
             self.solution, str(self.mode.currentData()), self.past.value(), self.future.value(),
-            span,
+            span, clones,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.success.connect(self._completed)
+        worker.progress.connect(
+            lambda done, total: self.calculate.setText(tr("Klony {0}/{1}…", done + 1, total))
+        )
         worker.error.connect(self._failed)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
@@ -1423,7 +1729,14 @@ class OrbitEvolutionPanel(QWidget):
         self.note.setText(tr("Výpočet se nezdařil: {0}", message))
         QMessageBox.warning(self, tr("Vývoj dráhy"), message)
 
-    def _completed(self, result: EvolutionResult) -> None:
+    def _completed(self, payload: object) -> None:
+        if isinstance(payload, tuple):
+            result, spread = payload
+        else:
+            result, spread = payload, None
+        self.clone_spread = spread if isinstance(spread, CloneSpread) else None
+        if isinstance(spread, str):
+            QMessageBox.information(self, tr("Rozptyl klonů"), spread)
         self.result = result
         self._centered_cache.clear()
         self._relation_cache.clear()
@@ -1433,7 +1746,7 @@ class OrbitEvolutionPanel(QWidget):
         phase_note = (
             tr(
                 "Vstup a výstup jsou oskulační stavy na hranicích zvoleného intervalu. "
-                "Svislé značky v grafu ukazují planetární setkání. Dvojklikem zobrazíte "
+                "Svislé značky v grafu ukazují setkání s planetami či Měsícem. Dvojklikem zobrazíte "
                 "stav ve Sluneční soustavě.",
             )
             if result.snapshots else
@@ -1449,7 +1762,7 @@ class OrbitEvolutionPanel(QWidget):
             + (
                 tr("  Detekováno planetocentrické zachycení: ")
                 + ", ".join(
-                    f"{PLANET_LABELS.get(item.planet, item.planet)} "
+                    f"{BODY_LABELS.get(item.planet, item.planet)} "
                     f"{(datetime_from_jd(item.start_jd) or datetime.min.replace(tzinfo=timezone.utc)).year}–"
                     f"{(datetime_from_jd(item.end_jd) or datetime.min.replace(tzinfo=timezone.utc)).year}"
                     for item in result.captures
@@ -1464,7 +1777,7 @@ class OrbitEvolutionPanel(QWidget):
             date = datetime_from_jd(item.epoch_jd)
             rows.append((item.epoch_jd, (
                 date.strftime("%Y-%m-%d %H:%M") if date else f"JD {item.epoch_jd:.2f}",
-                PLANET_LABELS.get(item.planet, item.planet), f"{item.distance_au:.6f}",
+                BODY_LABELS.get(item.planet, item.planet), f"{item.distance_au:.6f}",
                 f"{item.hill_radii:.3f}", f"{item.relative_velocity_kms:.2f}",
                 "—" if item.v_infinity_kms is None else f"{item.v_infinity_kms:.2f}",
                 "—" if item.delta_reciprocal_a is None else f"{item.delta_reciprocal_a:+.3e}",
@@ -1762,6 +2075,8 @@ class OrbitEvolutionPanel(QWidget):
         finite = np.isfinite(values)
         # NaN values (notably the period while an orbit is open) deliberately
         # break the curve instead of drawing a misleading bridge.
+        if view != "captured":
+            self._draw_clone_spread(ax, attribute, metric_key)
         ax.plot(x, values, color="#67cfe8", lw=1.45, alpha=.9)
         return_x = np.array([
             2000.0 + (item.epoch_jd - 2451545.0) / 365.25 for item in displayed_states
@@ -1793,7 +2108,7 @@ class OrbitEvolutionPanel(QWidget):
             encounter_x = 2000.0 + (encounter.epoch_jd - 2451545.0) / 365.25
             ax.axvline(encounter_x, color="#f0c85a", lw=.9, alpha=.65, ls="--")
             date = datetime_from_jd(encounter.epoch_jd)
-            label = PLANET_LABELS.get(encounter.planet, encounter.planet)
+            label = BODY_LABELS.get(encounter.planet, encounter.planet)
             if date:
                 label += f" {date.year}"
             ax.text(encounter_x, .98, label, transform=ax.get_xaxis_transform(),
@@ -1803,7 +2118,7 @@ class OrbitEvolutionPanel(QWidget):
             end_x = 2000.0 + (capture.end_jd - 2451545.0) / 365.25
             ax.axvspan(start_x, end_x, color="#b07cff", alpha=.12, zorder=.1)
             ax.text((start_x + end_x) / 2.0, .04,
-                    tr("zachycení: {0}", PLANET_LABELS.get(capture.planet, capture.planet)),
+                    tr("zachycení: {0}", BODY_LABELS.get(capture.planet, capture.planet)),
                     transform=ax.get_xaxis_transform(), ha="center", va="bottom",
                     color="#c9a8ff", fontsize=8)
         ax.set_xlabel(tr("rok"))
@@ -1822,6 +2137,29 @@ class OrbitEvolutionPanel(QWidget):
         )
         ax.grid(color="#273750", alpha=.55, lw=.6)
         self.canvas.draw_idle()
+
+    def _draw_clone_spread(self, ax, attribute: str, metric_key: str) -> None:
+        """Faint clone curves and their 5-95 % band behind the nominal curve."""
+        spread = self.clone_spread
+        if spread is None or not spread.count or attribute not in spread.elements:
+            return
+        series = np.array(spread.elements[attribute], dtype=float)
+        if metric_key in {"node", "arg_peri"}:
+            series = np.degrees(np.unwrap(np.radians(np.nan_to_num(series)), axis=1))
+        years = 2000.0 + (spread.epochs - 2451545.0) / 365.25
+        if spread.count <= 100:
+            for row in series:
+                ax.plot(years, row, color="#ff9ad5", lw=.55, alpha=.18, zorder=1)
+        valid = np.sum(np.isfinite(series), axis=0) >= max(3, spread.count // 2)
+        with warnings.catch_warnings(), np.errstate(all="ignore"):
+            warnings.simplefilter("ignore", RuntimeWarning)   # all-NaN columns
+            low = np.nanpercentile(np.where(valid, series, np.nan), 5, axis=0)
+            high = np.nanpercentile(np.where(valid, series, np.nan), 95, axis=0)
+        ax.fill_between(
+            years, low, high, where=valid, color="#ff9ad5", alpha=.16, lw=0, zorder=.8,
+            label=tr("{0} klonů, 5–95 %", spread.count),
+        )
+        ax.legend(loc="lower left", fontsize=8, framealpha=.4)
 
     def _draw_impacts(self, ax) -> None:
         for impact in self.result.impacts if self.result else ():
@@ -1949,7 +2287,10 @@ class OrbitEvolutionPanel(QWidget):
             return ""
         if self.report_format.currentData() == "mpc":
             return format_evolution_mpc_report(self.solution, self.result)
-        return format_evolution_report(self.solution, self.result)
+        report = format_evolution_report(self.solution, self.result)
+        if self.clone_spread is not None:
+            report += "\n\n" + "\n".join(clone_spread_summary(self.clone_spread, self.result))
+        return report
 
     def _copy_report(self) -> None:
         report = self._report_text()
@@ -2107,6 +2448,9 @@ class SolarSystemPanel(QWidget):
     ) -> None:
         super().__init__()
         self.solution = solution
+        # Other components of a split comet (label -> own orbit), drawn as
+        # small markers next to the displayed one.
+        self.companions: dict[str, OrbitSolution] = {}
         self.evolution_source: OrbitSolution | None = None
         self.evolution_result: EvolutionResult | None = None
         self.playback = playback
@@ -2131,7 +2475,7 @@ class SolarSystemPanel(QWidget):
         notice.setObjectName("muted")
         controls.addWidget(notice); controls.addStretch()
         self.show_orbit_curtain = QCheckBox(tr("Projekční plocha k ekliptice (3D)"))
-        self.show_orbit_curtain.setChecked(False)
+        self.show_orbit_curtain.setChecked(True)
         self.show_orbit_curtain.setToolTip(
             tr(
                 "Zobrazí průsvitnou projekční plochu mezi dráhou tělesa a jejím kolmým "
@@ -2152,7 +2496,8 @@ class SolarSystemPanel(QWidget):
         self.view_center = QComboBox()
         for key, label in ELEMENT_CENTERS:
             self.view_center.addItem(tr("Střed: {0}", label), key)
-        self.view_center.setEnabled(False)
+        self.view_center.addItem(tr("Střed: {0}", tr("těleso")), "object")
+        self.view_center.setEnabled(True)
         self.view_center.currentIndexChanged.connect(self._view_center_changed)
         controls.addWidget(self.view_center)
         enlarge = QPushButton(tr("Zvětšit ↗") if allow_detach else tr("Celá obrazovka (F11)"))
@@ -2211,7 +2556,7 @@ class SolarSystemPanel(QWidget):
         # A complete planetary orbit is effectively a static backdrop over
         # an animation.  Recomputing thousands of DE440 positions for every
         # frame was by far the largest source of stutter.
-        self._planet_path_cache: dict[tuple[str, str], np.ndarray] = {}
+        self._planet_path_cache: dict[tuple[object, ...], np.ndarray] = {}
         self.canvas.mpl_connect("button_press_event", self._camera_press)
         self.canvas.mpl_connect("motion_notify_event", self._camera_motion)
         self.canvas.mpl_connect("button_release_event", self._camera_release)
@@ -2230,6 +2575,7 @@ class SolarSystemPanel(QWidget):
         playback = PlaybackBar()
         playback.time.setDateTime(self.playback.time.dateTime())
         panel = SolarSystemPanel(self.solution, playback, allow_detach=False)
+        panel.companions = dict(self.companions)
         panel.view_azimuth.setValue(self.view_azimuth.value())
         panel.view_elevation.setValue(self.view_elevation.value())
         panel.view_zoom.setValue(self.view_zoom.value())
@@ -2314,19 +2660,16 @@ class SolarSystemPanel(QWidget):
             result and result.trajectory_epochs is not None
             and result.trajectory_states is not None
         ))
-        self.view_center.setEnabled(bool(
-            result and result.trajectory_epochs is not None
-            and result.trajectory_states is not None
-        ))
-        if result is None:
-            self.view_center.setCurrentIndex(self.view_center.findData("sun"))
+        self.view_center.setEnabled(True)
 
     def _view_center_changed(self, *_args) -> None:
         center = str(self.view_center.currentData() or "sun")
-        if center != "sun":
-            enabled = self.evolution_count.findData(-1)
-            if enabled >= 0 and int(self.evolution_count.currentData()) == 0:
-                self.evolution_count.setCurrentIndex(enabled)
+        if center == "object":
+            target = .02
+            minimum, maximum = .0005, 5.0
+            fraction = np.log(target / minimum) / np.log(maximum / minimum)
+            self.view_zoom.setValue(int(round(fraction * self.view_zoom.maximum())))
+        elif center != "sun":
             target = max(.01, HILL_RADII_AU[center] * 1.6)
             minimum, maximum = .0005, 5.0
             fraction = np.log(np.clip(target, minimum, maximum) / minimum) / np.log(maximum / minimum)
@@ -2336,17 +2679,13 @@ class SolarSystemPanel(QWidget):
         self.set_time(self.playback.time.dateTime().toPython())
 
     def _evolution_display_changed(self, *_args) -> None:
-        if (
-            int(self.evolution_count.currentData()) == 0
-            and str(self.view_center.currentData() or "sun") != "sun"
-        ):
-            self.view_center.setCurrentIndex(self.view_center.findData("sun"))
-            return
         self.set_time(self.playback.time.dateTime().toPython())
 
     def _center_positions(self, center: str, epochs: np.ndarray) -> np.ndarray:
         if center == "sun":
             return np.zeros((len(epochs), 3), dtype=float)
+        if center == "object":
+            raise ValueError("The moving object centre needs an explicit current position")
         key = (center, id(epochs))
         cached = self._center_track_cache.get(key)
         if cached is None:
@@ -2411,21 +2750,41 @@ class SolarSystemPanel(QWidget):
         # Open conics still need a finite plotting radius near their asymptote.
         current_jd = datetime_to_jd(time)
         center = str(self.view_center.currentData() or "sun")
-        center_label = dict(ELEMENT_CENTERS).get(center, center)
-        center_now = (
-            np.zeros(3, dtype=float) if center == "sun"
-            else PLANETS.position(center, current_jd)
+        center_label = (
+            self.solution.designation if center == "object"
+            else dict(ELEMENT_CENTERS).get(center, center)
         )
         trajectory = self._integrated_trajectory()
+        if center == "sun":
+            center_now = np.zeros(3, dtype=float)
+        elif center == "object":
+            center_now = self._trajectory_position(trajectory, current_jd)
+            if center_now is None:
+                center_now = heliocentric_xyz(
+                    self.solution, np.array([current_jd]),
+                )[0]
+        else:
+            center_now = PLANETS.position(center, current_jd)
         propagated_current: np.ndarray | None = None
         if trajectory is not None:
             trajectory_epochs, trajectory_states = trajectory
-            # Plot at most 6000 points; this is visually continuous while a
-            # multi-century integration remains responsive during animation.
-            stride = max(1, int(np.ceil(len(trajectory_epochs) / 6000)))
-            plotted_epochs = trajectory_epochs[::stride]
-            center_track = self._center_positions(center, trajectory_epochs)[::stride]
-            xyz = trajectory_states[::stride, :3] - center_track
+            # Keep the densely integrated planet-capture loops even when the
+            # quiet heliocentric parts of a multi-century trajectory are
+            # thinned for interactive animation.
+            capture_ranges = tuple(
+                (item.start_jd, item.end_jd)
+                for item in (self.evolution_result.captures
+                             if self.evolution_result else ())
+            )
+            plot_indices = trajectory_display_indices(
+                trajectory_epochs, capture_ranges,
+            )
+            plotted_epochs = trajectory_epochs[plot_indices]
+            if center == "object":
+                center_track = np.broadcast_to(center_now, (len(plotted_epochs), 3))
+            else:
+                center_track = self._center_positions(center, trajectory_epochs)[plot_indices]
+            xyz = trajectory_states[plot_indices, :3] - center_track
             # Let the axes clip the projected curve.  Radial pre-clipping can
             # cut a tilted orbit whose distant part still projects into view.
             valid = np.all(np.isfinite(xyz), axis=1)
@@ -2464,6 +2823,8 @@ class SolarSystemPanel(QWidget):
                 pass
             orbit_radius = solar_orbit_clip_radius(curve_solution, curve_radius)
             xyz, valid = orbital_curve_xyz(curve_solution, max_radius_au=orbit_radius)
+            if center != "sun":
+                xyz = xyz - center_now
             plotted_epochs = None
             valid_indices = np.flatnonzero(valid)
             breaks = np.where(np.diff(valid_indices) > 1)[0] + 1
@@ -2504,50 +2865,29 @@ class SolarSystemPanel(QWidget):
                         arc = sampled_arc
                         base = arc.copy()
                         base[:, 2] = 0.0
-                        arc_x, arc_y, _ = project_ecliptic_camera(
-                            arc, azimuth, elevation
-                        )
                         base_x, base_y, _ = project_ecliptic_camera(
                             base, azimuth, elevation
                         )
-                        # A muted blue above and violet below the ecliptic
-                        # reveal both nodes while remaining distinct from the
-                        # cyan/magenta past/future trajectory colours.
-                        surface_color = (
-                            "#579bd1" if float(np.mean(arc[:, 2])) >= 0.0
-                            else "#9a65bd"
+                        quads = projected_ecliptic_curtain_quads(
+                            arc, azimuth, elevation,
                         )
-                        height_scale = max(
-                            float(np.max(np.abs(arc[:, 2]))), 1e-12
-                        )
-                        ax.fill(
-                            np.concatenate((arc_x, base_x[::-1])),
-                            np.concatenate((arc_y, base_y[::-1])),
-                            facecolor=surface_color, edgecolor="none",
-                            alpha=.16, zorder=.28,
-                        )
-                        # The footprint plus a handful of very fine vertical
-                        # connectors act as depth cues without recreating the
-                        # dense striped curtain the user wanted to avoid.
-                        ax.plot(
-                            base_x, base_y, color="#7895b6", lw=.55,
-                            alpha=.28, ls=(0, (2, 5)), zorder=.29,
-                        )
-                        rib_count = min(10, len(arc))
-                        rib_indices = np.unique(np.linspace(
-                            0, len(arc) - 1, rib_count, dtype=int
+                        # A concave projected curtain must not be filled as
+                        # one polygon: its implicit closing chords produce
+                        # large false wedges at some camera angles.  Adjacent
+                        # edge-free quads preserve the actual ruled surface.
+                        # Their colour is the 13%-opaque orbit blue already
+                        # composited over the fixed axes background.  Drawing
+                        # that result opaquely prevents shared raster edges
+                        # from accumulating alpha into visible vertical ribs.
+                        ax.add_collection(PolyCollection(
+                            quads, facecolors="#172b44", edgecolors="none",
+                            linewidths=0.0, antialiaseds=False,
+                            zorder=.28,
                         ))
-                        ribs = [
-                            ((base_x[index], base_y[index]),
-                             (arc_x[index], arc_y[index]))
-                            for index in rib_indices
-                            if abs(float(arc[index, 2])) > height_scale * .04
-                        ]
-                        if ribs:
-                            ax.add_collection(LineCollection(
-                                ribs, colors="#9bb6d0", linewidths=.42,
-                                alpha=.20, zorder=.31,
-                            ))
+                        ax.plot(
+                            base_x, base_y, color="#52a9ff", lw=.55,
+                            alpha=.22, zorder=.29,
+                        )
             for segment in orbit_segments:
                 if len(segment) > 1:
                     screen_x, screen_y, _ = project_ecliptic_camera(
@@ -2601,6 +2941,7 @@ class SolarSystemPanel(QWidget):
                     continue
                 encounter_center = (
                     np.zeros(3, dtype=float) if center == "sun"
+                    else center_now if center == "object"
                     else PLANETS.position(center, encounter.epoch_jd)
                 )
                 encounter_relative = encounter_position - encounter_center
@@ -2619,7 +2960,7 @@ class SolarSystemPanel(QWidget):
                     str(encounter_date.year) if encounter_date is not None else "?"
                 )
                 ax.annotate(
-                    f"{PLANET_LABELS.get(encounter.planet, encounter.planet)} "
+                    f"{BODY_LABELS.get(encounter.planet, encounter.planet)} "
                     f"{encounter_year}",
                     (switch_x, switch_y), xytext=(5, -11),
                     textcoords="offset points", color="#e9cb78", fontsize=7,
@@ -2634,7 +2975,8 @@ class SolarSystemPanel(QWidget):
             if np.linalg.norm(relative_position) > curve_radius * 1.15:
                 continue
             if key != center:
-                cache_key = (key, center)
+                path_center = "sun" if center == "object" else center
+                cache_key = (key, path_center)
                 path = self._planet_path_cache.get(cache_key)
                 if path is None:
                     planet_jd = np.linspace(
@@ -2643,19 +2985,55 @@ class SolarSystemPanel(QWidget):
                     path = np.stack([
                         PLANETS.position(key, float(epoch)) for epoch in planet_jd
                     ])
-                    if center != "sun":
+                    if path_center != "sun":
                         path -= np.stack([
-                            PLANETS.position(center, float(epoch))
+                            PLANETS.position(path_center, float(epoch))
                             for epoch in planet_jd
                         ])
                     self._planet_path_cache[cache_key] = path
-                path_x, path_y, _ = project_ecliptic_camera(path, azimuth, elevation)
+                displayed_path = path - center_now if center == "object" else path
+                path_x, path_y, _ = project_ecliptic_camera(
+                    displayed_path, azimuth, elevation,
+                )
                 ax.plot(path_x, path_y, color=color, alpha=.7, lw=1.15)
             px, py, _ = project_ecliptic_camera(relative_position, azimuth, elevation)
             ax.scatter(px, py, s=30 if key != "jupiter" else 46, color=color,
                        edgecolor="white", linewidth=.45, zorder=5)
             ax.annotate(name, (px, py), xytext=(4, 4), textcoords="offset points",
                         color=color, fontsize=8)
+        if center == "earth":
+            moon_position = PLANETS.position("moon", current_jd) - center_now
+            if np.linalg.norm(moon_position) <= curve_radius * 1.15:
+                moon_cache_day, moon_jd = lunar_orbit_path_epochs(current_jd)
+                cache_key = ("moon", "earth", moon_cache_day)
+                moon_path = self._planet_path_cache.get(cache_key)
+                if moon_path is None:
+                    for old_key in tuple(self._planet_path_cache):
+                        if old_key[:2] == ("moon", "earth"):
+                            self._planet_path_cache.pop(old_key, None)
+                    moon_path = (
+                        np.asarray(PLANETS.position_series("moon", moon_jd), dtype=float)
+                        - np.asarray(PLANETS.position_series("earth", moon_jd), dtype=float)
+                    )
+                    self._planet_path_cache[cache_key] = moon_path
+                moon_path_x, moon_path_y, _ = project_ecliptic_camera(
+                    moon_path, azimuth, elevation,
+                )
+                ax.plot(
+                    moon_path_x, moon_path_y, color="#b9c8dc",
+                    alpha=.72, lw=1.0,
+                )
+                moon_x, moon_y, _ = project_ecliptic_camera(
+                    moon_position, azimuth, elevation,
+                )
+                ax.scatter(
+                    moon_x, moon_y, s=24, color="#d9e1ec",
+                    edgecolor="white", linewidth=.4, zorder=5.5,
+                )
+                ax.annotate(
+                    tr("Měsíc"), (moon_x, moon_y), xytext=(4, 4),
+                    textcoords="offset points", color="#d9e1ec", fontsize=8,
+                )
         heliocentric_current = self._trajectory_position(trajectory, current_jd)
         if heliocentric_current is None and propagated_current is not None:
             heliocentric_current = propagated_current
@@ -2667,6 +3045,20 @@ class SolarSystemPanel(QWidget):
                    linewidth=.6, zorder=7)
         ax.annotate(self.solution.designation, (object_x, object_y), xytext=(6, 6),
                     textcoords="offset points", color="#7fe7ff", fontsize=9, fontweight="bold")
+        for label, companion in self.companions.items():
+            try:
+                companion_position = heliocentric_xyz(companion, np.array([current_jd]))[0]
+            except (ValueError, RuntimeError, FloatingPointError, OverflowError):
+                continue
+            if not np.all(np.isfinite(companion_position)):
+                continue
+            companion_x, companion_y, _ = project_ecliptic_camera(
+                companion_position - center_now, azimuth, elevation,
+            )
+            ax.scatter(companion_x, companion_y, s=22, color="#ff9ad5", edgecolor="white",
+                       linewidth=.45, zorder=6.8)
+            ax.annotate(label, (companion_x, companion_y), xytext=(6, -10),
+                        textcoords="offset points", color="#ff9ad5", fontsize=8)
         sun_position = -center_now
         sun_x, sun_y, _ = project_ecliptic_camera(sun_position, azimuth, elevation)
         ax.scatter(sun_x, sun_y, s=95, color="#ffd166", edgecolor="#fff0b3",
@@ -2706,7 +3098,7 @@ class SolarSystemPanel(QWidget):
         distance_earth = float(np.linalg.norm(heliocentric_current - earth))
         distance_sun = float(np.linalg.norm(heliocentric_current))
         center_distance = float(np.linalg.norm(current))
-        center_text = "" if center == "sun" else tr(
+        center_text = "" if center in ("sun", "object") else tr(
             "    od {0} {1:.6f} AU",
             center_label,
             center_distance,
@@ -2786,6 +3178,7 @@ class SkyPanel(QWidget):
     ) -> None:
         super().__init__()
         self.solution = solution
+        self.companions: dict[str, OrbitSolution] = {}
         self.playback = playback
         self._detached_windows: list[QMainWindow] = []
         self.free_center_ra: float | None = None
@@ -2819,10 +3212,12 @@ class SkyPanel(QWidget):
             )
         )
         self.field_of_view = QComboBox()
-        for angle in (15, 30, 60, 120, 180, 240):
-            self.field_of_view.addItem(f"{angle}°", float(angle))
+        # Sub-degree fields show split-comet fragments, typically arcminutes
+        # from each other.
+        for angle in (0.25, 1, 5, 15, 30, 60, 120, 180, 240):
+            self.field_of_view.addItem(f"{angle:g}°", float(angle))
         self.field_of_view.addItem(tr("Celá obloha"), 360.0)
-        self.field_of_view.setCurrentIndex(2)
+        self.field_of_view.setCurrentIndex(self.field_of_view.findData(60.0))
         self.horizontal_horizon = QComboBox()
         for label, days in (
             (tr("12 hodin celkem"), .25), (tr("24 hodin celkem"), .5),
@@ -2984,6 +3379,7 @@ class SkyPanel(QWidget):
         playback = PlaybackBar()
         playback.time.setDateTime(self.playback.time.dateTime())
         panel = SkyPanel(self.solution, playback, allow_detach=False)
+        panel.companions = dict(self.companions)
         panel.horizon.setCurrentIndex(panel.horizon.findData(self.horizon.currentData()))
         panel.horizontal_horizon.setCurrentIndex(
             panel.horizontal_horizon.findData(self.horizontal_horizon.currentData())
@@ -3658,6 +4054,28 @@ class SkyPanel(QWidget):
                         textcoords="offset points", color="#67e4ff", fontsize=9,
                         fontweight="bold", va="top", zorder=7,
                         bbox={"facecolor": "#0e1828", "edgecolor": "none", "alpha": .72, "pad": 1.5})
+        for label, companion in self.companions.items():
+            try:
+                companion_now = apparent_geometry(companion, np.array([jd0]))
+            except (ValueError, RuntimeError, FloatingPointError, OverflowError):
+                continue
+            companion_ra = float(companion_now["ra"][0])
+            companion_dec = float(companion_now["dec"][0])
+            if not (np.isfinite(companion_ra) and np.isfinite(companion_dec)):
+                continue
+            companion_x, companion_y, companion_distance = projection(
+                companion_ra, companion_dec, center_ra, center_dec,
+            )
+            if not bool(visible_mask(
+                np.atleast_1d(companion_x), np.atleast_1d(companion_y),
+                np.atleast_1d(companion_distance),
+            )[0]):
+                continue
+            ax.scatter(float(companion_x), float(companion_y), s=34, color="#ff9ad5",
+                       edgecolor="white", linewidth=.6, zorder=5.8)
+            if self.show_labels.isChecked():
+                ax.annotate(label, (float(companion_x), float(companion_y)), xytext=(9, 6),
+                            textcoords="offset points", color="#ff9ad5", fontsize=8, zorder=7)
 
         for name, body_ra, body_dec, color, size in self._body_positions(jd0):
             body_x, body_y, body_distance = projection(
@@ -3816,6 +4234,10 @@ class PhotometryPanel(QWidget):
         self.redraw()
 
     def _absolute_changed(self, value: float) -> None:
+        # Programmatic setValue() of the same H must not turn a placeholder
+        # into a "known" magnitude; only a real edit does.
+        if float(value) != float(self.solution.absolute_magnitude):
+            self.solution.absolute_magnitude_known = True
         self.solution.absolute_magnitude = float(value)
         self.photometry_changed.emit()
         self.redraw()
@@ -3843,6 +4265,7 @@ class PhotometryPanel(QWidget):
             self.exponent.value(), phase,
         )
         self.solution.absolute_magnitude = estimate
+        self.solution.absolute_magnitude_known = True
         self.solution.photometric_exponent = self.exponent.value()
         self.solution.phase_correction = use_phase
         self.absolute.setValue(estimate)
@@ -4391,11 +4814,19 @@ class ElementsPanel(QWidget):
             )
         impact_lines: list[str] = []
         prediction = getattr(self.solution, "impact", None)
+        impact_risk = getattr(self.solution, "impact_risk", None)
         if prediction is not None:
             label = BODY_LABELS.get(prediction.body, prediction.body)
             impact_lines = [
                 "*** " + tr("PŘEDPOVĚĎ DOPADU: {0}", label).upper() + " ***",
                 *describe_impact(prediction, label).split("\n")[1:],
+                "",
+            ]
+        elif impact_risk is not None:
+            label = BODY_LABELS.get(impact_risk.body, impact_risk.body)
+            impact_lines = [
+                "*** " + tr("NENULOVÉ RIZIKO DOPADU: {0}", label).upper() + " ***",
+                *describe_impact_risk(impact_risk, label).split("\n")[1:],
                 "",
             ]
         lines = [
@@ -4416,6 +4847,7 @@ class ElementsPanel(QWidget):
             f"Q    {aphelion:12.9f} AU" if aphelion is not None else "Q               — (open orbit)",
             f"P    {period:.5f} days = {period / 365.2569:.6f} years" if period else "P               —",
             f"H {s.absolute_magnitude:.2f}   G {s.slope_g:.2f}",
+            *asteroid_size_lines(s),
         ]
         if s.nongravitational_parameters:
             if "R_EXPONENT" in s.nongravitational_parameters:
@@ -4426,14 +4858,23 @@ class ElementsPanel(QWidget):
                 )
             else:
                 lines.append("Nongravitational parameters (Marsden water-ice model):")
-            split = s.nongravitational_parameters.get(NONGRAVITATIONAL_SPLIT_KEY)
-            if split is not None:
+            try:
+                splits = force_period_splits(s.nongravitational_parameters)
+            except FloatingPointError:
+                splits = ()
+            for period, split in enumerate(splits, start=1):
                 switch = datetime_from_jd(float(split))
                 switch_text = f"{switch:%Y-%m-%d}" if switch else f"JD {float(split):.1f}"
-                lines.append(
-                    f"Historical set A1H-A3H applies before {switch_text} (TDB), A1-A3 after it."
+                names = historical_period_names(period)
+                newer = "A1-A3" if period == 1 else (
+                    f"{historical_period_names(period - 1)['A1']}-"
+                    f"{historical_period_names(period - 1)['A3']}"
                 )
-            for name in ("A1", "A2", "A3", "DT", *HISTORICAL_NONGRAVITATIONAL.values()):
+                lines.append(
+                    f"Set {names['A1']}-{names['A3']} applies before {switch_text} (TDB), "
+                    f"{newer} after it."
+                )
+            for name in ("A1", "A2", "A3", "DT", *ALL_HISTORICAL_NAMES):
                 if name in s.nongravitational_parameters:
                     value = s.nongravitational_parameters[name]
                     uncertainty = (s.element_uncertainties or {}).get(name)
@@ -4702,8 +5143,19 @@ class ElementsPanel(QWidget):
 
     def _update_impact_banner(self) -> None:
         prediction = getattr(self.solution, "impact", None)
-        if prediction is None:
+        impact_risk = getattr(self.solution, "impact_risk", None)
+        if prediction is None and impact_risk is None:
             self.impact_banner.setVisible(False)
+            return
+        if prediction is None:
+            label = BODY_LABELS.get(impact_risk.body, impact_risk.body)
+            details = describe_impact_risk(impact_risk, label).split("\n")
+            self.impact_banner.setText(
+                "<b style='font-size:16px; color:#f0c85a'>"
+                + html.escape(tr("⚠ NENULOVÉ RIZIKO DOPADU: {0}", label).upper())
+                + "</b><br>" + "<br>".join(html.escape(line) for line in details[1:])
+            )
+            self.impact_banner.setVisible(True)
             return
         label = BODY_LABELS.get(prediction.body, prediction.body)
         details = describe_impact(prediction, label).split("\n")
@@ -4999,8 +5451,9 @@ class OrbitConstraintsDialog(QDialog):
         )
         self.historical_force.setToolTip(
             tr(
-                "Před nejdelší mezerou v pozorováních platí vlastní sada A1H–A3H, po ní "
-                "A1–A3. Hodí se pro komety, jejichž aktivita se mezi historickým a "
+                "Před okamžikem přepnutí (výchozí: střed nejdelší mezery v pozorováních) "
+                "platí vlastní sada A1H–A3H, po něm A1–A3. Hodí se pro komety, jejichž "
+                "aktivita se mezi historickým a "
                 "moderním návratem změnila (205P: ztracena 1896–2008). Historická sada "
                 "se fituje až s připojením historického návratu.",
             )
@@ -5024,12 +5477,67 @@ class OrbitConstraintsDialog(QDialog):
             )
         )
         self.model_tension.setChecked(bool(linkage_options.get("accept_model_tension")))
+        # Switch epochs of the force periods (empty = middle of the longest gap).
+        self.historical_split_year = QLineEdit()
+        self.historical_split_year.setPlaceholderText(tr("střed nejdelší mezery"))
+        self.historical_split_year.setText(
+            format_split_years(linkage_options.get("historical_split_year"))
+        )
+        self.historical_split_year.setToolTip(
+            tr(
+                "Rok nebo více let oddělených čárkou (desetinné hodnoty), kdy se mění "
+                "negravitační síly; každé období mezi nimi má vlastní A1–A3 (nejnovější "
+                "A1–A3, starší A1H–A3H, A1H2–A3H2 …, nejvýše {0} období). Každý rok musí "
+                "ležet v mezeře mezi pozorovanými návraty. Nejvhodnější je okamžik změny "
+                "aktivity – rozpad (205P: úlomek C koncem roku 1998) nebo těsný průlet "
+                "kolem Jupiteru, který změnil dráhu (78P: 1995) – nejlépe daleko od Slunce.",
+                MAX_FORCE_PERIODS,
+            )
+        )
+        split_row = QWidget(); split_layout = QHBoxLayout(split_row)
+        split_layout.setContentsMargins(24, 0, 0, 0)
+        split_layout.addWidget(QLabel(tr("Přepnutí sil v letech:")))
+        split_layout.addWidget(self.historical_split_year); split_layout.addStretch()
+        sigma = linkage_options.get("historical_sigma") or None
+        self.historical_sigma = QCheckBox(tr("Zvětšit nejistotu měření pořízených před rokem"))
+        self.historical_sigma.setToolTip(
+            tr(
+                "Stará mikrometrická a fotografická měření z mnoha observatoří mají "
+                "soustavné chyby několika obloukových vteřin (katalog, měřítko desky, "
+                "pozorovatel), které se průměrováním nezmenší. Zvětšením jejich nejistoty "
+                "dostanou ve společném fitu odpovídající váhu.",
+            )
+        )
+        self.historical_sigma.setChecked(bool(sigma))
+        self.historical_sigma_year = QSpinBox(); self.historical_sigma_year.setRange(1600, 2100)
+        self.historical_sigma_year.setValue(int(sigma[0]) if sigma else 1950)
+        self.historical_sigma_factor = QDoubleSpinBox()
+        self.historical_sigma_factor.setRange(1.1, 20.0); self.historical_sigma_factor.setDecimals(1)
+        self.historical_sigma_factor.setSingleStep(0.5); self.historical_sigma_factor.setPrefix("× ")
+        self.historical_sigma_factor.setValue(float(sigma[1]) if sigma else 3.0)
+        sigma_row = QWidget(); sigma_layout = QHBoxLayout(sigma_row)
+        sigma_layout.setContentsMargins(0, 0, 0, 0)
+        sigma_layout.addWidget(self.historical_sigma)
+        sigma_layout.addWidget(self.historical_sigma_year)
+        sigma_layout.addWidget(self.historical_sigma_factor); sigma_layout.addStretch()
+
+        def sync_sigma() -> None:
+            self.historical_sigma_year.setEnabled(self.historical_sigma.isChecked())
+            self.historical_sigma_factor.setEnabled(self.historical_sigma.isChecked())
+
+        self.historical_sigma.toggled.connect(sync_sigma)
+        sync_sigma()
 
         def sync_historical() -> None:
             available = any(control.isChecked() for control in a_checks)
             self.historical_force.setEnabled(available)
             if not available:
                 self.historical_force.setChecked(False)
+            self.historical_split_year.setEnabled(
+                available and self.historical_force.isChecked()
+            )
+
+        self.historical_force.toggled.connect(lambda _checked: sync_historical())
 
         for control in a_checks:
             control.toggled.connect(sync_ng_model)
@@ -5051,7 +5559,9 @@ class OrbitConstraintsDialog(QDialog):
         form.addRow(nongrav_note)
         form.addRow(linkage_heading)
         form.addRow(self.historical_force)
+        form.addRow(split_row)
         form.addRow(self.model_tension)
+        form.addRow(sigma_row)
         if comet:
             dynamics_heading = QLabel(tr("Dlouhodobá dynamika komety"))
             dynamics_heading.setStyleSheet("font-weight: 650; margin-top: 10px;")
@@ -5161,12 +5671,18 @@ class OrbitConstraintsDialog(QDialog):
     def calculate_original_future(self) -> bool:
         return self.is_comet and self.original_future.isChecked()
 
-    def selected_linkage_options(self) -> dict[str, bool]:
+    def selected_linkage_options(self) -> dict[str, object]:
+        historical = bool(self.historical_force.isEnabled() and self.historical_force.isChecked())
+        split_years = parse_split_years(self.historical_split_year.text())
         return {
-            "historical_nongravitational": bool(
-                self.historical_force.isEnabled() and self.historical_force.isChecked()
-            ),
+            "historical_nongravitational": historical,
+            "historical_split_year": split_years if historical and split_years else None,
             "accept_model_tension": self.model_tension.isChecked(),
+            "historical_sigma": (
+                [int(self.historical_sigma_year.value()),
+                 float(self.historical_sigma_factor.value())]
+                if self.historical_sigma.isChecked() else None
+            ),
         }
 
     def selected_output_epoch(self) -> str:
@@ -5329,6 +5845,15 @@ class MainWindow(QMainWindow):
         self.preliminary_thread: QThread | None = None
         self.preliminary_worker: PreliminaryOrbitWorker | None = None
         self._dirty_solution_tabs: set[int] = set()
+        # Split comets: own orbit of each fitted component (fragment letters or
+        # MAIN_UNLABELLED), the last assignment of unlabelled rows and the
+        # last split-epoch report.
+        self.component_solutions: dict[str, OrbitSolution] = {}
+        self.fragment_assignment = None
+        self.split_report_text = ""
+        self.split_thread: QThread | None = None
+        self.split_worker: SplitEstimateWorker | None = None
+        self.split_progress_dialog: OrbitFitProgressDialog | None = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -5553,6 +6078,11 @@ class MainWindow(QMainWindow):
         observation_actions.addWidget(self.worst_observation_button)
         observation_actions.addStretch()
         obs_layout.addLayout(observation_actions)
+        self.fragment_banner = FragmentBanner()
+        self.fragment_banner.overview_requested.connect(self._show_fragment_overview)
+        self.fragment_banner.split_requested.connect(self._estimate_split_epochs)
+        self.fragment_banner.split_off_requested.connect(self._split_off_secondary_track)
+        obs_layout.addWidget(self.fragment_banner)
         self.observation_table = QTableView(); self.observation_table.setModel(self.observation_model)
         self.observation_table.setAlternatingRowColors(True); self.observation_table.setSortingEnabled(True)
         self.observation_table.setSelectionBehavior(QTableView.SelectRows)
@@ -5631,6 +6161,7 @@ class MainWindow(QMainWindow):
             self.fit_constraints = {}
             self.compute_original_future = False
             self.fit_output_epoch = ""
+            self._reset_fragment_state()
         self.current_designation = designation
         self.current_display_name = display_name or designation
         self.search.setText(designation)
@@ -5687,6 +6218,13 @@ class MainWindow(QMainWindow):
         """Load astrometry from the local cache, or download it from the MPC."""
         if not force_refresh:
             cached = mpc_cache.load(designation)
+            if (
+                cached is not None and wants_fragment_listing(designation)
+                and not cached.fragments_checked
+            ):
+                # Cached before fragments were fetched: download once more so a
+                # split comet gets its lettered components.
+                cached = None
             if cached is not None:
                 rows = cached.observations()
                 if rows:
@@ -5710,6 +6248,21 @@ class MainWindow(QMainWindow):
         self.load_button.setEnabled(True)
         same_object = designation.strip().casefold() == self.current_designation.strip().casefold()
         self.has_orbit = self.has_orbit and same_object
+        if not same_object:
+            # File/clipboard import can replace the object without going
+            # through _begin_object_load().  Never carry fixed elements,
+            # Yarkovsky/comet parameters or a shortened fit interval from the
+            # previously displayed body into the newly pasted astrometry.
+            self.nongravitational_fit = {}
+            self.linkage_options = {}
+            self.fit_constraints = {}
+            self.compute_original_future = False
+            self.fit_output_epoch = ""
+            self.fit_interval.setCurrentIndex(0)
+            self.constraints_button.setText(tr("Vlastní nastavení…"))
+            self._reset_fragment_state()
+        else:
+            self._carry_fragment_state(rows)
         self._configure_fragment_selector(rows)
         self.observation_model.set_rows(rows)
         self.observation_detail.setText(
@@ -5725,6 +6278,7 @@ class MainWindow(QMainWindow):
         if not same_object:
             self.current_display_name = designation
         self.current_observations = rows
+        self._refresh_fragment_banner()
         self._refresh_residual_actions()
         self.photometry_panel.set_observations(rows)
         self.object_title.setText(self.current_display_name or designation)
@@ -5840,8 +6394,8 @@ class MainWindow(QMainWindow):
         except (OSError, MpcError) as exc:
             QMessageBox.warning(self, tr("Pozorování"), str(exc))
             return
-        designation = self.search.text().strip() or rows[0].designation
-        if not self.search.text().strip():
+        designation = imported_designation(rows) or self.search.text().strip()
+        if self.search.text().strip().casefold() != designation.strip().casefold():
             self.search.setText(designation)
         self._observations_loaded(designation, rows)
 
@@ -5862,8 +6416,8 @@ class MainWindow(QMainWindow):
         except MpcError as exc:
             QMessageBox.warning(self, tr("Pozorování"), str(exc))
             return
-        designation = self.search.text().strip() or rows[0].designation
-        if not self.search.text().strip():
+        designation = imported_designation(rows) or self.search.text().strip()
+        if self.search.text().strip().casefold() != designation.strip().casefold():
             self.search.setText(designation)
         self._observations_loaded(designation, rows)
 
@@ -6079,25 +6633,33 @@ class MainWindow(QMainWindow):
 
     def _configure_fragment_selector(self, rows: list[Observation]) -> None:
         """Offer the components of a split comet and fit the principal one."""
-        counts = fragment_counts(rows)
+        components = fragment_components(rows)
         primary = primary_fragment(rows)
-        unlabelled = sum(1 for row in rows if not observation_fragment(row))
         self.fragment_selector.blockSignals(True)
         self.fragment_selector.clear()
-        if len(counts) >= 2:
-            for letters, count in counts.items():
-                if letters == primary:
-                    text = tr("{0} – hlavní složka ({1})", letters, count + unlabelled)
+        offered = len(components) >= 2
+        if offered:
+            # Fragment letters in label order; an unlabelled main nucleus first.
+            order = sorted(
+                components,
+                key=lambda letters: (letters != MAIN_UNLABELLED, len(letters), letters),
+            )
+            for letters in order:
+                count = components[letters]
+                if letters == MAIN_UNLABELLED:
+                    text = tr("hlavní jádro – neoznačená měření ({0})", count)
+                elif letters == primary:
+                    text = tr("{0} – hlavní složka ({1})", letters, count)
                 else:
                     text = f"{letters} ({count})"
                 self.fragment_selector.addItem(text, letters)
-            self.fragment_selector.setCurrentIndex(list(counts).index(primary))
+            self.fragment_selector.setCurrentIndex(order.index(primary))
             select_fragment(rows, primary)
         else:
             select_fragment(rows, None)
         self.fragment_selector.blockSignals(False)
-        self.fragment_label.setVisible(len(counts) >= 2)
-        self.fragment_selector.setVisible(len(counts) >= 2)
+        self.fragment_label.setVisible(offered)
+        self.fragment_selector.setVisible(offered)
 
     def _fragment_selection_changed(self, _index: int) -> None:
         fragment = self.fragment_selector.currentData()
@@ -6109,14 +6671,214 @@ class MainWindow(QMainWindow):
         self.observation_model.set_rows(self.current_observations)
         self._update_fit_button_label()
         self._refresh_residual_actions()
+        stored = self.component_solutions.get(fragment)
+        if stored is not None and self.fit_thread is None:
+            # Show the component's own orbit; the others stay as companions.
+            self._update_companions(stored, refresh=False)
+            self._apply_solution(stored)
+            self.statusBar().showMessage(
+                tr(
+                    "Vybrán fragment {0}: {1} měření; zobrazena jeho vlastní dráha. "
+                    "Pro aktuální O−C spusťte vlastní fit znovu.",
+                    self._fragment_display_name(fragment), selected,
+                ),
+                10000,
+            )
+            return
         self.statusBar().showMessage(
             tr(
                 "Vybrán fragment {0}: {1} měření; ostatní složky nemají ve fitu váhu. "
                 "Spusťte vlastní fit znovu.",
-                fragment, selected,
+                self._fragment_display_name(fragment), selected,
             ),
             10000,
         )
+
+    # ----- split comets: banner, components, split epochs -----------------
+
+    def _reset_fragment_state(self) -> None:
+        self.component_solutions = {}
+        self.fragment_assignment = None
+        self.split_report_text = ""
+        self._update_companions()
+        if hasattr(self, "fragment_banner"):
+            self.fragment_banner.update_state("", can_split=False, has_track=False)
+
+    @staticmethod
+    def _observation_key(observation: Observation) -> tuple:
+        return (
+            observation.time, (observation.station or "").strip().upper(),
+            None if observation.ra_deg is None else round(float(observation.ra_deg), 7),
+            None if observation.dec_deg is None else round(float(observation.dec_deg), 7),
+        )
+
+    def _carry_fragment_state(self, rows: list[Observation]) -> None:
+        """Keep split-off tracks when the same object's astrometry is reloaded.
+
+        Freshly downloaded rows carry no assignments: re-apply the tracks the
+        user split off (X1, X2…) and forget orbits of components that no
+        longer have any measurement.  Automatic assignments are recomputed by
+        the next fit.
+        """
+        split_off = {
+            self._observation_key(item): {
+                key: item.raw[key]
+                for key in (ASSIGNED_FRAGMENT_KEY, SPLIT_OFF_KEY, ASSIGNMENT_REASON_KEY)
+                if key in item.raw
+            }
+            for item in self.current_observations if item.raw.get(SPLIT_OFF_KEY)
+        }
+        for row in rows:
+            values = split_off.get(self._observation_key(row))
+            if values:
+                row.raw.update(values)
+                row.excluded_from_fit = False
+        present = set(fragment_components(rows)) | {MAIN_UNLABELLED}
+        self.component_solutions = {
+            letters: solution for letters, solution in self.component_solutions.items()
+            if letters in present
+        }
+        self.fragment_assignment = None
+        self._update_companions(refresh=False)
+
+    def _current_component(self) -> str:
+        if self.fragment_selector.isHidden():
+            return ""
+        return str(self.fragment_selector.currentData() or "")
+
+    def _refresh_fragment_banner(self) -> None:
+        rows = self.current_observations
+        summaries = component_summaries(rows) if rows else []
+        tracks = secondary_tracks(rows) if rows else []
+        primary = primary_fragment(rows) if rows else ""
+        text = fragment_banner_text(
+            summaries, self.component_solutions, self.fragment_assignment, tracks,
+        )
+        can_split = bool(primary) and primary in self.component_solutions and any(
+            letters != primary for letters in self.component_solutions
+        )
+        self.fragment_banner.update_state(
+            text, can_split=can_split, has_track=bool(tracks),
+            busy=self.split_thread is not None or self.fit_thread is not None,
+        )
+
+    def _configure_fragment_selector_counts(self) -> None:
+        """Rebuild the selector after components changed, keeping the selection."""
+        current = self._current_component()
+        self._configure_fragment_selector(self.current_observations)
+        index = self.fragment_selector.findData(current) if current else -1
+        if index >= 0 and index != self.fragment_selector.currentIndex():
+            self.fragment_selector.blockSignals(True)
+            self.fragment_selector.setCurrentIndex(index)
+            self.fragment_selector.blockSignals(False)
+            select_fragment(self.current_observations, current)
+
+    def _component_arc_days(self, component: str) -> float | None:
+        for summary in component_summaries(self.current_observations):
+            if summary.component == component and summary.first and summary.last:
+                return (summary.last - summary.first).total_seconds() / 86400.0
+        return None
+
+    def _companion_label(self, component: str) -> str:
+        base = self.current_designation or self.solution.designation
+        if component == MAIN_UNLABELLED:
+            return tr("{0} hlavní", base)
+        return f"{base}-{component}"
+
+    def _update_companions(
+        self, displayed_solution: OrbitSolution | None = None, refresh: bool = True,
+    ) -> None:
+        """Other fitted components drawn next to the displayed orbit.
+
+        ``displayed_solution`` is the orbit about to be shown (default: the
+        current one).  Call this before ``_apply_solution`` so an open Solar
+        System/Sky tab is redrawn once, with the right companions.
+        """
+        displayed = self._current_component() if hasattr(self, "fragment_selector") else ""
+        shown = displayed_solution if displayed_solution is not None else self.solution
+        companions = {
+            self._companion_label(letters): solution
+            for letters, solution in self.component_solutions.items()
+            if letters != displayed and solution is not shown
+        }
+        for panel in (getattr(self, "solar_panel", None), getattr(self, "sky_panel", None)):
+            if panel is not None:
+                panel.companions = companions
+        if hasattr(self, "_dirty_solution_tabs"):
+            self._dirty_solution_tabs.update((4, 5))
+            if refresh and hasattr(self, "tabs"):
+                self._refresh_solution_tab(self.tabs.currentIndex())
+
+    def _split_off_secondary_track(self) -> None:
+        tracks = secondary_tracks(self.current_observations)
+        if not tracks:
+            return
+        labels = [split_off_track(self.current_observations, track) for track in tracks]
+        self._configure_fragment_selector_counts()
+        self.observation_model.set_rows(self.current_observations)
+        self._update_fit_button_label()
+        self._refresh_fragment_banner()
+        self.statusBar().showMessage(
+            tr(
+                "Vedlejší stopa vyčleněna jako složka {0}. Vyberte ji vlevo a spusťte "
+                "vlastní fit; začne z dráhy hlavního jádra.",
+                ", ".join(labels),
+            ),
+            15000,
+        )
+
+    def _show_fragment_overview(self) -> None:
+        dialog = FragmentOverviewDialog(
+            self, component_summaries(self.current_observations),
+            self.component_solutions, self.split_report_text,
+        )
+        dialog.show()
+
+    def _estimate_split_epochs(self) -> None:
+        if self.split_thread is not None or self.fit_thread is not None:
+            return
+        thread = QThread(self)
+        worker = SplitEstimateWorker(self.current_observations, self.component_solutions)
+        progress_dialog = OrbitFitProgressDialog(self)
+        progress_dialog.setWindowTitle(tr("Odhad času rozpadu"))
+        progress_dialog.cancel_requested.connect(lambda: worker.request_cancel())
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.success.connect(self._split_estimated)
+        worker.error.connect(
+            lambda message: QMessageBox.warning(self, tr("Odhad času rozpadu"), message)
+        )
+        worker.cancelled.connect(
+            lambda: self.statusBar().showMessage(tr("Odhad času rozpadu byl zrušen."), 8000)
+        )
+        worker.progress.connect(progress_dialog.update_progress)
+        worker.finished.connect(progress_dialog.finish)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._split_finished)
+        self.split_thread = thread
+        self.split_worker = worker
+        self.split_progress_dialog = progress_dialog
+        self.fit_button.setEnabled(False)
+        self._refresh_fragment_banner()
+        progress_dialog.show()
+        thread.start()
+
+    def _split_estimated(self, results: object) -> None:
+        self.split_report_text = describe_split_results(list(results))
+        show_text_dialog(self, tr("Odhad času rozpadu"), self.split_report_text)
+
+    def _split_finished(self) -> None:
+        self.split_thread = None
+        self.split_worker = None
+        self.split_progress_dialog = None
+        self.fit_button.setEnabled(bool(self.current_observations))
+        self._refresh_fragment_banner()
+
+    @staticmethod
+    def _fragment_display_name(fragment: str) -> str:
+        return tr("hlavní jádro") if fragment == MAIN_UNLABELLED else fragment
 
     def _update_fit_button_label(self) -> None:
         total = len(self.current_observations)
@@ -6234,6 +6996,7 @@ class MainWindow(QMainWindow):
             text for key, text in (
                 ("historical_nongravitational", tr("historické A1H–A3H")),
                 ("accept_model_tension", tr("napojení s napětím modelu")),
+                ("historical_sigma", tr("větší nejistota historických měření")),
             ) if self.linkage_options.get(key)
         ]
         count = (
@@ -6342,8 +7105,26 @@ class MainWindow(QMainWindow):
             self.fit_button.setEnabled(bool(self.current_observations))
 
     def calculate_own_orbit(self) -> None:
-        if not self.current_observations:
+        if not self.current_observations or self.split_thread is not None:
             return
+        warning = long_arc_ephemeris_warning(self.current_observations)
+        if warning:
+            answer = QMessageBox.warning(
+                self, tr("Chybí planetární efemeridy DE440"),
+                warning + "\n\n" + tr("Pokračovat přesto s přibližným modelem planet?"),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+        component = self._current_component()
+        if component:
+            # A fragment shares its parent's orbit until the split: start from
+            # the component's own earlier fit, else from the principal one.
+            primary = primary_fragment(self.current_observations)
+            seed = self.component_solutions.get(component) or self.component_solutions.get(primary)
+            if seed is not None and seed.position_au is not None:
+                self._start_own_orbit_fit(seed)
+                return
         if not self.has_orbit or self.solution.position_au is None:
             self._fit_after_orbit_load = True
             self.fit_button.setEnabled(False)
@@ -6369,11 +7150,35 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             tr("Počítám vlastní dráhu z astrometrie{0}{1}…", mode, extra)
         )
+        nongravitational = self.nongravitational_fit
+        linkage_options = self.linkage_options
+        component = self._current_component()
+        fragment_context = None
+        if component:
+            fragment_context = {
+                "component": component, "solutions": dict(self.component_solutions),
+            }
+            primary = primary_fragment(self.current_observations)
+            arc = self._component_arc_days(component)
+            if component != primary and arc is not None and arc < 365.0 and (
+                nongravitational or linkage_options
+            ):
+                # A short fragment arc cannot determine comet forces or link
+                # returns; fit the gravitational orbit only.
+                nongravitational = {}
+                linkage_options = {}
+                self.statusBar().showMessage(
+                    tr(
+                        "Fragment {0} má oblouk jen {1:.0f} dní; počítám čistě "
+                        "gravitační dráhu bez negravitačních parametrů…",
+                        self._fragment_display_name(component), arc,
+                    )
+                )
         thread = QThread(self)
         worker = OrbitFitWorker(
             self.current_observations, initial, self.fit_constraints, truncate_years,
-            self.nongravitational_fit, self.compute_original_future,
-            self.linkage_options,
+            nongravitational, self.compute_original_future,
+            linkage_options, fragment_context,
         )
         progress_dialog = OrbitFitProgressDialog(self)
         # A queued slot on ``worker`` could not run while its thread is inside
@@ -6400,6 +7205,28 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _announce_impact(self, prediction) -> None:
+        if isinstance(prediction, ImpactRisk):
+            label = BODY_LABELS.get(prediction.body, prediction.body)
+            self.statusBar().showMessage(
+                tr("POZOR: klony nejistoty ukazují nenulové riziko dopadu na {0}.", label), 0,
+            )
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle(tr("Riziko dopadu"))
+            box.setText(
+                "<b>" + html.escape(tr("Nenulové riziko dopadu na těleso {0}.", label))
+                + "</b>"
+            )
+            box.setInformativeText(
+                describe_impact_risk(prediction, label)
+                + tr(
+                    "\n\nKontroluje se {0:.0f} dní od epochy dráhy. Výsledek je "
+                    "orientační a vyžaduje ověření autoritativním systémem.",
+                    IMPACT_CHECK_DAYS,
+                )
+            )
+            box.exec()
+            return
         label = BODY_LABELS.get(prediction.body, prediction.body)
         self.statusBar().showMessage(
             tr("POZOR: vypočtená dráha vede k dopadu na těleso {0}.", label), 0,
@@ -6423,16 +7250,31 @@ class MainWindow(QMainWindow):
         box.exec()
 
     def _own_orbit_loaded(self, payload: object) -> None:
-        result, fitted_observations = payload
+        result, fitted_observations, *extra = payload
         solution, rms, _used = result
         apply_fitted_observations(self.current_observations, fitted_observations)
+        component = self._current_component()
+        if component:
+            self.component_solutions[component] = solution
+            report = extra[0] if extra else None
+            if report is not None:
+                self.fragment_assignment = report
+            # The assignment may have moved rows between components.
+            self._configure_fragment_selector_counts()
+        elif secondary_tracks(self.current_observations):
+            # An undivided object whose fit found a second track: keep the
+            # orbit as the main nucleus, the track can become a fragment.
+            self.component_solutions[MAIN_UNLABELLED] = solution
         self.observation_model.set_rows(self.current_observations)
         self._refresh_residual_actions()
         self.has_orbit = True
         self.tabs.setCurrentIndex(1)
         self._apply_solution(solution)
-        if solution.impact is not None:
-            QTimer.singleShot(0, lambda prediction=solution.impact: self._announce_impact(prediction))
+        self._update_companions()
+        self._refresh_fragment_banner()
+        assessment = solution.impact or solution.impact_risk
+        if assessment is not None:
+            QTimer.singleShot(0, lambda item=assessment: self._announce_impact(item))
         if self.fit_output_epoch:
             self.elements_panel.output_epoch.setText(self.fit_output_epoch)
             QTimer.singleShot(0, self.elements_panel._apply_output_epoch)
@@ -6446,8 +7288,8 @@ class MainWindow(QMainWindow):
         self.rms_metric.setToolTip(
             tr(
                 "První hodnota je nevážené RMS v obloukových sekundách; druhá zohledňuje "
-                "nejistoty rmsRA/rmsDec uvedené v ADES a částečnou korelaci série ze "
-                "stejné stanice během jedné noci.",
+                "úplnou kovarianci ADES (rmsRA/rmsDec/rmsCorr), časovou nejistotu podél "
+                "pohybu a částečnou korelaci série ze stejné stanice během jedné noci.",
             )
         )
         interval = f" • {self.fit_interval.currentText().lower()}"
@@ -6457,8 +7299,11 @@ class MainWindow(QMainWindow):
         count_text = apparition_observation_count_text(solution)
         linkage_text = apparition_linkage_summary(solution)
         label_parts = [tr("Vlastní fit")]
-        if self.fragment_selector.isVisible() and self.fragment_selector.currentData():
-            label_parts.append(tr("fragment {0}", self.fragment_selector.currentData()))
+        if not self.fragment_selector.isHidden() and self.fragment_selector.currentData():
+            label_parts.append(tr(
+                "fragment {0}",
+                self._fragment_display_name(self.fragment_selector.currentData()),
+            ))
         if linkage_text:
             label_parts.append(linkage_text)
         if count_text:
@@ -6536,6 +7381,7 @@ class MainWindow(QMainWindow):
         self.solve.setEnabled(True)
         self.fit_interval.setEnabled(True)
         self.fragment_selector.setEnabled(True)
+        self._refresh_fragment_banner()
 
 
 def run() -> int:

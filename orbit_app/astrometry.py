@@ -110,6 +110,24 @@ _TECHNIQUE_SIGMA_ARCSEC = {
     "hipparcos": 0.1,
 }
 
+# Frequently used observatory rules from Vereš et al. (2017).  They are only
+# fallbacks: explicit ADES rmsRA/rmsDec always wins.  The full rule set also
+# contains packed-program/catalogue combinations; keeping the stable station
+# rules here materially improves legacy MPC80 astrometry without pretending
+# that a missing program code is known.
+_CCD_STATION_SIGMA_ARCSEC = {
+    "645": 0.3, "673": 0.3, "H01": 0.3,
+    "J04": 0.4, "K91": 0.4, "K92": 0.4, "K93": 0.4,
+    "Q63": 0.4, "Q64": 0.4, "V37": 0.4, "W85": 0.4,
+    "W86": 0.4, "W87": 0.4,
+    "F51": 0.2, "F52": 0.2,
+    "G96": 0.5, "689": 0.5, "950": 0.5, "W84": 0.5,
+    "608": 0.6, "G45": 0.6,
+    "D29": 0.75, "E12": 0.75,
+    "699": 0.8, "704": 1.0, "C51": 1.0, "J75": 1.0,
+    "M28": 3.0, "247": 2.0, "270": 2.0,
+}
+
 
 def measurement_technique(observation: Observation) -> str:
     """Return a coarse measurement technique derived from ADES or MPC80 notes."""
@@ -149,8 +167,59 @@ def default_sigma_arcsec(observation: Observation) -> float:
     if technique == "photographic":
         return 2.5 if year < 1950 else 1.5
     if technique == "ccd":
-        return min(_epoch_fallback_sigma(year), 2.0)
+        station = (observation.station or "").strip().upper()
+        if station == "703":
+            return 0.8 if year >= 2014 else 1.0
+        if station == "691":
+            return 0.5 if year >= 2003 else 0.6
+        if station == "644":
+            return 0.4 if year >= 2004 else 0.6
+        if station in _CCD_STATION_SIGMA_ARCSEC:
+            return _CCD_STATION_SIGMA_ARCSEC[station]
+        catalog = str(
+            observation.catalog or observation.raw.get("astCat")
+            or observation.raw.get("astcat") or observation.raw.get("mpc_catalog") or ""
+        ).strip().upper()
+        # Vereš et al. assign 1.5″ to CCD astrometry with an unknown
+        # catalogue and 1.0″ to the generic known-catalogue case.
+        return 1.5 if catalog in ("", "UNK", "UNKNOWN") else 1.0
     return _epoch_fallback_sigma(year)
+
+
+# Multiplier of the 1-sigma uncertainty set by :func:`scale_historical_sigmas`.
+SIGMA_SCALE_KEY = "sigma_scale"
+
+
+def scale_historical_sigmas(
+    observations: list[Observation], before_year: float | None, factor: float | None,
+) -> int:
+    """Inflate the uncertainty of measurements made before ``before_year``.
+
+    Old micrometer and plate astrometry from many observatories carries
+    systematic errors of several arcseconds (reference catalogues, plate
+    scale, the observer) that do not average out; the per-technique defaults
+    describe only the random part.  The factor applies to every row older
+    than ``before_year`` (decimal year, UTC) and is cleared from the others;
+    ``None`` or a factor of 1 removes it everywhere.  Returns the number of
+    scaled rows.
+    """
+    active = before_year is not None and factor is not None and float(factor) > 1.0
+    scaled = 0
+    for observation in observations:
+        observation.raw.pop(SIGMA_SCALE_KEY, None)
+        if not active:
+            continue
+        try:
+            instant = parse_observation_time(observation.time)
+        except (TypeError, ValueError):
+            continue
+        start = datetime(instant.year, 1, 1, tzinfo=instant.tzinfo)
+        end = datetime(instant.year + 1, 1, 1, tzinfo=instant.tzinfo)
+        year = instant.year + (instant - start) / (end - start)
+        if year < float(before_year):
+            observation.raw[SIGMA_SCALE_KEY] = float(factor)
+            scaled += 1
+    return scaled
 
 
 def observation_sigma_arcsec(observation: Observation) -> tuple[float, float]:
@@ -180,9 +249,14 @@ def observation_sigma_arcsec(observation: Observation) -> tuple[float, float]:
         floor = max(ASTROMETRIC_SIGMA_FLOOR_ARCSEC, 0.5 * quantum if np.isfinite(quantum) else 0.0)
         return max(value, floor)
 
+    try:
+        scale = float(observation.raw.get(SIGMA_SCALE_KEY, 1.0) or 1.0)
+    except (TypeError, ValueError):
+        scale = 1.0
+    scale = scale if np.isfinite(scale) and scale > 0.0 else 1.0
     return (
-        value_for("rmsra", "mpc_ra_quantum_arcsec"),
-        value_for("rmsdec", "mpc_dec_quantum_arcsec"),
+        scale * value_for("rmsra", "mpc_ra_quantum_arcsec"),
+        scale * value_for("rmsdec", "mpc_dec_quantum_arcsec"),
     )
 
 
@@ -205,6 +279,115 @@ def observation_sigmas(rows: list[Row], account_for_batch_correlation: bool = Fa
         for _coordinate in range(2)
     ], dtype=float)
     return values * factors
+
+
+def _raw_float(observation: Observation, key: str) -> float | None:
+    lowered = {str(name).casefold(): value for name, value in observation.raw.items()}
+    try:
+        value = float(lowered.get(key.casefold()))
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
+
+
+def _positive_raw_float(observation: Observation, key: str) -> float | None:
+    value = _raw_float(observation, key)
+    return value if value is not None and value >= 0.0 else None
+
+
+def _tracklet_angular_rates(rows: list[Row]) -> np.ndarray:
+    """Observed tangent-plane rates in arcsec/s for ADES timing covariance.
+
+    Rates are local secants within one station/night (or explicit trkSub).  A
+    model-derived rate would make the statistical weights depend on every
+    optimizer trial; the observed secant captures the same along-track timing
+    effect while keeping the least-squares objective deterministic.
+    """
+    rates = np.zeros((len(rows), 2), dtype=float)
+    groups: dict[tuple[object, ...], list[int]] = {}
+    for index, (observation, instant, _ra, _dec) in enumerate(rows):
+        lowered = {str(key).casefold(): value for key, value in observation.raw.items()}
+        tracklet = str(lowered.get("trksub") or lowered.get("trkmpc") or "").strip()
+        night_key = observing_night_key(observation, instant)
+        key: tuple[object, ...] = (
+            (observation.station or "").strip().upper(), tracklet, night_key[1],
+        ) if tracklet else night_key
+        groups.setdefault(key, []).append(index)
+    for indices in groups.values():
+        indices.sort(key=lambda index: rows[index][1])
+        if len(indices) < 2:
+            continue
+        seconds = np.asarray([
+            seconds_since_j2000(rows[index][1]) for index in indices
+        ], dtype=float)
+        ra = np.unwrap(np.radians([rows[index][2] for index in indices]))
+        dec = np.radians([rows[index][3] for index in indices])
+        x = np.degrees(ra - ra[0]) * 3600.0 * np.cos(float(np.mean(dec)))
+        y = np.degrees(dec - dec[0]) * 3600.0
+        for local, index in enumerate(indices):
+            left = max(0, local - 1)
+            right = min(len(indices) - 1, local + 1)
+            elapsed = seconds[right] - seconds[left]
+            if elapsed > 0.0:
+                rates[index] = ((x[right] - x[left]) / elapsed, (y[right] - y[left]) / elapsed)
+    return rates
+
+
+def observation_covariance_blocks(
+    rows: list[Row], account_for_batch_correlation: bool = False,
+) -> np.ndarray:
+    """Return one 2×2 tangent-plane covariance per observation (arcsec²).
+
+    Besides rmsRA/rmsDec this consumes the ADES ``rmsCorr`` correlation and
+    ``rmsTime``/``uncTime`` timing uncertainties.  Timing is projected along
+    the measured sky-plane rate.  ``uncTime`` is formally a systematic clock
+    term; treating it per row is conservative and avoids an ill-conditioned
+    dense covariance when a submission does not identify a clock batch.
+    """
+    if not rows:
+        return np.empty((0, 2, 2), dtype=float)
+    rates = _tracklet_angular_rates(rows)
+    blocks = np.empty((len(rows), 2, 2), dtype=float)
+    batch_sizes: dict[tuple[str, object], int] = {}
+    if account_for_batch_correlation:
+        for observation, instant, _ra, _dec in rows:
+            key = observing_night_key(observation, instant)
+            batch_sizes[key] = batch_sizes.get(key, 0) + 1
+    for index, (observation, instant, _ra, _dec) in enumerate(rows):
+        sigma_ra, sigma_dec = observation_sigma_arcsec(observation)
+        correlation = _raw_float(observation, "rmsCorr")
+        if correlation is None:
+            correlation = 0.0
+        correlation = float(np.clip(correlation, -0.999, 0.999))
+        covariance = np.array((
+            (sigma_ra * sigma_ra, correlation * sigma_ra * sigma_dec),
+            (correlation * sigma_ra * sigma_dec, sigma_dec * sigma_dec),
+        ))
+        timing_terms = [
+            value for value in (
+                _positive_raw_float(observation, "rmsTime"),
+                _positive_raw_float(observation, "uncTime"),
+            ) if value is not None
+        ]
+        if timing_terms:
+            timing_sigma = float(np.sqrt(np.sum(np.square(timing_terms))))
+            along_track = rates[index] * timing_sigma
+            covariance += np.outer(along_track, along_track)
+        if account_for_batch_correlation:
+            size = batch_sizes[observing_night_key(observation, instant)]
+            covariance *= max(1.0, size / INDEPENDENT_MEASUREMENTS_PER_NIGHT)
+        blocks[index] = covariance
+    return blocks
+
+
+def observation_whiteners(
+    rows: list[Row], account_for_batch_correlation: bool = False,
+) -> np.ndarray:
+    """Matrices mapping tangent-plane residuals in arcsec to unit covariance."""
+    covariance = observation_covariance_blocks(rows, account_for_batch_correlation)
+    return np.asarray([
+        np.linalg.solve(np.linalg.cholesky(block), np.eye(2)) for block in covariance
+    ], dtype=float)
 
 
 # --------------------------------------------------------------------------
@@ -254,7 +437,13 @@ _UNPACKED_FRAGMENT = re.compile(
 )
 # ADES rows may carry the original 80-column record.
 _OBS80_KEYS = ("mpc80", "obs80", "obs_80")
-_DESIGNATION_KEYS = ("permid", "provid", "trksub")
+# Only MPC-assigned designations.  ``trkSub`` is the observer's own tracklet
+# name: the MPC files 31 rows with trkSub ``0073Pbt`` under the main nucleus
+# of 73P, so letters in it say nothing about the component.
+_DESIGNATION_KEYS = ("permid", "provid")
+# Component token for unlabelled astrometry that is itself the main nucleus
+# (the MPC labels only the secondary pieces).  Never a real fragment letter.
+MAIN_UNLABELLED = "*"
 
 
 def mpc80_fragment(line: str) -> str:
@@ -275,8 +464,27 @@ def designation_fragment(designation: str) -> str:
     return match.group(1).upper() if match else ""
 
 
+# raw key of a component that orbit_app.fragments assigned to an unlabelled
+# measurement after comparing it with the fitted orbits of the components.
+ASSIGNED_FRAGMENT_KEY = "assigned_fragment"
+
+
 def observation_fragment(observation: Observation) -> str:
-    """Fragment (``A``, ``B``, ``BK``) a measurement refers to; ``""`` if unlabelled.
+    """Component a measurement belongs to: its MPC label, else an assignment.
+
+    An MPC label always wins.  An unlabelled row may carry a component that
+    :func:`orbit_app.fragments.assign_unlabelled_rows` found it to match
+    (``raw['assigned_fragment']``); otherwise ``""``.
+    """
+    letters = explicit_fragment(observation)
+    if letters:
+        return letters
+    assigned = observation.raw.get(ASSIGNED_FRAGMENT_KEY)
+    return str(assigned) if isinstance(assigned, str) and assigned else ""
+
+
+def explicit_fragment(observation: Observation) -> str:
+    """Fragment (``A``, ``B``, ``BK``) the MPC labelled a measurement with; ``""`` if none.
 
     Unlabelled rows are the undivided comet (before the split) or a report that
     did not resolve the components.
@@ -300,7 +508,7 @@ def fragment_counts(observations: list[Observation]) -> dict[str, int]:
     """Number of explicitly labelled measurements per fragment, sorted by label."""
     counts: dict[str, int] = {}
     for observation in observations:
-        letters = observation_fragment(observation)
+        letters = explicit_fragment(observation)
         if letters:
             counts[letters] = counts.get(letters, 0) + 1
     return dict(sorted(counts.items(), key=lambda item: (len(item[0]), item[0])))
@@ -315,7 +523,7 @@ def fragment_return_counts(observations: list[Observation]) -> dict[str, int]:
     """Number of observed returns in which each fragment is explicitly labelled."""
     days: dict[str, list[float]] = {}
     for observation in observations:
-        letters = observation_fragment(observation)
+        letters = explicit_fragment(observation)
         if not letters or not observation.time:
             continue
         try:
@@ -333,6 +541,36 @@ def fragment_return_counts(observations: list[Observation]) -> dict[str, int]:
     return returns
 
 
+def _fragment_days(observations: list[Observation]) -> list[tuple[str, float]]:
+    """(MPC fragment label or ``""``, days since J2000 UTC) of every dated row."""
+    dated: list[tuple[str, float]] = []
+    for observation in observations:
+        if not observation.time:
+            continue
+        try:
+            instant = parse_observation_time(observation.time)
+        except ValueError:
+            continue
+        dated.append((explicit_fragment(observation), seconds_since_j2000(instant) / 86400.0))
+    return dated
+
+
+def _return_spans(days: list[float]) -> list[tuple[float, float]]:
+    """Observed returns of a sorted day list, split at gaps > FRAGMENT_RETURN_GAP_DAYS."""
+    spans: list[tuple[float, float]] = []
+    for day in sorted(days):
+        if spans and day - spans[-1][1] <= FRAGMENT_RETURN_GAP_DAYS:
+            spans[-1] = (spans[-1][0], day)
+        else:
+            spans.append((day, day))
+    return spans
+
+
+# Unlabelled rows within this many days of a labelled return are compared
+# with that return's labelled rows (pre-split reports, unresolved images).
+FRAGMENT_CONTEXT_DAYS = 30.0
+
+
 def primary_fragment(observations: list[Observation]) -> str:
     """Principal (surviving) component of a split comet.
 
@@ -340,16 +578,53 @@ def primary_fragment(observations: list[Observation]) -> str:
     the split is ``A``, but 73P/Schwassmann–Wachmann lost A within weeks and
     only C was followed through later returns, after which its astrometry is
     no longer labelled.  The component labelled in the most observed returns
-    is therefore principal; the number of labelled measurements breaks ties
-    (205P: A, B and C were all seen only in 2008, A is by far the best
-    observed).  Short-lived pieces and stray labels rarely span returns.
+    is therefore the principal labelled one; the number of labelled
+    measurements breaks ties (205P: A, B and C were all seen only in 2008, A
+    is by far the best observed).
+
+    Unlabelled rows normally continue that component.  When they outnumber
+    its labelled rows within its own returns, however, the MPC labelled only
+    secondary pieces and the unlabelled astrometry is the main nucleus:
+    :data:`MAIN_UNLABELLED` is returned.  ``""`` means no label at all.
     """
     counts = fragment_counts(observations)
     if not counts:
+        # No MPC label, but a secondary track was split off as a component:
+        # the unlabelled astrometry is then the main nucleus.
+        if any(observation.raw.get(ASSIGNED_FRAGMENT_KEY) for observation in observations):
+            return MAIN_UNLABELLED
         return ""
     returns = fragment_return_counts(observations)
     # ``counts`` is ordered by label, so complete ties go to the earliest one.
-    return max(counts, key=lambda letters: (returns.get(letters, 1), counts[letters]))
+    labelled = max(counts, key=lambda letters: (returns.get(letters, 1), counts[letters]))
+    dated = _fragment_days(observations)
+    spans = _return_spans([day for letters, day in dated if letters == labelled])
+    unlabelled_nearby = sum(
+        1 for letters, day in dated
+        if not letters and any(
+            start - FRAGMENT_CONTEXT_DAYS <= day <= end + FRAGMENT_CONTEXT_DAYS
+            for start, end in spans
+        )
+    )
+    return MAIN_UNLABELLED if unlabelled_nearby > counts[labelled] else labelled
+
+
+def fragment_components(observations: list[Observation]) -> dict[str, int]:
+    """Selectable components with their row counts, principal one first.
+
+    Unlabelled rows are counted with the principal component unless they were
+    assigned to another component.
+    """
+    counts = fragment_counts(observations)
+    primary = primary_fragment(observations)
+    if not primary:
+        return {}
+    components = {primary: 0}
+    components.update((letters, 0) for letters in counts if letters != primary)
+    for observation in observations:
+        letters = observation_fragment(observation) or primary
+        components[letters] = components.get(letters, 0) + 1
+    return components
 
 
 def select_fragment(observations: list[Observation], fragment: str | None) -> int:
@@ -359,9 +634,11 @@ def select_fragment(observations: list[Observation], fragment: str | None) -> in
     stop being fit candidates; they still receive O-C against the fitted orbit.
     Unlabelled rows belong to the principal component (:func:`primary_fragment`):
     they are the parent nucleus before the split or reports that did not
-    resolve the fragments.  ``fragment`` ``None``/``""`` fits all rows (no
-    selection), as does astrometry without any fragment label.  The user's manual inclusion state is not changed.  Returns
-    the number of rows belonging to the selected component.
+    resolve the fragments - or, with :data:`MAIN_UNLABELLED`, the main
+    nucleus itself.  ``fragment`` ``None``/``""`` fits all rows (no
+    selection), as does astrometry without any fragment label.  The user's
+    manual inclusion state is not changed.  Returns the number of rows
+    belonging to the selected component.
     """
     wanted = (fragment or "").strip().upper()
     primary = primary_fragment(observations) if wanted else ""

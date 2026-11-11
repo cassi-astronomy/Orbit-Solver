@@ -42,7 +42,10 @@ from .domain import Observation, OrbitSolution
 from .i18n import tr
 from .observatories import dynamical_jd, earth_heliocentric_ecliptic
 from .orbit_engine import MU_SUN, SCAN_TOLERANCES, NBodyIntegrator, StateVector
-from .orbit_engine import HISTORICAL_NONGRAVITATIONAL, NONGRAVITATIONAL_SPLIT_KEY
+from .orbit_engine import (
+    ALL_HISTORICAL_NAMES, ALL_SPLIT_KEYS, HISTORICAL_NONGRAVITATIONAL, MAX_FORCE_PERIODS,
+    force_period, historical_period_names, period_split_key,
+)
 from .orbit_fit import (
     NONGRAVITATIONAL_NAMES, _PLANET_NAMES, OrbitFitCancelled, OrbitFitError,
     _apparition_linkage_record, _coherent_secondary_track_candidates, _equatorial_direction, _local_light_time_states,
@@ -342,12 +345,40 @@ def _anchor_index(groups: list[list[Observation]]) -> int:
     return max(index for index, score in enumerate(scores) if score >= best * 0.999)
 
 
+def historical_split_epoch(
+    spans: list[tuple[float, float]], requested_jd: float | None = None,
+) -> tuple[float | None, bool]:
+    """Switch epoch (TDB JD) of the historical force law and whether a request was replaced.
+
+    By default it is the middle of the longest gap between observed returns.
+    A requested epoch is used when it lies strictly inside a gap, so that
+    every return keeps one force law (205P: the fragmentation of 1998 rather
+    than the middle of the 1897-2008 gap).  Otherwise the default is used and
+    ``True`` reports that the request was replaced.
+    """
+    ordered = sorted(spans)
+    gaps = [
+        (later[0] - earlier[1], earlier[1], later[0])
+        for earlier, later in zip(ordered, ordered[1:])
+        if later[0] > earlier[1]
+    ]
+    if not gaps:
+        return None, requested_jd is not None
+    if requested_jd is not None:
+        requested = float(requested_jd)
+        if any(start < requested < end for _length, start, end in gaps):
+            return requested, False
+    _length, start, end = max(gaps)
+    return 0.5 * (start + end), requested_jd is not None
+
+
 class _Linker:
     def __init__(
         self, observations, groups, initial, constraints, nongravitational,
         fit_once: FitOnce, evaluate: Evaluate, report_progress: ProgressReporter,
         cancel_callback, historical_nongravitational: bool = False,
         accept_model_tension: bool = False,
+        historical_split_jd: float | list[float] | tuple[float, ...] | None = None,
     ) -> None:
         self.observations = observations
         self.groups = groups
@@ -358,6 +389,14 @@ class _Linker:
         # Returns joined through the relaxed gate (reported as model tension).
         self.tension: set[int] = set()
         self.split_jd: float | None = None
+        # Switch epochs of all force periods, most recent first.
+        self.split_jds: tuple[float, ...] = ()
+        # Historical coefficient name -> its force period (1, 2, …).
+        self.name_period: dict[str, int] = {}
+        # A requested switch epoch that does not separate the returns is
+        # replaced by the default (reported in the linkage note).
+        self.requested_split_jd = historical_split_jd
+        self.split_jd_replaced = False
         if historical_nongravitational:
             self._request_historical_force()
         self.free_names = tuple(name for name in NONGRAVITATIONAL_NAMES if name in self.requested)
@@ -381,48 +420,85 @@ class _Linker:
         self.used_line_of_variations = False
 
     def _request_historical_force(self) -> None:
-        """Mirror requested A1–A3 as A1H–A3H valid before the longest gap.
+        """Mirror requested A1–A3 as historical sets valid before the switch epochs.
 
-        The switch (TDB JD) is the middle of the longest gap between observed
-        returns: a lost comet (205P: 1896 → 2008) is far from the Sun there,
-        where the water-ice law is negligible, so the force law changes
-        without a noticeable jump.  The historical side starts with the
-        modern values (``current_force``) and is released only once one of
-        its returns takes part in a correction.
+        By default there is one switch, in the middle of the longest gap
+        between observed returns: a lost comet (205P: 1896 → 2008) is far
+        from the Sun there, where the water-ice law is negligible, so the
+        force law changes without a noticeable jump.  Requested switch epochs
+        (one or several, each inside a gap) give several force periods,
+        A1H–A3H before the most recent switch, A1H2–A3H2 before the next one
+        and so on; a switch that would leave a period without an observed
+        return is dropped.  Each historical set starts with the values of
+        the next newer period (``current_force``) and is released only once
+        one of its returns takes part in a correction.
         """
         modern = [name for name in HISTORICAL_NONGRAVITATIONAL if name in self.requested]
         if not modern or len(self.groups) < 2:
             return
-        spans = sorted((self._start(index), self._end(index)) for index in range(len(self.groups)))
-        gaps = [
-            (later[0] - earlier[1], 0.5 * (earlier[1] + later[0]))
-            for earlier, later in zip(spans, spans[1:])
-        ]
-        if not gaps:
+        spans = [(self._start(index), self._end(index)) for index in range(len(self.groups))]
+        requested = self.requested_split_jd
+        if requested is None:
+            requests: list[float] = []
+        elif isinstance(requested, (int, float, np.floating)):
+            requests = [float(requested)]
+        else:
+            requests = [float(value) for value in requested]
+        splits: list[float] = []
+        for value in requests:
+            split, replaced = historical_split_epoch(spans, value)
+            if replaced or split is None:
+                self.split_jd_replaced = True
+                continue
+            splits.append(split)
+        if not splits:
+            default, _replaced = historical_split_epoch(spans, None)
+            if default is None:
+                return
+            splits = [default]
+        splits = sorted(set(splits), reverse=True)[:MAX_FORCE_PERIODS - 1]
+        # Every period needs at least one observed return to constrain it.
+        while True:
+            periods = {force_period(tuple(splits), end) for _start, end in spans}
+            empty = [period for period in range(1, len(splits) + 1) if period not in periods]
+            if not empty:
+                break
+            splits.pop(empty[0] - 1)
+            self.split_jd_replaced = True
+        if not splits:
             return
-        _gap, self.split_jd = max(gaps)
-        for name in modern:
-            self.requested[HISTORICAL_NONGRAVITATIONAL[name]] = float(self.requested[name])
-        self.requested[NONGRAVITATIONAL_SPLIT_KEY] = float(self.split_jd)
+        self.split_jds = tuple(splits)
+        self.split_jd = splits[0]
+        for period, split in enumerate(splits, start=1):
+            names = historical_period_names(period)
+            for name in modern:
+                self.requested[names[name]] = float(self.requested[name])
+                self.name_period[names[name]] = period
+            self.requested[period_split_key(period)] = float(split)
+
+    def period(self, index: int) -> int:
+        """Force period of a return (0 = the most recent force law)."""
+        return force_period(self.split_jds, self._end(index)) if self.split_jds else 0
 
     def historical(self, index: int) -> bool:
-        """Whether a return lies before the force-law switch."""
-        return self.split_jd is not None and self._end(index) < self.split_jd
+        """Whether a return lies before the most recent force-law switch."""
+        return self.period(index) > 0
 
     def free_for(self, indices: list[int], names: tuple[str, ...]) -> tuple[str, ...]:
         """``names`` without historical coefficients that ``indices`` cannot constrain."""
-        historical_names = set(HISTORICAL_NONGRAVITATIONAL.values())
-        if any(self.historical(index) for index in indices):
-            return names
-        return tuple(name for name in names if name not in historical_names)
+        present = {self.period(index) for index in indices}
+        return tuple(
+            name for name in names
+            if name not in self.name_period or self.name_period[name] in present
+        )
 
     def historical_free(self, indices: list[int]) -> tuple[str, ...]:
-        """A1H/A2H to release when a historical return takes part in a stage."""
-        if not any(self.historical(index) for index in indices):
-            return ()
+        """Historical A1/A2 to release when returns of their periods take part in a stage."""
+        present = {self.period(index) for index in indices} - {0}
         return tuple(
-            HISTORICAL_NONGRAVITATIONAL[name] for name in ("A1", "A2")
-            if HISTORICAL_NONGRAVITATIONAL[name] in self.free_names
+            historical_period_names(period)[name]
+            for period in sorted(present) for name in ("A1", "A2")
+            if historical_period_names(period)[name] in self.free_names
         )
 
     # -- helpers ----------------------------------------------------------
@@ -680,13 +756,18 @@ class _Linker:
         reached = (solution.nongravitational_parameters or {}) if solution is not None else {}
         force.update({
             name: float(value) for name, value in reached.items()
-            if name in force or name in ("R_EXPONENT", NONGRAVITATIONAL_SPLIT_KEY)
+            if name in force or name in ("R_EXPONENT", *ALL_SPLIT_KEYS)
         })
-        # Until a historical return has been fitted, the historical
-        # coefficients continue the modern ones (one force law).
-        for modern, historical in HISTORICAL_NONGRAVITATIONAL.items():
-            if historical in force and historical not in reached and modern in force:
-                force[historical] = force[modern]
+        # Until a return of a historical period has been fitted, its
+        # coefficients continue those of the next newer period.
+        for period in range(1, MAX_FORCE_PERIODS):
+            newer = (
+                {name: name for name in ("A1", "A2", "A3")} if period == 1
+                else historical_period_names(period - 1)
+            )
+            for modern, historical in historical_period_names(period).items():
+                if historical in force and historical not in reached and newer[modern] in force:
+                    force[historical] = force[newer[modern]]
         return force
 
     def accepted(self, indices: list[int], new: list[int] | None = None) -> bool:
@@ -1236,7 +1317,7 @@ class _Linker:
             # No historical return was joined: the historical coefficients
             # were never constrained, so the result keeps one force law.
             parameters = dict(result[0].nongravitational_parameters or {})
-            for name in (*HISTORICAL_NONGRAVITATIONAL.values(), NONGRAVITATIONAL_SPLIT_KEY):
+            for name in (*ALL_HISTORICAL_NAMES, *ALL_SPLIT_KEYS):
                 parameters.pop(name, None)
             result[0].nongravitational_parameters = parameters or None
         # Rows without O-C from the final correction (unlinked apparitions,
@@ -1293,6 +1374,11 @@ class _Linker:
             _update_apparition_linkage_metrics(record, self.groups[index])
         rejected = sum(len(items) for items in self.rejections.values())
         note_parts = [source]
+        if self.split_jd_replaced:
+            note_parts.append(tr(
+                "Zadaný okamžik přepnutí sil neleží v mezeře mezi pozorovanými návraty; "
+                "použit je střed nejdelší mezery.",
+            ))
         if rejected:
             note_parts.append(
                 tr(
@@ -1372,6 +1458,7 @@ def link_apparitions(
     fit_once: FitOnce, evaluate: Evaluate,
     report_progress: ProgressReporter, cancel_callback=None,
     historical_nongravitational: bool = False, accept_model_tension: bool = False,
+    historical_split_jd: float | None = None,
 ) -> tuple[tuple[OrbitSolution, float, int], list[dict[str, object]], str]:
     """Link several observed apparitions; return (fit result, audit records, note).
 
@@ -1384,5 +1471,6 @@ def link_apparitions(
         fit_once, evaluate, report_progress, cancel_callback,
         historical_nongravitational=historical_nongravitational,
         accept_model_tension=accept_model_tension,
+        historical_split_jd=historical_split_jd,
     )
     return linker.run()

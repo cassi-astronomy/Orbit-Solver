@@ -43,6 +43,9 @@ class OrbitSolution:
     arg_peri_deg: float
     mean_anomaly_deg: float
     absolute_magnitude: float = 18.0
+    # False while absolute_magnitude is only a placeholder (no catalogue H and
+    # no photometry reduced with an orbit); size estimates are then withheld.
+    absolute_magnitude_known: bool = True
     slope_g: float = 0.15
     photometric_exponent: float = 2.0
     phase_correction: bool = True
@@ -50,6 +53,11 @@ class OrbitSolution:
     position_au: tuple[float, float, float] | None = None
     velocity_au_per_day: tuple[float, float, float] | None = None
     state_covariance: tuple[tuple[float, ...], ...] | None = None
+    # Formal covariance of every fitted parameter in physical units: the
+    # Cartesian state (AU, AU/day) followed by the free A1/A2/A3 (AU/day²)
+    # and DT (days) listed in ``parameter_names``; None without free forces.
+    parameter_covariance: tuple[tuple[float, ...], ...] | None = None
+    parameter_names: tuple[str, ...] | None = None
     element_uncertainties: dict[str, float] | None = None
     fit_observation_count: int | None = None
     fit_available_observation_count: int | None = None
@@ -68,6 +76,9 @@ class OrbitSolution:
     # impact.ImpactPrediction when the fitted orbit hits a planet or the Moon
     # within impact.IMPACT_CHECK_DAYS after the epoch (checked after a fit).
     impact: Any = field(default=None, repr=False, compare=False)
+    # impact.ImpactRisk when the nominal path only passes close to the Earth
+    # or Moon but Monte Carlo clones from the fit covariance include impacts.
+    impact_risk: Any = field(default=None, repr=False, compare=False)
 
 
 @dataclass(slots=True)
